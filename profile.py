@@ -112,7 +112,24 @@ def _fallback_detect_gpu() -> GPUSpec:
         "4080":      (305.0, 716.8, 64.0),
         "3090":      (142.0, 936.2, 6.0),
         "3080":      (119.5, 760.3, 5.0),
+        # AMD Instinct GPUs
+        "MI300X":    (1307.4, 5300.0, 256.0),
+        "MI325X":    (1307.4, 6000.0, 256.0),
+        "MI350X":    (2300.0, 8000.0, 256.0),
+        "MI355X":    (2300.0, 8000.0, 256.0),
     }
+
+    # On ROCm, device name may be empty; try gcnArchName-based lookup
+    gcn_arch = getattr(props, 'gcnArchName', '')
+    if gcn_arch and not name:
+        _AMD_ARCHS = {
+            "gfx942": ("AMD Instinct MI300X", 1307.4, 5300.0, 256.0),
+            "gfx950": ("AMD Instinct MI350X", 2300.0, 8000.0, 256.0),
+        }
+        for arch_prefix, amd_specs in _AMD_ARCHS.items():
+            if gcn_arch.startswith(arch_prefix):
+                name, peak_fp16_val, peak_bw_val, l2_val = amd_specs
+                break
 
     matched = None
     for fragment, specs in _KNOWN_GPUS.items():
@@ -123,13 +140,15 @@ def _fallback_detect_gpu() -> GPUSpec:
     if matched is not None:
         peak_fp16, peak_bw, l2 = matched
     else:
-        ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
-        clock_ghz = props.clock_rate / 1e6
-        peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3
-        # APPROXIMATE bandwidth: torch.cuda.get_device_properties() does not
-        # expose memory clock, so we use the GPU core clock as a rough proxy.
-        # This is only a coarse fallback for GPUs not in the known-GPU table.
-        peak_bw = max(props.clock_rate / 1e6 * 256 / 8 * 2, 500.0)  # rough proxy GB/s (core clock, not mem clock)
+        if hasattr(props, 'clock_rate') and props.clock_rate > 0:
+            ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
+            clock_ghz = props.clock_rate / 1e6
+            peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3
+            peak_bw = max(props.clock_rate / 1e6 * 256 / 8 * 2, 500.0)
+        else:
+            # ROCm fallback: no clock_rate available
+            peak_fp16 = 500.0
+            peak_bw = 2000.0
         l2 = props.L2_cache_size / (1024 * 1024) if hasattr(props, "L2_cache_size") else 0.0
 
     peak_bf16 = peak_fp16

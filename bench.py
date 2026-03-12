@@ -114,6 +114,19 @@ _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
     "4080":       (305.0,  716.8,  64.0),
     "3090":       (142.0,  936.2,  6.0),
     "3080":       (119.5,  760.3,  5.0),
+    # AMD Instinct GPUs
+    "MI300X":     (1307.4, 5300.0, 256.0),
+    "MI325X":     (1307.4, 6000.0, 256.0),
+    "MI350X":     (2300.0, 8000.0, 256.0),
+    "MI355X":     (2300.0, 8000.0, 256.0),
+}
+
+# AMD GPU database keyed by gcnArchName prefix for ROCm detection.
+# ROCm may report an empty device name; gcnArchName is always available.
+_KNOWN_AMD_GPUS: Dict[str, Tuple[str, float, float, float]] = {
+    # gcnArchName prefix -> (display_name, peak_fp16_tflops, peak_bw_gb_s, l2_mb)
+    "gfx942": ("AMD Instinct MI300X", 1307.4, 5300.0, 256.0),
+    "gfx950": ("AMD Instinct MI350X", 2300.0, 8000.0, 256.0),
 }
 
 
@@ -129,7 +142,21 @@ def detect_gpu() -> GPUSpec:
     memory_gb = round(props.total_memory / (1024 ** 3), 1)
     cc = (props.major, props.minor)
 
-    # Try to match a known GPU
+    # On ROCm, device name may be empty; try gcnArchName-based lookup first
+    gcn_arch = getattr(props, 'gcnArchName', '')
+    if gcn_arch and not name:
+        # ROCm: resolve name and specs via gcnArchName
+        matched_amd = None
+        for arch_prefix, amd_specs in _KNOWN_AMD_GPUS.items():
+            if gcn_arch.startswith(arch_prefix):
+                matched_amd = amd_specs
+                break
+        if matched_amd is not None:
+            name, peak_fp16, peak_bw, l2 = matched_amd
+        else:
+            name = f"AMD GPU ({gcn_arch})"
+
+    # Try to match a known GPU by name
     matched = None
     for fragment, specs in _KNOWN_GPUS.items():
         if fragment in name:
@@ -140,17 +167,17 @@ def detect_gpu() -> GPUSpec:
         peak_fp16, peak_bw, l2 = matched
     else:
         # Estimate from hardware counters
-        # fp16 tensor cores: ~256 ops/clock/SM for Ampere+, ~128 for Volta/Turing
-        ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
-        clock_ghz = props.clock_rate / 1e6  # clock_rate is in kHz
-        peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3  # TFLOPS
-        # APPROXIMATE bandwidth estimate: torch.cuda.get_device_properties()
-        # does not expose memory clock rate, so we use the GPU core clock
-        # (props.clock_rate) as a rough proxy. This will NOT match the real
-        # memory bandwidth -- it is only used as a coarse fallback when the
-        # GPU is not in the _KNOWN_GPUS table above.
-        peak_bw = props.clock_rate / 1e6 * 256 / 8 * 2  # rough proxy GB/s (uses core clock, not mem clock)
-        peak_bw = max(peak_bw, 500.0)  # conservative floor
+        if hasattr(props, 'clock_rate') and props.clock_rate > 0:
+            # NVIDIA path: fp16 tensor cores estimate
+            ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
+            clock_ghz = props.clock_rate / 1e6  # clock_rate is in kHz
+            peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3
+            peak_bw = props.clock_rate / 1e6 * 256 / 8 * 2
+            peak_bw = max(peak_bw, 500.0)
+        else:
+            # ROCm fallback: no clock_rate available
+            peak_fp16 = 500.0  # conservative estimate
+            peak_bw = 2000.0   # conservative estimate
         l2 = props.L2_cache_size / (1024 * 1024) if hasattr(props, 'L2_cache_size') else 0.0
 
     # Derive bf16 and fp32 from fp16
