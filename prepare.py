@@ -104,14 +104,16 @@ def verify_environment() -> None:
     cc_major = props.major
     cc_minor = props.minor
 
-    # Driver and CUDA runtime versions
-    # torch.version.cuda gives the CUDA toolkit version PyTorch was compiled with
+    # Runtime version: CUDA toolkit or ROCm/HIP version
     cuda_version = torch.version.cuda or "unknown"
+    hip_version = getattr(torch.version, "hip", None)
+    if hip_version:
+        cuda_version = f"ROCm {hip_version}"
 
-    # nvidia-smi driver version -- fall back gracefully
+    # GPU driver version -- try nvidia-smi first, then rocm-smi as fallback
+    import subprocess
     driver_str = "unknown"
     try:
-        import subprocess
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
@@ -120,6 +122,20 @@ def verify_environment() -> None:
             driver_str = result.stdout.strip().split("\n")[0]
     except Exception:
         pass
+
+    if driver_str == "unknown":
+        try:
+            result = subprocess.run(
+                ["rocm-smi", "--showdriverversion"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if "Driver" in line:
+                        driver_str = line.split(":")[-1].strip()
+                        break
+        except Exception:
+            pass
 
     print(f"GPU: {gpu_name}")
     print(f"  Memory: {mem_gb:.1f} GB")

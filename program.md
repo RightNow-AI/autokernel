@@ -527,6 +527,21 @@ Once block sizes are tuned, memory is usually the bottleneck.
 - L4: very memory-bandwidth limited.
 - RTX 4090: 128 SMs but consumer-grade memory bandwidth.
 
+**MI300X (CDNA3, gfx942):** *(source: [GEAK](https://github.com/AMD-AGI/GEAK) knowledge-base)*
+- 304 CUs, wavefront size = 64 (not 32). All warp-level reasoning must use 64-wide.
+- HBM3: 5.3 TB/s peak bandwidth, 192 GB capacity. Memory-bound kernels should target >70% of this.
+- MFMA (Matrix Fused Multiply-Add) instructions: 1307 TFLOPS FP16/BF16. Use `tl.dot` which maps to MFMA.
+- LDS: 64 KB per CU, shared memory in Triton maps to LDS. Avoid >64 KB per block.
+- BLOCK_SIZE = 256 is often optimal for CDNA (vs 128 for NVIDIA). Try 128/256 in autotune configs.
+- `num_warps`: on AMD each "warp" in Triton is a wavefront of 64 threads. 4 warps = 256 threads.
+- `waves_per_eu`: controls occupancy hint. Add to `triton.Config(kwargs, num_warps=N, waves_per_eu=M)`.
+  Typical values: 0 (auto), 2-4 for compute-bound, 4-8 for memory-bound.
+- `tl.math.tanh` is NOT available on HIP backend. Use sigmoid identity: `2*tl.sigmoid(2*x) - 1`.
+- No `cp.async` or TMA equivalent; Triton compiler handles async prefetch internally.
+- Prefer BF16 over FP16 for training workloads (same throughput, better dynamic range).
+- Profile with `rocprof --hip-trace` or `rocprofv3`. Key counters: `SQ_INSTS_MFMA_MOPS_FP16`,
+  `TCC_HIT/TCC_REQ` (L2 hit rate), `SQ_WAVE_CYCLES` (occupancy), `TCP_PENDING_STALL_CYCLES` (mem stall).
+
 **Typical gains**: 5-15% from architecture-specific tuning.
 
 ### Tier 6: Kernel-Specific Tricks
@@ -676,6 +691,17 @@ asm volatile("cp.async.wait_group 0;");
 - FP8 tensor cores for inference.
 - Smaller shared memory per SM -- use smaller tiles.
 - High FP16 throughput but consumer-grade memory bandwidth.
+
+**AMD CDNA3 (gfx942, MI300X) — HIP backend:** *(source: [GEAK](https://github.com/AMD-AGI/GEAK) knowledge-base)*
+- Use `hipcc` with `-march=gfx942 -O3`. Compile flags: `--offload-arch=gfx942`.
+- Wavefront = 64 threads (vs CUDA warp = 32). All `__shfl*` → `__shfl*` in HIP but width=64.
+- MFMA intrinsics replace NVIDIA's WMMA/MMA. Use rocBLAS or rocWMMA for matrix ops.
+- LDS: 64 KB per CU. Use `__launch_bounds__(256, 4)` for occupancy (256 threads, min 4 blocks/CU).
+- VGPRs: 65536 per CU. Target 20-32 registers/thread for good occupancy (75-100%).
+- `__restrict__` and `__builtin_nontemporal_load/store` for memory hint control.
+- No `cp.async`; use `__builtin_amdgcn_global_load_lds()` for async LDS fills (advanced).
+- Memory coalescing: same principle, 128-byte transactions, wavefront of 64 threads.
+- Profile: `rocprof --stats`, `rocprofv3`. Key counters: `SQ_INSTS_MFMA_MOPS_*`, `TCC_*`, `SQ_WAVE_CYCLES`.
 
 **Typical gains**: 5-15% from arch-specific tuning.
 
