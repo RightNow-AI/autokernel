@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -182,6 +183,7 @@ def parse_shape_info(shape_info_str: str, op_type: str) -> Optional[Dict[str, in
       - "B=1, H=32, N=4096, D=128"
       - "batch=4096, vocab=32000"
       - "rows=4096, cols=4096"
+      - "[[4096, 4096], [4096, 4096]]"  (PyTorch profiler tensor shape lists)
 
     Returns None if parsing fails.
     """
@@ -190,21 +192,87 @@ def parse_shape_info(shape_info_str: str, op_type: str) -> Optional[Dict[str, in
 
     # Match key=value pairs
     pairs = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\d+)", shape_info_str)
-    if not pairs:
+    if pairs:
+        raw = {k: int(v) for k, v in pairs}
+
+        # Map to canonical bench.py keys using alias map
+        alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
+        if alias_map:
+            canonical = {}
+            for k, v in raw.items():
+                mapped_key = alias_map.get(k, k)
+                canonical[mapped_key] = v
+            return canonical
+        else:
+            return raw
+
+    # Fallback: parse PyTorch profiler tensor shape lists (e.g. "[[4096, 4096], [4096, 4096]]")
+    return _parse_profiler_shapes(shape_info_str, op_type)
+
+
+def _parse_profiler_shapes(shape_info_str: str, op_type: str) -> Optional[Dict[str, int]]:
+    """
+    Parse PyTorch profiler tensor shape lists into kernel shape dicts.
+
+    The profiler writes shapes as e.g. "[[4096, 4096], [4096, 4096]]" for
+    aten::mm with two 2D inputs. This function interprets them per op_type.
+    """
+    try:
+        shapes = ast.literal_eval(shape_info_str)
+    except (ValueError, SyntaxError):
         return None
 
-    raw = {k: int(v) for k, v in pairs}
+    if not isinstance(shapes, (list, tuple)) or not shapes:
+        return None
 
-    # Map to canonical bench.py keys using alias map
-    alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
-    if alias_map:
-        canonical = {}
-        for k, v in raw.items():
-            mapped_key = alias_map.get(k, k)
-            canonical[mapped_key] = v
-        return canonical
-    else:
-        return raw
+    # Extract 2D matrix operands (skip 1D bias/scalar tensors)
+    matrices = [s for s in shapes if isinstance(s, (list, tuple)) and len(s) == 2]
+
+    if op_type in ("matmul", "fused_mlp"):
+        # aten::mm: [[M, K], [K, N]] -> {M, N, K}
+        # aten::addmm: [[N], [M, K], [K, N]] -> skip bias, use last two 2D tensors
+        if len(matrices) >= 2:
+            a, b = matrices[-2], matrices[-1]
+            if all(isinstance(d, int) for d in a + b):
+                raw = {"M": a[0], "K": a[1], "N": b[1]}
+                alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
+                if alias_map:
+                    return {alias_map.get(k, k): v for k, v in raw.items()}
+                return raw
+
+    if op_type in ("layernorm", "softmax", "rmsnorm", "reduce"):
+        # e.g. [[4096, 2048], ...] -> {M, N} from first 2D tensor
+        if matrices:
+            first = matrices[0]
+            if all(isinstance(d, int) for d in first):
+                keys = SHAPE_KEYS.get(op_type, ["M", "N"])
+                alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
+                raw = dict(zip(keys[:len(first)], first))
+                if alias_map:
+                    return {alias_map.get(k, k): v for k, v in raw.items()}
+                return raw
+
+    if op_type == "cross_entropy":
+        # [[batch, vocab], [batch]] -> {batch, vocab}
+        if matrices:
+            first = matrices[0]
+            if len(first) == 2 and all(isinstance(d, int) for d in first):
+                return {"batch": first[0], "vocab": first[1]}
+
+    if op_type in ("flash_attention", "rotary_embedding"):
+        # [[B, H, N, D], ...] -> {B, H, N, D}
+        tensors_4d = [s for s in shapes if isinstance(s, (list, tuple)) and len(s) == 4]
+        if tensors_4d:
+            first = tensors_4d[0]
+            if all(isinstance(d, int) for d in first):
+                keys = SHAPE_KEYS.get(op_type, ["B", "H", "N", "D"])
+                alias_map = SHAPE_ALIAS_MAP.get(op_type, {})
+                raw = dict(zip(keys, first))
+                if alias_map:
+                    return {alias_map.get(k, k): v for k, v in raw.items()}
+                return raw
+
+    return None
 
 
 def shape_to_display(shape: Dict[str, int]) -> str:
