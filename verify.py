@@ -35,6 +35,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def _xpu_available() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def _get_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if _xpu_available():
+        return "xpu"
+    return "cpu"
+
+
+def _synchronize_device() -> None:
+    device = _get_device()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "xpu":
+        torch.xpu.synchronize()
+
+
+def _empty_cache() -> None:
+    device = _get_device()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "xpu":
+        torch.xpu.empty_cache()
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -178,18 +206,21 @@ def load_model(args) -> nn.Module:
     else:
         raise ValueError("Must specify either --model (file path) or --module (Python module)")
 
+    device = _get_device()
     model = model.to(dtype=dtype)
 
-    if torch.cuda.is_available():
+    if device == "cuda":
         try:
             model = model.cuda()
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"WARNING: OOM moving model to GPU. Trying with smaller footprint...")
-                torch.cuda.empty_cache()
+                _empty_cache()
                 model = model.half().cuda()
             else:
                 raise
+    elif device == "xpu":
+        model = model.to("xpu")
 
     model.eval()
     return model
@@ -202,10 +233,11 @@ def load_model(args) -> nn.Module:
 def generate_sample_input(
     input_shape: str,
     dtype: torch.dtype,
-    device: str = "cuda",
+    device: Optional[str] = None,
     seed: int = 42,
 ) -> torch.Tensor:
     """Generate a sample input tensor from a shape string like '1,2048'."""
+    device = device or _get_device()
     dims = [int(d.strip()) for d in input_shape.split(",")]
     torch.manual_seed(seed)
 
@@ -218,6 +250,15 @@ def generate_sample_input(
 
 def infer_input_type(model: nn.Module) -> str:
     """Try to determine if the model expects integer token IDs or float tensors."""
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if callable(get_input_embeddings):
+        try:
+            embeddings = get_input_embeddings()
+            if isinstance(embeddings, nn.Embedding):
+                return "token_ids"
+        except Exception:
+            pass
+
     # Check if model has an embedding layer as the first module
     for name, child in model.named_children():
         if isinstance(child, nn.Embedding):
@@ -231,9 +272,10 @@ def make_model_input(
     model: nn.Module,
     input_shape: str,
     dtype: torch.dtype,
-    device: str = "cuda",
+    device: Optional[str] = None,
 ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
     """Create an appropriate input for the model."""
+    device = device or _get_device()
     input_type = infer_input_type(model)
 
     if input_type == "token_ids":
@@ -263,10 +305,11 @@ def benchmark_model(
 ) -> Tuple[Any, float]:
     """
     Benchmark model inference. Returns (output, median_latency_ms).
-    Uses CUDA events for precise GPU timing.
+    Uses CUDA events on CUDA and perf_counter timing on XPU.
     """
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for benchmarking.")
+    device = _get_device()
+    if device not in ("cuda", "xpu"):
+        raise RuntimeError("CUDA or XPU is required for benchmarking.")
 
     def _run():
         with torch.no_grad():
@@ -279,30 +322,42 @@ def benchmark_model(
     print(f"  Warmup: {warmup} runs...", end="", flush=True)
     for _ in range(warmup):
         output = _run()
-    torch.cuda.synchronize()
+    _synchronize_device()
     print(" done")
 
     # Timed runs
     print(f"  Timed: {timed} runs...", end="", flush=True)
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(timed)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(timed)]
+    if device == "cuda":
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(timed)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(timed)]
 
-    torch.cuda.synchronize()
-    for i in range(timed):
-        start_events[i].record()
-        _run()
-        end_events[i].record()
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        for i in range(timed):
+            start_events[i].record()
+            _run()
+            end_events[i].record()
+        torch.cuda.synchronize()
+        times_ms = sorted(s.elapsed_time(e) for s, e in zip(start_events, end_events))
+    else:
+        times_ms = []
+        _synchronize_device()
+        for _ in range(timed):
+            _synchronize_device()
+            start = time.perf_counter()
+            _run()
+            _synchronize_device()
+            end = time.perf_counter()
+            times_ms.append((end - start) * 1000.0)
+        times_ms.sort()
     print(" done")
 
     # Compute median
-    times_ms = sorted(s.elapsed_time(e) for s, e in zip(start_events, end_events))
     median_ms = times_ms[len(times_ms) // 2]
 
     # Final reference output (deterministic)
     with torch.no_grad():
         output = _run()
-    torch.cuda.synchronize()
+    _synchronize_device()
 
     return output, median_ms
 
@@ -358,7 +413,8 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                     speedup=speedup,
                     optimized_path=opt_path,
                 ))
-        return replacements
+        if replacements:
+            return replacements
 
     # Strategy 2: Scan workspace directory for optimized kernel files
     if not os.path.isdir(WORKSPACE_DIR):
@@ -521,6 +577,8 @@ class OptimizedModelContext:
         self.replacements = replacements
         self._original_modules: Dict[str, nn.Module] = {}
         self._applied: List[str] = []
+        self._original_f_softmax: Optional[Callable] = None
+        self._original_torch_softmax: Optional[Callable] = None
 
     def __enter__(self) -> nn.Module:
         for repl in self.replacements:
@@ -551,6 +609,12 @@ class OptimizedModelContext:
             for p in parts[:-1]:
                 parent = getattr(parent, p)
             setattr(parent, parts[-1], original)
+        if self._original_f_softmax is not None:
+            F.softmax = self._original_f_softmax
+            self._original_f_softmax = None
+        if self._original_torch_softmax is not None:
+            torch.softmax = self._original_torch_softmax
+            self._original_torch_softmax = None
         self._original_modules.clear()
         self._applied.clear()
 
@@ -566,9 +630,11 @@ class OptimizedModelContext:
             count = self._replace_layernorm_modules(repl)
         elif repl.kernel_type == "rmsnorm":
             count = self._replace_rmsnorm_modules(repl)
+        elif repl.kernel_type == "softmax":
+            count = self._replace_softmax_ops(repl)
         else:
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, layernorm, rmsnorm)")
+                  f"Skipping. (Supported: matmul, layernorm, rmsnorm, softmax)")
 
         return count
 
@@ -635,6 +701,30 @@ class OptimizedModelContext:
                 setattr(parent, parts[-1], wrapper)
                 count += 1
         return count
+
+    def _replace_softmax_ops(self, repl: KernelReplacement) -> int:
+        """Route last-dimension softmax calls through the optimized kernel_fn."""
+        self._original_f_softmax = F.softmax
+        self._original_torch_softmax = torch.softmax
+
+        original_f_softmax = self._original_f_softmax
+        kernel_fn = repl.module_fn
+
+        def patched_softmax(input: torch.Tensor, dim: Optional[int] = None,
+                            _stacklevel: int = 3, dtype: Optional[torch.dtype] = None):
+            target_dim = -1 if dim is None else dim
+            resolved_dim = target_dim if target_dim >= 0 else input.dim() + target_dim
+            if (
+                input.device.type in ("cuda", "xpu")
+                and resolved_dim == input.dim() - 1
+                and dtype is None
+            ):
+                return kernel_fn(input)
+            return original_f_softmax(input, dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+
+        F.softmax = patched_softmax
+        torch.softmax = patched_softmax
+        return 1
 
     @property
     def applied_summary(self) -> List[str]:
@@ -706,50 +796,93 @@ def compare_outputs(
         result["reason"] = f"Shape mismatch: ref={result['ref_shape']}, opt={result['opt_shape']}"
         return result
 
-    # NaN / Inf check
-    ref_float = ref_output.float()
-    opt_float = opt_output.float()
+    # NaN / Inf check and numerical comparison are done in chunks to avoid
+    # materializing an additional full-size diff tensor for large model outputs.
+    ref_flat = ref_output.reshape(-1)
+    opt_flat = opt_output.reshape(-1)
+    chunk_size = 4_000_000
 
-    result["ref_has_nan"] = bool(torch.isnan(ref_float).any())
-    result["ref_has_inf"] = bool(torch.isinf(ref_float).any())
-    result["opt_has_nan"] = bool(torch.isnan(opt_float).any())
-    result["opt_has_inf"] = bool(torch.isinf(opt_float).any())
+    result["ref_has_nan"] = False
+    result["ref_has_inf"] = False
+    result["opt_has_nan"] = False
+    result["opt_has_inf"] = False
 
-    if result["opt_has_nan"] and not result["ref_has_nan"]:
-        result["correctness"] = "FAIL"
-        result["reason"] = "Optimized output contains NaN where reference does not"
-        return result
-
-    if result["opt_has_inf"] and not result["ref_has_inf"]:
-        result["correctness"] = "FAIL"
-        result["reason"] = "Optimized output contains Inf where reference does not"
-        return result
-
-    # Numerical comparison
-    diff = (ref_float - opt_float).abs()
-
-    # Mask out positions where both are NaN (those are fine)
-    valid_mask = ~(torch.isnan(ref_float) & torch.isnan(opt_float))
-    if valid_mask.any():
-        valid_diff = diff[valid_mask]
-        result["max_abs_error"] = float(valid_diff.max())
-        result["mean_abs_error"] = float(valid_diff.mean())
-    else:
-        result["max_abs_error"] = 0.0
-        result["mean_abs_error"] = 0.0
+    total_abs_error = 0.0
+    total_valid = 0
+    max_abs_error = 0.0
+    nan_mismatch = False
+    inf_mismatch = False
+    inf_sign_mismatch = False
 
     # Tolerance check
     tols = DEFAULT_TOLERANCES.get(dtype, {"atol": 1e-4, "rtol": 1e-4})
     atol = custom_atol if custom_atol is not None else tols["atol"]
     rtol = custom_rtol if custom_rtol is not None else tols["rtol"]
 
-    # Use allclose on the valid (non-NaN) elements
-    if valid_mask.any():
-        passes = torch.allclose(
-            ref_float[valid_mask], opt_float[valid_mask], atol=atol, rtol=rtol
-        )
-    else:
-        passes = True
+    passes = True
+    for start in range(0, ref_flat.numel(), chunk_size):
+        end = min(start + chunk_size, ref_flat.numel())
+        ref_chunk = ref_flat[start:end].float()
+        opt_chunk = opt_flat[start:end].float()
+
+        ref_nan = torch.isnan(ref_chunk)
+        opt_nan = torch.isnan(opt_chunk)
+        ref_inf = torch.isinf(ref_chunk)
+        opt_inf = torch.isinf(opt_chunk)
+
+        result["ref_has_nan"] = result["ref_has_nan"] or bool(ref_nan.any())
+        result["ref_has_inf"] = result["ref_has_inf"] or bool(ref_inf.any())
+        result["opt_has_nan"] = result["opt_has_nan"] or bool(opt_nan.any())
+        result["opt_has_inf"] = result["opt_has_inf"] or bool(opt_inf.any())
+
+        if bool((opt_nan & ~ref_nan).any()):
+            nan_mismatch = True
+        if bool((opt_inf & ~ref_inf).any()):
+            inf_mismatch = True
+        both_inf = ref_inf & opt_inf
+        if bool((both_inf & (torch.signbit(ref_chunk) != torch.signbit(opt_chunk))).any()):
+            inf_sign_mismatch = True
+
+        valid_mask = torch.isfinite(ref_chunk) & torch.isfinite(opt_chunk)
+        if valid_mask.any():
+            ref_valid = ref_chunk[valid_mask]
+            opt_valid = opt_chunk[valid_mask]
+            diff = (ref_valid - opt_valid).abs()
+            max_abs_error = max(max_abs_error, float(diff.max()))
+            total_abs_error += float(diff.sum())
+            total_valid += int(diff.numel())
+            if not torch.allclose(ref_valid, opt_valid, atol=atol, rtol=rtol):
+                passes = False
+
+    if nan_mismatch:
+        result["correctness"] = "FAIL"
+        result["reason"] = "Optimized output contains NaN where reference does not"
+        result["max_abs_error"] = max_abs_error
+        result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
+        result["atol"] = atol
+        result["rtol"] = rtol
+        return result
+
+    if inf_mismatch:
+        result["correctness"] = "FAIL"
+        result["reason"] = "Optimized output contains Inf where reference does not"
+        result["max_abs_error"] = max_abs_error
+        result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
+        result["atol"] = atol
+        result["rtol"] = rtol
+        return result
+
+    if inf_sign_mismatch:
+        result["correctness"] = "FAIL"
+        result["reason"] = "Optimized output has Inf sign mismatch versus reference"
+        result["max_abs_error"] = max_abs_error
+        result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
+        result["atol"] = atol
+        result["rtol"] = rtol
+        return result
+
+    result["max_abs_error"] = max_abs_error
+    result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
 
     result["correctness"] = "PASS" if passes else "FAIL"
     result["atol"] = atol
@@ -792,7 +925,7 @@ def diagnose_kernel_failures(
                         opt_output = patched_model(**model_input)
                     else:
                         opt_output = patched_model(model_input)
-                torch.cuda.synchronize()
+                _synchronize_device()
 
             opt_tensor = extract_tensor(opt_output)
             comp = compare_outputs(ref_tensor, opt_tensor, dtype)
@@ -958,6 +1091,8 @@ def _get_gpu_name() -> str:
     """Get current GPU name."""
     if torch.cuda.is_available():
         return torch.cuda.get_device_name(0)
+    if _xpu_available():
+        return str(torch.xpu.get_device_name(0))
     return "No GPU"
 
 
@@ -1126,7 +1261,7 @@ def main() -> None:
         if "out of memory" in str(e).lower():
             print(f"\nERROR: GPU out of memory during reference run.")
             print("  Try a smaller --input-shape or a smaller model.")
-            torch.cuda.empty_cache()
+            _empty_cache()
             sys.exit(1)
         else:
             raise
@@ -1162,7 +1297,7 @@ def main() -> None:
         if "out of memory" in str(e).lower():
             print(f"\nERROR: GPU out of memory during optimized run.")
             print("  The optimized kernels may use more memory than expected.")
-            torch.cuda.empty_cache()
+            _empty_cache()
             sys.exit(1)
         else:
             print(f"\nERROR: Optimized run failed: {e}")

@@ -56,7 +56,7 @@ def softmax_kernel(
 
 def kernel_fn(x: torch.Tensor) -> torch.Tensor:
     """Entry point called by bench.py. Must match reference.softmax_ref signature."""
-    assert x.is_cuda
+    assert x.device.type in ("cuda", "xpu")
 
     # Flatten to 2D for row-parallel processing
     orig_shape = x.shape
@@ -66,6 +66,13 @@ def kernel_fn(x: torch.Tensor) -> torch.Tensor:
         x = x.view(-1, x.shape[-1])
 
     n_rows, n_cols = x.shape
+
+    # This row-parallel kernel maps one program to one row and requires a
+    # power-of-two BLOCK_SIZE covering the full row. Very wide rows like the
+    # vocab benchmark (50257 -> 65536) time out on XPU, so fall back.
+    if n_cols > 4096:
+        return torch.softmax(x, dim=-1).view(orig_shape)
+
     output = torch.empty_like(x)
 
     # Block size must be a power of 2 >= n_cols

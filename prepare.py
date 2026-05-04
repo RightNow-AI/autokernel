@@ -42,10 +42,39 @@ _BENCH_ITERS = 100
 # Deterministic seed for reproducibility
 _SEED = 42
 
+# Global device tracking (set during initialization)
+_DEVICE = None
+
+
+def _xpu_available() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _get_device_str():
+    """Return active device string ('cuda' or 'xpu')."""
+    global _DEVICE
+    if _DEVICE is None:
+        if torch.cuda.is_available():
+            _DEVICE = "cuda"
+        elif _xpu_available():
+            _DEVICE = "xpu"
+        else:
+            raise RuntimeError("Neither CUDA nor XPU is available")
+    return _DEVICE
+
+
+def _sync_device():
+    """Synchronize active device."""
+    device_str = _get_device_str()
+    if device_str == "xpu":
+        torch.xpu.synchronize()
+    else:
+        torch.cuda.synchronize()
+
 
 def _dtype_tag(dtype: torch.dtype) -> str:
     """Short string tag for a dtype, e.g. 'fp16', 'bf16'."""
@@ -58,25 +87,39 @@ def _matmul_flops(M: int, N: int, K: int) -> int:
 
 
 def _benchmark_fn(fn, *args, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS):
-    """
-    Benchmark *fn* using CUDA events. Returns median latency in microseconds.
-    """
+    """Benchmark fn and return median latency in microseconds."""
+    import time
+    
+    device_str = _get_device_str()
+    
     # Warmup
     for _ in range(warmup):
         fn(*args)
-    torch.cuda.synchronize()
+    _sync_device()
 
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    if device_str == "xpu":
+        # XPU timing using time.perf_counter
+        times_ms = []
+        for _ in range(iters):
+            _sync_device()
+            start = time.perf_counter()
+            fn(*args)
+            _sync_device()
+            end = time.perf_counter()
+            times_ms.append((end - start) * 1000)  # convert to ms
+    else:
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
 
-    torch.cuda.synchronize()
-    for i in range(iters):
-        start_events[i].record()
-        fn(*args)
-        end_events[i].record()
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        for i in range(iters):
+            start_events[i].record()
+            fn(*args)
+            end_events[i].record()
+        torch.cuda.synchronize()
 
-    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+        times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    
     times_ms.sort()
     median_ms = times_ms[len(times_ms) // 2]
     return median_ms * 1000.0  # convert to microseconds
@@ -91,22 +134,35 @@ def verify_environment() -> None:
 
     print("=== AutoKernel Setup ===\n")
 
-    # -- CUDA & GPU --
-    if not torch.cuda.is_available():
-        print("ERROR: CUDA is not available. A CUDA-capable GPU is required.")
+    # -- CUDA/XPU & GPU --
+    if not torch.cuda.is_available() and not _xpu_available():
+        print("ERROR: Neither CUDA nor XPU is available. A GPU is required.")
         sys.exit(1)
-
-    device = torch.cuda.current_device()
-    gpu_name = torch.cuda.get_device_name(device)
-    props = torch.cuda.get_device_properties(device)
-    mem_gb = props.total_memory / (1024 ** 3)
-    sm_count = props.multi_processor_count
-    cc_major = props.major
-    cc_minor = props.minor
+    
+    # Prefer CUDA, fallback to XPU
+    use_xpu = not torch.cuda.is_available() and _xpu_available()
+    
+    if use_xpu:
+        device = torch.xpu.current_device()
+        gpu_name = "Intel XPU"
+        mem_gb = torch.xpu.get_device_properties(device).total_memory / (1024 ** 3)
+        cc_major, cc_minor = 0, 0  # Not applicable for XPU
+        sm_count = 0  # Not applicable for XPU
+    else:
+        device = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(device)
+        props = torch.cuda.get_device_properties(device)
+        mem_gb = props.total_memory / (1024 ** 3)
+        sm_count = props.multi_processor_count
+        cc_major = props.major
+        cc_minor = props.minor
 
     # Driver and CUDA runtime versions
     # torch.version.cuda gives the CUDA toolkit version PyTorch was compiled with
-    cuda_version = torch.version.cuda or "unknown"
+    if use_xpu:
+        cuda_version = "XPU"
+    else:
+        cuda_version = torch.version.cuda or "unknown"
 
     # nvidia-smi driver version -- fall back gracefully
     driver_str = "unknown"
@@ -237,12 +293,13 @@ def smoke_test() -> None:
 
     gen = torch.Generator(device="cpu")
     gen.manual_seed(_SEED)
-    A = torch.randn(M, K, generator=gen, dtype=dtype).cuda()
-    B = torch.randn(K, N, generator=gen, dtype=dtype).cuda()
+    device_str = _get_device_str()
+    A = torch.randn(M, K, generator=gen, dtype=dtype).to(device_str)
+    B = torch.randn(K, N, generator=gen, dtype=dtype).to(device_str)
 
     try:
         C_kernel = kernel.kernel_fn(A, B)
-        torch.cuda.synchronize()
+        _sync_device()
         print(f"  Run kernel (tiny, fp16): ok")
     except Exception as e:
         if kernel_type == "unknown":
@@ -254,7 +311,7 @@ def smoke_test() -> None:
 
     # Correctness check
     C_ref = matmul_ref(A, B)
-    torch.cuda.synchronize()
+    _sync_device()
 
     # For fp16 matmul, use relaxed tolerance
     atol = 1e-2
@@ -288,15 +345,16 @@ def benchmark_baselines() -> dict:
 
             # Load cached test data if available, else generate on the fly
             save_path = os.path.join(TEST_DATA_DIR, "matmul", size_name, f"{tag}.pt")
+            device_str = _get_device_str()
             if os.path.exists(save_path):
                 data = torch.load(save_path, weights_only=True)
-                A = data["A"].cuda()
-                B = data["B"].cuda()
+                A = data["A"].to(device_str)
+                B = data["B"].to(device_str)
             else:
                 gen = torch.Generator(device="cpu")
                 gen.manual_seed(_SEED)
-                A = torch.randn(M, K, generator=gen, dtype=dtype).cuda()
-                B = torch.randn(K, N, generator=gen, dtype=dtype).cuda()
+                A = torch.randn(M, K, generator=gen, dtype=dtype).to(device_str)
+                B = torch.randn(K, N, generator=gen, dtype=dtype).to(device_str)
 
             latency_us = _benchmark_fn(torch.matmul, A, B)
             tflops = flops / (latency_us * 1e-6) / 1e12
@@ -315,7 +373,10 @@ def benchmark_baselines() -> dict:
 
             # Free GPU memory
             del A, B
-            torch.cuda.empty_cache()
+            if _get_device_str() == "cuda":
+                torch.cuda.empty_cache()
+            else:
+                torch.xpu.empty_cache()
 
     print()
     return results
