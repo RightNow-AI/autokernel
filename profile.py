@@ -100,6 +100,21 @@ def _xpu_available() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def _empty_cache(device: str) -> None:
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "xpu" and _xpu_available():
+        torch.xpu.empty_cache()
+
+
+def _device_total_memory_gb(device: str) -> float:
+    if device == "cuda":
+        return torch.cuda.get_device_properties(0).total_memory / 1e9
+    if device == "xpu" and _xpu_available():
+        return torch.xpu.get_device_properties(0).total_memory / 1e9
+    return 0.0
+
+
 def _select_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -403,6 +418,8 @@ def _try_forward(
         else:
             model(**inputs)
         return True
+    except torch.OutOfMemoryError:
+        raise
     except Exception:
         return False
 
@@ -437,12 +454,12 @@ def _prepare_model_and_input(
                         f"{attempt_batch} to fit in GPU memory."
                     )
                 return model, inputs
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        except torch.OutOfMemoryError:
+            _empty_cache(device)
             if attempt_batch == 1:
                 raise RuntimeError(
                     "Model does not fit in GPU memory even with batch_size=1. "
-                    f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
+                    f"GPU memory: {_device_total_memory_gb(device):.1f} GB"
                 )
             print(
                 f"  OOM with batch_size={attempt_batch}, trying smaller..."
@@ -460,8 +477,8 @@ def _prepare_model_and_input(
                             f"{attempt_batch}."
                         )
                     return model, inputs
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
+                except torch.OutOfMemoryError:
+                    _empty_cache(device)
                     continue
                 except Exception:
                     pass
@@ -606,7 +623,11 @@ def profile_model(
         if device == "cuda":
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         elif device == "xpu":
-            activities.append(torch.profiler.ProfilerActivity.XPU)
+            xpu_activity = getattr(torch.profiler.ProfilerActivity, "XPU", None)
+            if xpu_activity is not None:
+                activities.append(xpu_activity)
+            else:
+                print("  WARNING: torch.profiler XPU activity is unavailable; collecting CPU-only trace.")
         
         with torch.profiler.profile(
             activities=activities,
@@ -1046,8 +1067,8 @@ def main() -> int:
     except RuntimeError as e:
         print(f"ERROR: {e}")
         return 1
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+    except torch.OutOfMemoryError:
+        _empty_cache(device)
         print("ERROR: GPU out of memory. Try a smaller --input-shape or batch size.")
         return 1
 
@@ -1080,8 +1101,8 @@ def main() -> int:
             export_trace=args.export_trace,
             memory_snapshot=args.memory_snapshot,
         )
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+    except torch.OutOfMemoryError:
+        _empty_cache(device)
         print(
             "ERROR: GPU out of memory during profiling. "
             "Try a smaller --input-shape."

@@ -810,16 +810,9 @@ def compare_outputs(
     total_abs_error = 0.0
     total_valid = 0
     max_abs_error = 0.0
-
-    if result["opt_has_nan"] and not result["ref_has_nan"]:
-        result["correctness"] = "FAIL"
-        result["reason"] = "Optimized output contains NaN where reference does not"
-        return result
-
-    if result["opt_has_inf"] and not result["ref_has_inf"]:
-        result["correctness"] = "FAIL"
-        result["reason"] = "Optimized output contains Inf where reference does not"
-        return result
+    nan_mismatch = False
+    inf_mismatch = False
+    inf_sign_mismatch = False
 
     # Tolerance check
     tols = DEFAULT_TOLERANCES.get(dtype, {"atol": 1e-4, "rtol": 1e-4})
@@ -842,7 +835,15 @@ def compare_outputs(
         result["opt_has_nan"] = result["opt_has_nan"] or bool(opt_nan.any())
         result["opt_has_inf"] = result["opt_has_inf"] or bool(opt_inf.any())
 
-        valid_mask = ~(ref_nan & opt_nan)
+        if bool((opt_nan & ~ref_nan).any()):
+            nan_mismatch = True
+        if bool((opt_inf & ~ref_inf).any()):
+            inf_mismatch = True
+        both_inf = ref_inf & opt_inf
+        if bool((both_inf & (torch.signbit(ref_chunk) != torch.signbit(opt_chunk))).any()):
+            inf_sign_mismatch = True
+
+        valid_mask = torch.isfinite(ref_chunk) & torch.isfinite(opt_chunk)
         if valid_mask.any():
             ref_valid = ref_chunk[valid_mask]
             opt_valid = opt_chunk[valid_mask]
@@ -852,6 +853,33 @@ def compare_outputs(
             total_valid += int(diff.numel())
             if not torch.allclose(ref_valid, opt_valid, atol=atol, rtol=rtol):
                 passes = False
+
+    if nan_mismatch:
+        result["correctness"] = "FAIL"
+        result["reason"] = "Optimized output contains NaN where reference does not"
+        result["max_abs_error"] = max_abs_error
+        result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
+        result["atol"] = atol
+        result["rtol"] = rtol
+        return result
+
+    if inf_mismatch:
+        result["correctness"] = "FAIL"
+        result["reason"] = "Optimized output contains Inf where reference does not"
+        result["max_abs_error"] = max_abs_error
+        result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
+        result["atol"] = atol
+        result["rtol"] = rtol
+        return result
+
+    if inf_sign_mismatch:
+        result["correctness"] = "FAIL"
+        result["reason"] = "Optimized output has Inf sign mismatch versus reference"
+        result["max_abs_error"] = max_abs_error
+        result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0
+        result["atol"] = atol
+        result["rtol"] = rtol
+        return result
 
     result["max_abs_error"] = max_abs_error
     result["mean_abs_error"] = total_abs_error / total_valid if total_valid > 0 else 0.0

@@ -552,9 +552,10 @@ def main() -> None:
     n_timed = args.n_timed or (30 if args.quick else DEFAULT_N_TIMED)
 
     import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_xpu = (not torch.cuda.is_available()) and hasattr(torch, "xpu") and torch.xpu.is_available()
+    device = "xpu" if use_xpu else ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cpu":
-        print("WARNING: No CUDA GPU detected. Results on CPU are not meaningful.")
+        print("WARNING: No CUDA/XPU GPU detected. Results on CPU are not meaningful.")
 
     meta = load_metadata()
     uid = meta.get("uid", "unknown")
@@ -606,6 +607,8 @@ def main() -> None:
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    elif device == "xpu":
+        torch.xpu.reset_peak_memory_stats()
 
     # ---- Stage 1: Correctness ----
     print(f"\n--- Stage 1: Correctness ({n_trials} trials, atol={args.atol}, rtol={args.rtol}) ---")

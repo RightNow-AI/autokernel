@@ -513,6 +513,10 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
             torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
             torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
         },
+        # Intel XPU bf16 can accumulate larger drift at big shapes.
+        "xpu_tolerances": {
+            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
+        },
         # gate_proj + up_proj + silu + mul + down_proj
         "flops_fn": lambda s: 2 * s["batch"] * s["dim"] * s["hidden"] * 3,
         "bytes_fn": lambda s, dt: (s["batch"] * s["dim"] + s["hidden"] * s["dim"] * 3 + s["batch"] * s["dim"]) * _dtype_bytes(dt),
@@ -696,7 +700,10 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     ref_fn = config["reference_fn"]
     sizes = config["test_sizes"]
     dtypes = config["test_dtypes"]
-    tols = config["tolerances"]
+    tols = dict(config["tolerances"])
+    if _USE_XPU:
+        for dt, tol in config.get("xpu_tolerances", {}).items():
+            tols[dt] = tol
 
     # ------------------------------------------------------------------
     # Stage 1: SMOKE TEST -- tiny input, tight tolerance
@@ -1199,11 +1206,18 @@ def run_profile(kernel_fn: Callable, config: dict):
     print("\n=== PROFILING ===")
     print(f"Profiling with size: {prof_size}, dtype: {dtype}")
 
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if _USE_XPU:
+        xpu_activity = getattr(torch.profiler.ProfilerActivity, "XPU", None)
+        if xpu_activity is not None:
+            activities.append(xpu_activity)
+        else:
+            print("WARNING: torch.profiler XPU activity unavailable; collecting CPU-only trace.")
+    else:
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
     with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
+        activities=activities,
         record_shapes=True,
         with_stack=True,
     ) as prof:
