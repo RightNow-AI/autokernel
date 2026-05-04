@@ -23,7 +23,7 @@ Each experiment takes ~90 seconds. That's ~40 experiments/hour, ~320 overnight, 
 
 ## Quick Start
 
-**Requirements:** GPU with Triton support (NVIDIA CUDA or Intel XPU), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** NVIDIA GPU (tested on H100/A100/RTX 4090), Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 # Install uv (if you don't have it)
@@ -237,7 +237,6 @@ Built by [RightNow AI](https://www.rightnowai.co). For enterprise GPU optimizati
 ## Changelog
 
 ### v1.3.0
-- Official Intel XPU support across setup, profiling, benchmarking, and end-to-end verification
 - AMD ROCm GPU support: MI300X, MI325X, MI350X, MI355X detection and specs (thanks [@andyluo7](https://github.com/andyluo7))
 - Fixed `verify.py` SyntaxError on Python 3.13+
 - Fixed CUDA flash_attention ignoring `sm_scale` parameter
