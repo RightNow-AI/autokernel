@@ -130,6 +130,7 @@ def _default_kernel_entry(
         "experiments_kept": 0,
         "consecutive_reverts": 0,
         "time_spent_minutes": 0,
+        "kernel_started_at": None,
     }
 
 
@@ -150,6 +151,7 @@ def _initialize_state_from_plan(plan: dict) -> dict:
     first_file = kernels[0]["file"] if kernels else None
     if kernels:
         kernels[0]["status"] = STATUS_OPTIMIZING
+        kernels[0]["kernel_started_at"] = _now_iso()
 
     return {
         "current_kernel_idx": 0,
@@ -461,6 +463,7 @@ def _transition_to(state: dict, next_idx: int) -> None:
     """Move the orchestrator to a new kernel index."""
     kernels = state["kernels"]
     kernels[next_idx]["status"] = STATUS_OPTIMIZING
+    kernels[next_idx]["kernel_started_at"] = _now_iso()
     state["current_kernel_idx"] = next_idx
     state["current_kernel_file"] = kernels[next_idx]["file"]
 
@@ -531,12 +534,12 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
     if target["baseline_tflops"] and target["best_tflops"] and target["baseline_tflops"] > 0:
         target["speedup"] = round(target["best_tflops"] / target["baseline_tflops"], 3)
 
-    # Update time_spent_minutes from started_at
-    started = state.get("started_at")
-    if started:
+    # Update time_spent_minutes from kernel_started_at (per-kernel, not global)
+    k_started = target.get("kernel_started_at")
+    if k_started:
         try:
             # Accept both timezone-aware and naive timestamps
-            start_dt = datetime.fromisoformat(started)
+            start_dt = datetime.fromisoformat(k_started)
             now_dt = datetime.now(timezone.utc)
             if start_dt.tzinfo is None:
                 start_dt = start_dt.replace(tzinfo=timezone.utc)
@@ -840,3 +843,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
