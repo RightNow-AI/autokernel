@@ -1,5 +1,12 @@
 """Kernel specifications: the public description of a benchmarkable operation.
 
+Typical use::
+
+    from autokernel.specs import create_builtin_registry
+
+    registry = create_builtin_registry()
+    spec = registry.get("matmul")
+
 Importing this package never imports ``torch`` and never initializes a GPU.
 """
 
