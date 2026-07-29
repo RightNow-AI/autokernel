@@ -11,9 +11,13 @@ Handles:
 Usage:
   uv run bench.py                        # benchmark kernel.py using its KERNEL_TYPE
   uv run bench.py --kernel matmul        # force kernel type
+  uv run bench.py --spec path/spec.py:SPEC   # benchmark an external KernelSpec
   uv run bench.py --quick                # skip stages 3-5, bench only large size
   uv run bench.py --profile              # emit torch profiler trace
   uv run bench.py --sizes large          # benchmark only 'large' size
+
+Operation metadata (sizes, dtypes, tolerances, edge cases, FLOP/byte accounting)
+lives in autokernel/specs/, not in this file.
 """
 
 from __future__ import annotations
@@ -31,6 +35,24 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+# The package lives next to this script; make sure it is importable when bench.py
+# is invoked from another working directory.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from autokernel.specs import (  # noqa: E402  (path bootstrap must run first)
+    KernelRegistry,
+    KernelSpec,
+    SpecLoadError,
+    SpecNotFoundError,
+    SpecValidationError,
+    create_builtin_registry,
+    dtype_bytes,
+    resolve_spec,
+    resolve_torch_dtype,
+)
 
 # ---------------------------------------------------------------------------
 # Timeout helper (cross-platform)
@@ -197,408 +219,107 @@ def detect_gpu() -> GPUSpec:
 
 
 # =========================================================================
-# 2. INPUT GENERATORS (deterministic via manual_seed)
+# 2. OPERATION METADATA (from the KernelSpec registry)
 # =========================================================================
+# Input generators, reference wiring, sizes, dtypes, tolerances, edge cases and
+# FLOP/byte accounting are owned by autokernel/specs/. This file only translates
+# canonical dtype names into torch dtypes at the runtime boundary.
 
-def gen_matmul_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N, K = size["M"], size["N"], size["K"]
-    A = torch.randn(M, K, device=device, dtype=dtype)
-    B = torch.randn(K, N, device=device, dtype=dtype)
-    return {"A": A, "B": B}
-
-
-def gen_softmax_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    rows, cols = size["rows"], size["cols"]
-    x = torch.randn(rows, cols, device=device, dtype=dtype)
-    return {"x": x}
-
-
-def gen_layernorm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, dim = size["batch"], size["dim"]
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    weight = torch.ones(dim, device=device, dtype=dtype)
-    bias = torch.zeros(dim, device=device, dtype=dtype)
-    return {"x": x, "weight": weight, "bias": bias}
-
-
-def gen_flash_attention_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
-    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    return {"Q": Q, "K": K, "V": V}
-
-
-def gen_fused_mlp_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, dim, hidden = size["batch"], size["dim"], size["hidden"]
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    w_gate = torch.randn(hidden, dim, device=device, dtype=dtype) * 0.02
-    w_up = torch.randn(hidden, dim, device=device, dtype=dtype) * 0.02
-    w_down = torch.randn(dim, hidden, device=device, dtype=dtype) * 0.02
-    return {"x": x, "w_gate": w_gate, "w_up": w_up, "w_down": w_down}
-
-
-def gen_cross_entropy_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, vocab = size["batch"], size["vocab"]
-    logits = torch.randn(batch, vocab, device=device, dtype=dtype)
-    targets = torch.randint(0, vocab, (batch,), device=device, dtype=torch.long)
-    return {"logits": logits, "targets": targets}
-
-
-def gen_rotary_embedding_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
-    x = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    half_dim = head_dim // 2
-    cos = torch.randn(seq_len, half_dim, device=device, dtype=dtype)
-    sin = torch.randn(seq_len, half_dim, device=device, dtype=dtype)
-    return {"x": x, "cos": cos, "sin": sin}
-
-
-def gen_rmsnorm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N = size["M"], size["N"]
-    x = torch.randn(M, N, device=device, dtype=dtype)
-    weight = torch.randn(N, device=device, dtype=dtype)
-    return {"x": x, "weight": weight}
-
-
-def gen_reduce_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N = size["M"], size["N"]
-    x = torch.randn(M, N, device=device, dtype=dtype)
-    return {"x": x}
-
-
-# =========================================================================
-# 3. REFERENCE WRAPPERS
-# =========================================================================
-# Thin wrappers that call reference.py functions with the right dict keys.
-
-def _ref_matmul(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.matmul_ref(inputs["A"], inputs["B"])
-
-def _ref_softmax(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.softmax_ref(inputs["x"])
-
-def _ref_layernorm(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.layernorm_ref(inputs["x"], inputs["weight"], inputs["bias"])
-
-def _ref_flash_attention(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.flash_attention_ref(inputs["Q"], inputs["K"], inputs["V"])
-
-def _ref_fused_mlp(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.fused_mlp_ref(inputs["x"], inputs["w_gate"], inputs["w_up"], inputs["w_down"])
-
-def _ref_cross_entropy(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.cross_entropy_ref(inputs["logits"], inputs["targets"])
-
-def _ref_rotary_embedding(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.rotary_embedding_ref(inputs["x"], inputs["cos"], inputs["sin"])
-
-def _ref_rmsnorm(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.rmsnorm_ref(inputs["x"], inputs["weight"])
-
-def _ref_reduce(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.reduce_sum_ref(inputs["x"], dim=-1)
-
-
-# =========================================================================
-# 4. KERNEL CONFIGS
-# =========================================================================
 
 def _dtype_bytes(dtype: torch.dtype) -> int:
     """Return byte-width for a dtype."""
     return torch.tensor([], dtype=dtype).element_size()
 
 
-KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
-    # -----------------------------------------------------------------
-    # MATMUL
-    # -----------------------------------------------------------------
-    "matmul": {
-        "test_sizes": [
-            ("tiny",    {"M": 128,  "N": 128,  "K": 128}),
-            ("small",   {"M": 512,  "N": 512,  "K": 512}),
-            ("medium",  {"M": 1024, "N": 1024, "K": 1024}),
-            ("large",   {"M": 2048, "N": 2048, "K": 2048}),
-            ("xlarge",  {"M": 4096, "N": 4096, "K": 4096}),
-            ("tall",    {"M": 8192, "N": 1024, "K": 1024}),
-            ("wide",    {"M": 1024, "N": 8192, "K": 1024}),
-            ("deep_k",  {"M": 1024, "N": 1024, "K": 8192}),
-            ("llm_qkv", {"M": 4096, "N": 4096, "K": 512}),
-            ("llm_mlp", {"M": 4096, "N": 11008, "K": 4096}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        "flops_fn": lambda s: 2 * s["M"] * s["N"] * s["K"],
-        "bytes_fn": lambda s, dt: (s["M"] * s["K"] + s["K"] * s["N"] + s["M"] * s["N"]) * _dtype_bytes(dt),
-        "input_generator": gen_matmul_inputs,
-        "reference_fn": _ref_matmul,
-        "edge_sizes": [
-            ("edge_1023",  {"M": 1023, "N": 1023, "K": 1023}),
-            ("edge_4097",  {"M": 4097, "N": 4097, "K": 512}),
-            ("edge_1537",  {"M": 1537, "N": 1537, "K": 1537}),
-        ],
-    },
+def _spec_sizes(spec: KernelSpec) -> List[Tuple[str, Dict[str, int]]]:
+    """Ordered ``(label, size)`` pairs, as the harness has always consumed them."""
+    return list(spec.size_items())
 
-    # -----------------------------------------------------------------
-    # SOFTMAX
-    # -----------------------------------------------------------------
-    "softmax": {
-        "test_sizes": [
-            ("tiny",    {"rows": 32,    "cols": 128}),
-            ("small",   {"rows": 256,   "cols": 512}),
-            ("medium",  {"rows": 1024,  "cols": 1024}),
-            ("large",   {"rows": 4096,  "cols": 4096}),
-            ("xlarge",  {"rows": 8192,  "cols": 8192}),
-            ("wide",    {"rows": 1024,  "cols": 32768}),
-            ("narrow",  {"rows": 32768, "cols": 128}),
-            ("vocab",   {"rows": 4096,  "cols": 50257}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        "flops_fn": lambda s: 5 * s["rows"] * s["cols"],  # exp + sub + sum + div + max
-        "bytes_fn": lambda s, dt: 2 * s["rows"] * s["cols"] * _dtype_bytes(dt),  # read + write
-        "input_generator": gen_softmax_inputs,
-        "reference_fn": _ref_softmax,
-        "edge_sizes": [
-            ("edge_1023",  {"rows": 1023, "cols": 1023}),
-            ("edge_4097",  {"rows": 4097, "cols": 4097}),
-            ("edge_50257", {"rows": 1024, "cols": 50257}),
-        ],
-    },
 
-    # -----------------------------------------------------------------
-    # LAYERNORM
-    # -----------------------------------------------------------------
-    "layernorm": {
-        "test_sizes": [
-            ("tiny",    {"batch": 32,    "dim": 128}),
-            ("small",   {"batch": 256,   "dim": 512}),
-            ("medium",  {"batch": 1024,  "dim": 1024}),
-            ("large",   {"batch": 4096,  "dim": 2048}),
-            ("xlarge",  {"batch": 8192,  "dim": 4096}),
-            ("wide",    {"batch": 1024,  "dim": 8192}),
-            ("llm_7b",  {"batch": 4096,  "dim": 4096}),
-            ("llm_13b", {"batch": 4096,  "dim": 5120}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        "flops_fn": lambda s: 8 * s["batch"] * s["dim"],  # mean, var, norm, scale, shift
-        "bytes_fn": lambda s, dt: (2 * s["batch"] * s["dim"] + 2 * s["dim"]) * _dtype_bytes(dt),
-        "input_generator": gen_layernorm_inputs,
-        "reference_fn": _ref_layernorm,
-        "edge_sizes": [
-            ("edge_1023",  {"batch": 1023, "dim": 1023}),
-            ("edge_4097",  {"batch": 4097, "dim": 4097}),
-        ],
-    },
+def _spec_dtypes(spec: KernelSpec) -> List[torch.dtype]:
+    """Declared dtypes as torch dtypes, in benchmark order."""
+    return [resolve_torch_dtype(name) for name in spec.dtypes]
 
-    # -----------------------------------------------------------------
-    # FLASH ATTENTION
-    # -----------------------------------------------------------------
-    "flash_attention": {
-        "test_sizes": [
-            ("tiny",    {"batch": 1, "heads": 4,  "seq_len": 64,   "head_dim": 64}),
-            ("small",   {"batch": 2, "heads": 8,  "seq_len": 256,  "head_dim": 64}),
-            ("medium",  {"batch": 2, "heads": 16, "seq_len": 512,  "head_dim": 64}),
-            ("large",   {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 64}),
-            ("xlarge",  {"batch": 2, "heads": 32, "seq_len": 2048, "head_dim": 64}),
-            ("long",    {"batch": 1, "heads": 32, "seq_len": 4096, "head_dim": 64}),
-            ("gqa",     {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128}),
-            ("llm_7b",  {"batch": 1, "heads": 32, "seq_len": 2048, "head_dim": 128}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        # 4*N*S^2*D FLOPs (Q@K^T + softmax + attn@V)
-        "flops_fn": lambda s: 4 * s["batch"] * s["heads"] * (s["seq_len"] ** 2) * s["head_dim"],
-        "bytes_fn": lambda s, dt: 3 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * _dtype_bytes(dt) + \
-                                   s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * _dtype_bytes(dt),
-        "input_generator": gen_flash_attention_inputs,
-        "reference_fn": _ref_flash_attention,
-        "edge_sizes": [
-            ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
-            ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 64}),
-        ],
-    },
 
-    # -----------------------------------------------------------------
-    # FUSED MLP (SwiGLU)
-    # -----------------------------------------------------------------
-    "fused_mlp": {
-        "test_sizes": [
-            ("tiny",    {"batch": 32,   "dim": 128,  "hidden": 256}),
-            ("small",   {"batch": 256,  "dim": 512,  "hidden": 1024}),
-            ("medium",  {"batch": 1024, "dim": 1024, "hidden": 2048}),
-            ("large",   {"batch": 2048, "dim": 2048, "hidden": 5504}),
-            ("xlarge",  {"batch": 4096, "dim": 4096, "hidden": 11008}),
-            ("llm_7b",  {"batch": 2048, "dim": 4096, "hidden": 11008}),
-            ("llm_13b", {"batch": 2048, "dim": 5120, "hidden": 13824}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        # gate_proj + up_proj + silu + mul + down_proj
-        "flops_fn": lambda s: 2 * s["batch"] * s["dim"] * s["hidden"] * 3,
-        "bytes_fn": lambda s, dt: (s["batch"] * s["dim"] + s["hidden"] * s["dim"] * 3 + s["batch"] * s["dim"]) * _dtype_bytes(dt),
-        "input_generator": gen_fused_mlp_inputs,
-        "reference_fn": _ref_fused_mlp,
-        "edge_sizes": [
-            ("edge_1023", {"batch": 1023, "dim": 1024, "hidden": 2048}),
-            ("edge_4097", {"batch": 4097, "dim": 512,  "hidden": 1024}),
-        ],
-    },
+def _spec_tolerances(spec: KernelSpec) -> Dict[torch.dtype, Dict[str, float]]:
+    """Tolerances keyed by torch dtype."""
+    return {
+        resolve_torch_dtype(name): tol.as_dict()
+        for name, tol in spec.tolerances.items()
+    }
 
-    # -----------------------------------------------------------------
-    # CROSS ENTROPY
-    # -----------------------------------------------------------------
-    "cross_entropy": {
-        "test_sizes": [
-            ("tiny",    {"batch": 32,    "vocab": 256}),
-            ("small",   {"batch": 256,   "vocab": 1024}),
-            ("medium",  {"batch": 1024,  "vocab": 4096}),
-            ("large",   {"batch": 4096,  "vocab": 32000}),
-            ("xlarge",  {"batch": 8192,  "vocab": 50257}),
-            ("llama",   {"batch": 4096,  "vocab": 32000}),
-            ("gpt2",    {"batch": 4096,  "vocab": 50257}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        # log_softmax + nll
-        "flops_fn": lambda s: 4 * s["batch"] * s["vocab"],
-        "bytes_fn": lambda s, dt: (s["batch"] * s["vocab"] + s["batch"]) * _dtype_bytes(dt),
-        "input_generator": gen_cross_entropy_inputs,
-        "reference_fn": _ref_cross_entropy,
-        "edge_sizes": [
-            ("edge_1023",  {"batch": 1023, "vocab": 32000}),
-            ("edge_50257", {"batch": 4096, "vocab": 50257}),
-        ],
-    },
 
-    # -----------------------------------------------------------------
-    # ROTARY EMBEDDING
-    # -----------------------------------------------------------------
-    "rotary_embedding": {
-        "test_sizes": [
-            ("tiny",    {"batch": 1, "heads": 4,  "seq_len": 64,   "head_dim": 64}),
-            ("small",   {"batch": 2, "heads": 8,  "seq_len": 256,  "head_dim": 64}),
-            ("medium",  {"batch": 2, "heads": 16, "seq_len": 512,  "head_dim": 64}),
-            ("large",   {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128}),
-            ("xlarge",  {"batch": 2, "heads": 32, "seq_len": 2048, "head_dim": 128}),
-            ("llm_7b",  {"batch": 1, "heads": 32, "seq_len": 2048, "head_dim": 128}),
-            ("llm_13b", {"batch": 1, "heads": 40, "seq_len": 2048, "head_dim": 128}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        # mul + add per element, x2 (cos and sin parts)
-        "flops_fn": lambda s: 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"],
-        "bytes_fn": lambda s, dt: (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 +
-                                    s["seq_len"] * s["head_dim"]) * _dtype_bytes(dt),
-        "input_generator": gen_rotary_embedding_inputs,
-        "reference_fn": _ref_rotary_embedding,
-        "edge_sizes": [
-            ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
-            ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 128}),
-        ],
-    },
+def _spec_reference(spec: KernelSpec) -> Callable[[Dict[str, Any]], Any]:
+    """Adapt ``reference_fn(**inputs)`` to the harness' ``ref_fn(inputs)`` shape."""
 
-    # -----------------------------------------------------------------
-    # RMSNORM
-    # -----------------------------------------------------------------
-    "rmsnorm": {
-        "test_sizes": [
-            ("small",   {"M": 1024, "N": 768}),
-            ("medium",  {"M": 4096, "N": 1024}),
-            ("large",   {"M": 4096, "N": 4096}),
-            ("llama",   {"M": 2048, "N": 4096}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
-        },
-        "flops_fn": lambda s: 6 * s["M"] * s["N"],  # square, mean, sqrt, div, mul
-        "bytes_fn": lambda s, dt: (2 * s["M"] * s["N"] + s["N"]) * torch.tensor([], dtype=dt).element_size(),
-        "input_generator": gen_rmsnorm_inputs,
-        "reference_fn": _ref_rmsnorm,
-        "edge_sizes": [
-            ("edge_1023", {"M": 1023, "N": 768}),
-            ("edge_4097", {"M": 4097, "N": 1024}),
-        ],
-    },
+    def ref_fn(inputs: Dict[str, Any]) -> Any:
+        return spec.reference_fn(**inputs)
 
-    # -----------------------------------------------------------------
-    # REDUCE (sum along last dim)
-    # -----------------------------------------------------------------
-    "reduce": {
-        "test_sizes": [
-            ("small",   {"M": 1024, "N": 1024}),
-            ("medium",  {"M": 4096, "N": 4096}),
-            ("large",   {"M": 8192, "N": 8192}),
-            ("wide",    {"M": 1024, "N": 32768}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
-        },
-        "flops_fn": lambda s: s["M"] * s["N"],  # N additions per row
-        "bytes_fn": lambda s, dt: (s["M"] * s["N"] + s["M"]) * torch.tensor([], dtype=dt).element_size(),
-        "input_generator": gen_reduce_inputs,
-        "reference_fn": _ref_reduce,
-        "edge_sizes": [
-            ("edge_1023", {"M": 1023, "N": 1024}),
-            ("edge_4097", {"M": 4096, "N": 4097}),
-        ],
-    },
-}
+    return ref_fn
+
+
+def _spec_bytes_fn(spec: KernelSpec) -> Callable[[Dict[str, int], torch.dtype], Any]:
+    """Adapt ``bytes_fn(size, dt_bytes)`` to a torch-dtype call site."""
+
+    def bytes_fn(size: Dict[str, int], dtype: torch.dtype) -> Any:
+        return spec.bytes_fn(size, _dtype_bytes(dtype))
+
+    return bytes_fn
+
+
+def _spec_edge_cases(spec: KernelSpec) -> List[Tuple[str, Dict[str, int]]]:
+    """Edge-case ``(label, size)`` pairs for the shape-robustness stage."""
+    return [(edge.name, dict(edge.size)) for edge in spec.edge_cases]
+
+
+def _legacy_config(spec: KernelSpec) -> Dict[str, Any]:
+    """Build the pre-registry ``KERNEL_CONFIGS`` entry for one specification."""
+    return {
+        "test_sizes": _spec_sizes(spec),
+        "test_dtypes": _spec_dtypes(spec),
+        "tolerances": _spec_tolerances(spec),
+        "flops_fn": spec.flops_fn,
+        "bytes_fn": _spec_bytes_fn(spec),
+        "input_generator": spec.input_generator,
+        "reference_fn": _spec_reference(spec),
+        "edge_sizes": _spec_edge_cases(spec),
+        "spec": spec,
+    }
+
+
+def _build_legacy_configs() -> Dict[str, Dict[str, Any]]:
+    return {spec.name: _legacy_config(spec) for spec in create_builtin_registry()}
+
+
+#: DEPRECATED compatibility view of the old hard-coded configuration table.
+#: Derived from the built-in registry; edit autokernel/specs/builtins.py instead.
+#: New code should use ``autokernel.specs.create_builtin_registry()``.
+KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = _build_legacy_configs()
+
+
+#: Device the harness allocates on. Overridden only by CPU tests; the
+#: benchmark itself always measures on the GPU.
+BENCH_DEVICE = "cuda"
+
+
+def resolve_operation_name(
+    spec_name: Optional[str],
+    kernel_arg: Optional[str],
+    declared_type: Optional[str],
+) -> Optional[str]:
+    """Apply the operation-selection precedence.
+
+    1. the name declared by an explicit ``--spec``;
+    2. an explicit ``--kernel``;
+    3. ``kernel.py::KERNEL_TYPE`` (the historical default).
+
+    Returns None when nothing selects an operation.
+    """
+    return spec_name or kernel_arg or declared_type
 
 
 # =========================================================================
-# 5. CORRECTNESS TESTING (5 stages)
+# 3. CORRECTNESS TESTING (5 stages)
 # =========================================================================
 
 def _compare(output: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> dict:
@@ -638,9 +359,9 @@ def _has_nan_inf(t: torch.Tensor) -> bool:
     return bool(torch.isnan(t).any().item() or torch.isinf(t).any().item())
 
 
-def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> dict:
+def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) -> dict:
     """Run all correctness stages. Returns dict with results."""
-    device = "cuda"
+    device = BENCH_DEVICE
     results = {
         "smoke_test": "SKIP",
         "shape_sweep": "SKIP",
@@ -652,11 +373,11 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     details = []
     all_pass = True
 
-    gen_fn = config["input_generator"]
-    ref_fn = config["reference_fn"]
-    sizes = config["test_sizes"]
-    dtypes = config["test_dtypes"]
-    tols = config["tolerances"]
+    gen_fn = spec.input_generator
+    ref_fn = _spec_reference(spec)
+    sizes = _spec_sizes(spec)
+    dtypes = _spec_dtypes(spec)
+    tols = _spec_tolerances(spec)
 
     # ------------------------------------------------------------------
     # Stage 1: SMOKE TEST -- tiny input, tight tolerance
@@ -913,46 +634,52 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     # ------------------------------------------------------------------
     print("\n--- Stage 5: Edge Cases ---")
     edge_pass = True
-    edge_sizes = config.get("edge_sizes", [])
-    if not edge_sizes:
+    edge_cases = spec.edge_cases
+    if not edge_cases:
         results["edge_cases"] = "SKIP (no edge sizes defined)"
         print("  SKIP: no edge sizes defined")
     else:
-        for label, sz in edge_sizes:
-            for dtype in dtypes[:1]:  # test with first dtype only for speed
-                try:
-                    inputs = gen_fn(sz, dtype, device, seed=42)
-                    expected = ref_fn(inputs)
-                    with _Timeout(30):
-                        output = kernel_fn(**inputs)
+        for edge in edge_cases:
+            label = edge.name
+            sz = dict(edge.size)
+            # An edge case may pin its own dtype; otherwise use the primary
+            # dtype only, for speed.
+            dtype = resolve_torch_dtype(edge.dtype) if edge.dtype else dtypes[0]
+            try:
+                inputs = gen_fn(sz, dtype, device, seed=edge.seed)
+                if edge.input_transform is not None:
+                    inputs = edge.input_transform(inputs)
+                expected = ref_fn(inputs)
+                with _Timeout(30):
+                    output = kernel_fn(**inputs)
 
-                    if _has_nan_inf(output) and not _has_nan_inf(expected):
-                        edge_pass = False
-                        details.append(f"  edge {label}: NaN/Inf")
-                        print(f"  FAIL: {label} -> NaN/Inf")
+                if _has_nan_inf(output) and not _has_nan_inf(expected):
+                    edge_pass = False
+                    details.append(f"  edge {label}: NaN/Inf")
+                    print(f"  FAIL: {label} -> NaN/Inf")
+                else:
+                    tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
+                    cmp = _compare(output, expected, **tol)
+                    if cmp["match"]:
+                        print(f"  PASS: {label} (max_err={cmp['max_abs_error']:.2e})")
                     else:
-                        tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                        cmp = _compare(output, expected, **tol)
-                        if cmp["match"]:
-                            print(f"  PASS: {label} (max_err={cmp['max_abs_error']:.2e})")
-                        else:
-                            edge_pass = False
-                            details.append(f"  edge {label}: {cmp['reason']}")
-                            print(f"  FAIL: {label} -> {cmp['reason']}")
+                        edge_pass = False
+                        details.append(f"  edge {label}: {cmp['reason']}")
+                        print(f"  FAIL: {label} -> {cmp['reason']}")
 
-                except torch.cuda.OutOfMemoryError:
-                    print(f"  SKIP: {label} -> OOM")
-                    torch.cuda.empty_cache()
-                except BenchTimeoutError:
-                    edge_pass = False
-                    details.append(f"  edge {label}: TIMEOUT")
-                    print(f"  FAIL: {label} -> TIMEOUT")
-                except Exception as e:
-                    edge_pass = False
-                    details.append(f"  edge {label}: {type(e).__name__}: {e}")
-                    print(f"  FAIL: {label} -> {type(e).__name__}: {e}")
-                finally:
-                    torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError:
+                print(f"  SKIP: {label} -> OOM")
+                torch.cuda.empty_cache()
+            except BenchTimeoutError:
+                edge_pass = False
+                details.append(f"  edge {label}: TIMEOUT")
+                print(f"  FAIL: {label} -> TIMEOUT")
+            except Exception as e:
+                edge_pass = False
+                details.append(f"  edge {label}: {type(e).__name__}: {e}")
+                print(f"  FAIL: {label} -> {type(e).__name__}: {e}")
+            finally:
+                torch.cuda.empty_cache()
 
         results["edge_cases"] = "PASS" if edge_pass else "FAIL"
         if not edge_pass:
@@ -967,7 +694,7 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
 
 
 # =========================================================================
-# 6. PERFORMANCE BENCHMARKING
+# 4. PERFORMANCE BENCHMARKING
 # =========================================================================
 
 def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
@@ -1000,18 +727,18 @@ def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
     return times[len(times) // 2]  # median
 
 
-def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
+def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
                     sizes_filter: str = "all") -> dict:
     """Run performance benchmarks. Returns dict with metrics."""
-    device = "cuda"
-    gen_fn = config["input_generator"]
-    ref_fn = config["reference_fn"]
-    flops_fn = config["flops_fn"]
-    bytes_fn = config["bytes_fn"]
-    dtypes = config["test_dtypes"]
+    device = BENCH_DEVICE
+    gen_fn = spec.input_generator
+    ref_fn = _spec_reference(spec)
+    flops_fn = spec.flops_fn
+    bytes_fn = _spec_bytes_fn(spec)
+    dtypes = _spec_dtypes(spec)
 
     # Select benchmark size
-    sizes = config["test_sizes"]
+    sizes = _spec_sizes(spec)
     bench_sizes = []
     if sizes_filter == "all":
         bench_sizes = sizes
@@ -1132,14 +859,14 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
 
 # =========================================================================
-# 7. PROFILER (optional)
+# 5. PROFILER (optional)
 # =========================================================================
 
-def run_profile(kernel_fn: Callable, config: dict):
+def run_profile(kernel_fn: Callable, spec: KernelSpec):
     """Run torch profiler and save a trace."""
-    device = "cuda"
-    gen_fn = config["input_generator"]
-    sizes = config["test_sizes"]
+    device = BENCH_DEVICE
+    gen_fn = spec.input_generator
+    sizes = _spec_sizes(spec)
 
     # Use 'medium' or first size
     prof_size = None
@@ -1150,7 +877,7 @@ def run_profile(kernel_fn: Callable, config: dict):
     if prof_size is None:
         prof_size = sizes[0][1]
 
-    dtype = config["test_dtypes"][0]
+    dtype = _spec_dtypes(spec)[0]
     inputs = gen_fn(prof_size, dtype, device, seed=42)
 
     trace_dir = "./traces"
@@ -1188,7 +915,7 @@ def run_profile(kernel_fn: Callable, config: dict):
 
 
 # =========================================================================
-# 8. MAIN -- orchestrate everything and produce structured output
+# 6. MAIN -- orchestrate everything and produce structured output
 # =========================================================================
 
 def main():
@@ -1197,6 +924,12 @@ def main():
     parser = argparse.ArgumentParser(description="AutoKernel benchmark harness")
     parser.add_argument("--kernel", type=str, default=None,
                         help="Kernel type to benchmark (default: read from kernel.py)")
+    parser.add_argument("--spec", type=str, default=None,
+                        help="External KernelSpec locator, e.g. "
+                             "'path/to/spec.py:SPEC' or 'package.module:SPEC'. "
+                             "Takes precedence over --kernel.")
+    parser.add_argument("--spec-override", action="store_true",
+                        help="Allow --spec to replace a built-in operation of the same name")
     parser.add_argument("--sizes", type=str, default="all",
                         help="Which sizes to benchmark: small|medium|large|all (default: all)")
     parser.add_argument("--quick", action="store_true",
@@ -1216,6 +949,29 @@ def main():
     kernel_fn = None
     kernel_type = args.kernel
 
+    # ------------------------------------------------------------------
+    # Resolve the operation specification.
+    # Precedence: --spec, then --kernel, then kernel.py::KERNEL_TYPE.
+    # Loading happens after argument parsing, so `bench.py --help` never
+    # imports an external specification.
+    # ------------------------------------------------------------------
+    registry: KernelRegistry = create_builtin_registry()
+    spec: Optional[KernelSpec] = None
+    if args.spec:
+        try:
+            spec, registry = resolve_spec(
+                spec_locator=args.spec,
+                registry=registry,
+                override=args.spec_override,
+            )
+        except (SpecLoadError, SpecValidationError) as e:
+            print(f"\nERROR: {e}")
+            print(f"\ncorrectness: FAIL")
+            print(f"throughput_tflops: 0.000")
+            sys.exit(1)
+        kernel_type = spec.name
+        print(f"kernel_spec: {args.spec}")
+
     try:
         # Add cwd to path so 'import kernel' works
         if os.getcwd() not in sys.path:
@@ -1228,11 +984,18 @@ def main():
         kernel_module = importlib.import_module("kernel")
         kernel_fn = kernel_module.kernel_fn
 
-        if kernel_type is None:
-            kernel_type = getattr(kernel_module, "KERNEL_TYPE", None)
-            if kernel_type is None:
-                print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
-                sys.exit(1)
+        declared_type = getattr(kernel_module, "KERNEL_TYPE", None)
+        resolved = resolve_operation_name(
+            spec.name if spec is not None else None, args.kernel, declared_type
+        )
+        if resolved is None:
+            print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
+            sys.exit(1)
+        if declared_type is not None and declared_type != resolved:
+            print(f"WARNING: kernel.py declares KERNEL_TYPE '{declared_type}' but "
+                  f"'{resolved}' was requested; benchmarking kernel_fn against "
+                  f"'{resolved}'")
+        kernel_type = resolved
 
         print(f"kernel_type: {kernel_type}")
         print(f"kernel_module: kernel.py loaded successfully")
@@ -1252,15 +1015,16 @@ def main():
         print(f"throughput_tflops: 0.000")
         sys.exit(1)
 
-    # Validate kernel type
-    if kernel_type not in KERNEL_CONFIGS:
-        print(f"\nERROR: Unknown kernel type '{kernel_type}'")
-        print(f"  Available: {', '.join(KERNEL_CONFIGS.keys())}")
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
-        sys.exit(1)
-
-    config = KERNEL_CONFIGS[kernel_type]
+    # Validate kernel type against the registry
+    if spec is None:
+        try:
+            spec = registry.get(kernel_type)
+        except SpecNotFoundError:
+            print(f"\nERROR: Unknown kernel type '{kernel_type}'")
+            print(f"  Available: {', '.join(registry.list_names())}")
+            print(f"\ncorrectness: FAIL")
+            print(f"throughput_tflops: 0.000")
+            sys.exit(1)
 
     # ------------------------------------------------------------------
     # GPU Detection
@@ -1283,7 +1047,7 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n=== CORRECTNESS ===")
     try:
-        correctness_results = run_correctness(kernel_fn, config, quick=args.quick)
+        correctness_results = run_correctness(kernel_fn, spec, quick=args.quick)
     except Exception as e:
         print(f"\nFATAL: Correctness testing crashed: {type(e).__name__}: {e}")
         traceback.print_exc()
@@ -1302,7 +1066,7 @@ def main():
     # Performance
     # ------------------------------------------------------------------
     # Determine primary size info for the header
-    _perf_sizes = config["test_sizes"]
+    _perf_sizes = _spec_sizes(spec)
     _perf_primary_label = None
     _perf_primary_size = None
     for _pl, _ps in _perf_sizes:
@@ -1312,7 +1076,7 @@ def main():
             break
     if _perf_primary_size is None:
         _perf_primary_label, _perf_primary_size = _perf_sizes[-1]
-    _perf_dtype = config["test_dtypes"][0]
+    _perf_dtype = _spec_dtypes(spec)[0]
     _size_params = ", ".join(f"{k}={v}" for k, v in _perf_primary_size.items())
     print(f"\n=== PERFORMANCE ({_perf_primary_label}: {_size_params}, dtype={_perf_dtype}) ===")
 
@@ -1323,7 +1087,7 @@ def main():
         if args.quick:
             sizes_filter = "large"
         torch.cuda.reset_peak_memory_stats()
-        perf_results = run_performance(kernel_fn, config, gpu, sizes_filter=sizes_filter)
+        perf_results = run_performance(kernel_fn, spec, gpu, sizes_filter=sizes_filter)
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")
@@ -1386,7 +1150,7 @@ def main():
     # ------------------------------------------------------------------
     if args.profile:
         try:
-            run_profile(kernel_fn, config)
+            run_profile(kernel_fn, spec)
         except Exception as e:
             print(f"\nWARNING: Profiling failed: {type(e).__name__}: {e}")
 
