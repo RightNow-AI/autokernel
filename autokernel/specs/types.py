@@ -16,6 +16,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,7 +68,12 @@ def _fail(spec_name: object, field_name: str, message: str) -> "SpecValidationEr
 
 @dataclass(frozen=True)
 class Tolerance:
-    """Absolute and relative tolerance for one dtype."""
+    """Absolute and relative tolerance for one dtype.
+
+    Both values must be finite and non-negative. A NaN or infinite tolerance
+    would make every comparison pass and silently disable the correctness
+    gate, so it is rejected at construction time.
+    """
 
     atol: float
     rtol: float
@@ -81,6 +87,10 @@ class Tolerance:
                 )
             if value != value:  # NaN
                 raise SpecValidationError(f"Tolerance.{field_name} must not be NaN")
+            if math.isinf(value):
+                raise SpecValidationError(
+                    f"Tolerance.{field_name} must be finite, got {value!r}"
+                )
             if value < 0:
                 raise SpecValidationError(
                     f"Tolerance.{field_name} must be non-negative, got {value!r}"

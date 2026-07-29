@@ -29,6 +29,8 @@
   CI job to run it. GPU tests are marked `gpu`
 - `bench.py` keeps a deprecated `KERNEL_CONFIGS` view derived from the registry
   for out-of-tree callers
+- `Tolerance` rejects negative, NaN, and infinite `atol`/`rtol` values, so a
+  malformed specification cannot silently disable the correctness gate
 
 ## v1.3.0 -- 2026-03-13
 

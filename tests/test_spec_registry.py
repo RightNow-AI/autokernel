@@ -149,6 +149,34 @@ def test_reject_negative_tolerance_through_mapping():
         make_spec(dtypes=("float16",), tolerances={"float16": {"atol": -1.0, "rtol": 0.0}})
 
 
+@pytest.mark.parametrize("atol,rtol", [(float("nan"), 1e-3), (1e-3, float("nan"))])
+def test_reject_nan_tolerances(atol, rtol):
+    with pytest.raises(SpecValidationError, match="must not be NaN"):
+        Tolerance(atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "atol,rtol",
+    [
+        (float("inf"), 1e-3),
+        (1e-3, float("inf")),
+        (float("-inf"), 1e-3),
+        (1e-3, float("-inf")),
+    ],
+)
+def test_reject_infinite_tolerances(atol, rtol):
+    with pytest.raises(SpecValidationError, match="must be finite"):
+        Tolerance(atol=atol, rtol=rtol)
+
+
+def test_reject_infinite_tolerance_through_mapping():
+    with pytest.raises(SpecValidationError, match="must be finite"):
+        make_spec(
+            dtypes=("float16",),
+            tolerances={"float16": {"atol": float("inf"), "rtol": 0.0}},
+        )
+
+
 def test_extra_tolerances_are_allowed():
     spec = make_spec(
         dtypes=("float16",),

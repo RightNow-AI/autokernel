@@ -219,7 +219,8 @@ these responsibilities.
 - a missing `small`, `medium`, or `large` size for built-ins;
 - unknown dtype strings;
 - missing tolerances for a declared dtype;
-- negative tolerances;
+- negative, NaN, or infinite tolerances (a non-finite value would make every
+  comparison pass and silently disable the correctness gate);
 - missing starter-kernel files;
 - duplicate shape aliases that resolve inconsistently;
 - a reference or input generator that is not callable.
