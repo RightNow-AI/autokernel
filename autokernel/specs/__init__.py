@@ -2,10 +2,12 @@
 
 Typical use::
 
-    from autokernel.specs import create_builtin_registry
+    from autokernel.specs import create_builtin_registry, load_spec
 
     registry = create_builtin_registry()
     spec = registry.get("matmul")
+
+    external = load_spec("examples/custom_ops/add.py:SPEC", registry=registry)
 
 Importing this package never imports ``torch`` and never initializes a GPU.
 """
@@ -22,6 +24,13 @@ from .dtypes import (
     resolve_torch_dtype,
 )
 from .lazy import LazyCallable, lazy_callable
+from .loader import (
+    SpecCollisionError,
+    SpecLoadError,
+    load_spec,
+    parse_locator,
+    resolve_spec,
+)
 from .registry import (
     DuplicateSpecError,
     KernelRegistry,
@@ -53,6 +62,9 @@ __all__ = [
     "LazyCallable",
     "STANDARD_SIZE_LABELS",
     "SizeMap",
+    "SpecCollisionError",
+    "SpecLoadError",
+    "SpecNotFoundError",
     "SpecValidationError",
     "Tolerance",
     "builtin_spec_names",
@@ -62,6 +74,9 @@ __all__ = [
     "dtype_bytes",
     "is_canonical_dtype",
     "lazy_callable",
+    "load_spec",
+    "parse_locator",
+    "resolve_spec",
     "resolve_torch_dtype",
     "serialize_accounting",
     "size",
