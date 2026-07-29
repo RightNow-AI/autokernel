@@ -106,6 +106,84 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 
 Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
 
+Every operation is described by one `KernelSpec` in `autokernel/specs/builtins.py`. That
+specification is the single source of truth for sizes, dtypes, tolerances, edge cases,
+FLOP/byte accounting, profiler shape aliases and starter kernels -- `bench.py` and
+`extract.py` read it instead of carrying their own per-operation tables.
+
+## Custom Operations
+
+Any operation can be added from outside the repository, without editing `bench.py`,
+`extract.py`, `reference.py` or any central map. Write a `KernelSpec` and export it:
+
+```python
+# my_ops/gelu_tanh.py
+from autokernel.specs import DT_BYTES, EdgeCase, KernelSpec, Tolerance, resolve_torch_dtype, size
+
+
+def gelu_tanh_ref(x):
+    import torch
+    return 0.5 * x * (1 + torch.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
+
+
+def gen_inputs(size_map, dtype, device, seed=42):
+    import torch
+    torch.manual_seed(seed)
+    rows, cols = size_map["rows"], size_map["cols"]
+    return {"x": torch.randn(rows, cols, device=device, dtype=resolve_torch_dtype(dtype))}
+
+
+SPEC = KernelSpec(
+    name="gelu_tanh",
+    reference_fn=gelu_tanh_ref,
+    input_generator=gen_inputs,
+    sizes={
+        "small": {"rows": 256, "cols": 512},
+        "medium": {"rows": 1024, "cols": 1024},
+        "large": {"rows": 4096, "cols": 4096},
+    },
+    dtypes=("float16", "bfloat16", "float32"),
+    tolerances={
+        "float16": Tolerance(atol=1e-3, rtol=1e-3),
+        "bfloat16": Tolerance(atol=2e-3, rtol=2e-3),
+        "float32": Tolerance(atol=1e-5, rtol=1e-5),
+    },
+    flops_fn=8 * size("rows") * size("cols"),
+    bytes_fn=2 * size("rows") * size("cols") * DT_BYTES,
+    edge_cases=(EdgeCase(name="edge_1023", size={"rows": 1023, "cols": 1023}),),
+    shape_keys=("rows", "cols"),
+    starter_kernels={"triton": "my_ops/gelu_tanh_kernel.py"},
+)
+```
+
+Then point the existing commands at it with `--spec LOCATOR`, where a locator is
+`path/to/spec.py:ATTRIBUTE` or `package.module:ATTRIBUTE`:
+
+```bash
+# benchmark a candidate kernel.py against the external spec
+cp examples/custom_ops/add_kernel.py kernel.py
+uv run bench.py --spec examples/custom_ops/add.py:SPEC --quick
+
+# generate a starter kernel file for it under workspace/
+uv run extract.py --spec examples/custom_ops/add.py:SPEC --top 1
+```
+
+Operation selection precedence is `--spec`, then `--kernel`, then `kernel.py::KERNEL_TYPE`,
+so existing invocations keep working unchanged. A spec whose name collides with a built-in
+is rejected unless `--spec-override` is passed. `ATTRIBUTE` may be a `KernelSpec` or a
+zero-argument callable returning one.
+
+Requirements the harness validates before allocating anything on the GPU: an
+identifier-like name, `small`/`medium`/`large` sizes, canonical dtype names
+(`float16`, `bfloat16`, `float32`), a tolerance for every declared dtype, size keys that
+match `shape_keys`, and starter-kernel files that exist.
+
+A complete, runnable example lives in `examples/custom_ops/add.py` (spec) and
+`examples/custom_ops/add_kernel.py` (starter kernel).
+
+Note that loading a spec executes the Python file you point at, exactly like running
+`python that_file.py`. Only pass locators you trust.
+
 ## Example Models
 
 Self-contained model definitions ship with AutoKernel (no `transformers` library needed):
@@ -191,6 +269,9 @@ autokernel/
   reference.py          PyTorch reference implementations (ground truth)
   prepare.py            one-time setup: test data, baselines
 
+  autokernel/specs/     KernelSpec types, registry, external spec loader,
+                        built-in operation metadata, input generators
+
   profile.py            profile any PyTorch model, rank kernels by GPU time
   extract.py            extract bottleneck kernels into workspace/
   orchestrate.py        multi-kernel scheduler (Amdahl's law)
@@ -202,6 +283,8 @@ autokernel/
   kernels/cuda/         starter CUDA C++ kernels (9 types, tensor core accelerated)
   kernelbench/          KernelBench integration (bridge, eval harness, scorer)
   models/               self-contained model definitions (GPT-2, LLaMA, BERT)
+  examples/custom_ops/  external KernelSpec example + its starter kernel
+  tests/                CPU test suite (uv run pytest -m "not gpu")
   workspace/            runtime artifacts (gitignored)
 ```
 

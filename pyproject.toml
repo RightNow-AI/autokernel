@@ -36,6 +36,16 @@ hf-kernels = [
     "kernels>=0.4.0",
     "huggingface-hub>=0.20.0",
 ]
+# Development: CPU test suite
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: test requires a CUDA GPU (deselect with -m 'not gpu')",
+]
 
 [tool.uv.sources]
 torch = [
