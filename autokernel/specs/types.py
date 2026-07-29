@@ -27,11 +27,14 @@ from .dtypes import CANONICAL_DTYPES, is_canonical_dtype
 
 __all__ = [
     "STANDARD_SIZE_LABELS",
+    "BackwardSpec",
     "BytesFn",
+    "CompileSpec",
     "EdgeCase",
     "FlopsFn",
     "InputMap",
     "KernelSpec",
+    "OutputSpec",
     "SizeMap",
     "SpecValidationError",
     "Tolerance",
@@ -122,6 +125,117 @@ class EdgeCase:
         object.__setattr__(self, "size", dict(self.size))
 
 
+def _normalize_paths(value: Iterable[str], field: str) -> tuple[str, ...]:
+    """Normalize a sequence of output-tree paths, rejecting duplicates."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise SpecValidationError(f"{field} must be a sequence of path strings")
+    out: list[str] = []
+    for path in value:
+        if not isinstance(path, str) or not path:
+            raise SpecValidationError(
+                f"{field} entries must be non-empty strings, got {path!r}"
+            )
+        if path in out:
+            raise SpecValidationError(f"{field} contains duplicate path {path!r}")
+        out.append(path)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class OutputSpec:
+    """How a structured output tree participates in correctness checking.
+
+    ``included_paths`` of ``None`` compares every leaf; otherwise only the
+    listed leaf paths (see :mod:`autokernel.verification.outputs` for the path
+    syntax) participate, and a configured path that does not exist is an
+    error. ``compare_non_tensors`` controls whether non-tensor (metadata)
+    leaves must match exactly.
+    """
+
+    included_paths: tuple[str, ...] | None = None
+    compare_non_tensors: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.compare_non_tensors, bool):
+            raise SpecValidationError(
+                "OutputSpec.compare_non_tensors must be a bool, got "
+                f"{self.compare_non_tensors!r}"
+            )
+        if self.included_paths is not None:
+            object.__setattr__(
+                self,
+                "included_paths",
+                _normalize_paths(self.included_paths, "OutputSpec.included_paths"),
+            )
+
+
+@dataclass(frozen=True)
+class BackwardSpec:
+    """Opt-in gradient verification for an operation.
+
+    ``differentiable_inputs`` names the generated inputs that must receive
+    gradients. ``output_paths`` selects the tensor output leaves that receive
+    upstream gradients (``None`` selects every floating tensor leaf).
+    ``tolerances`` overrides the forward tolerances for gradient comparison,
+    keyed by canonical dtype. ``enabled_by_default`` lets a specification
+    request the check without a CLI flag.
+    """
+
+    differentiable_inputs: tuple[str, ...]
+    output_paths: tuple[str, ...] | None = None
+    tolerances: Mapping[str, Any] | None = None
+    enabled_by_default: bool = False
+
+    def __post_init__(self) -> None:
+        inputs = _normalize_paths(
+            self.differentiable_inputs, "BackwardSpec.differentiable_inputs"
+        )
+        if not inputs:
+            raise SpecValidationError(
+                "BackwardSpec.differentiable_inputs must name at least one input"
+            )
+        object.__setattr__(self, "differentiable_inputs", inputs)
+        if self.output_paths is not None:
+            object.__setattr__(
+                self,
+                "output_paths",
+                _normalize_paths(self.output_paths, "BackwardSpec.output_paths"),
+            )
+        if not isinstance(self.enabled_by_default, bool):
+            raise SpecValidationError(
+                "BackwardSpec.enabled_by_default must be a bool, got "
+                f"{self.enabled_by_default!r}"
+            )
+        if self.tolerances is not None:
+            object.__setattr__(
+                self,
+                "tolerances",
+                _normalize_tolerances("backward_spec", self.tolerances),
+            )
+
+
+@dataclass(frozen=True)
+class CompileSpec:
+    """Opt-in ``torch.compile`` verification settings.
+
+    ``fullgraph`` (the default) forbids graph breaks. ``dynamic`` declares
+    dynamic-shape support, in which case the check runs at least two
+    compatible shapes through the same compiled callable.
+    """
+
+    enabled: bool = False
+    fullgraph: bool = True
+    dynamic: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("enabled", "fullgraph", "dynamic"):
+            value = getattr(self, field_name)
+            if not isinstance(value, bool):
+                raise SpecValidationError(
+                    f"CompileSpec.{field_name} must be a bool, got {value!r}"
+                )
+
+
 @dataclass(frozen=True, kw_only=True)
 class KernelSpec:
     """Everything the harness needs to benchmark and extract one operation.
@@ -151,6 +265,15 @@ class KernelSpec:
         speedup_estimate: human-readable extraction hint, e.g. ``"2-3x"``.
         default_shape: extraction fallback when a profiled shape cannot be
             parsed. Defaults to the ``large`` size.
+        output_spec: optional structured-output policy. ``None`` compares every
+            output leaf and requires non-tensor leaves to match exactly, which
+            preserves the historical single-tensor behavior.
+        backward_spec: optional gradient-verification policy. ``None`` means
+            the operation is forward-only; ``--check-backward`` then fails with
+            an actionable unsupported message instead of silently skipping.
+        compile_spec: optional ``torch.compile`` verification settings.
+            ``None`` behaves like ``CompileSpec()``: the check only runs when
+            requested, with ``fullgraph=True`` and static shapes.
     """
 
     name: str
@@ -167,6 +290,9 @@ class KernelSpec:
     starter_kernels: Mapping[str, Any] | Sequence[tuple[str, Any]] = ()
     speedup_estimate: str | None = None
     default_shape: SizeMap | None = None
+    output_spec: OutputSpec | Mapping[str, Any] | None = None
+    backward_spec: BackwardSpec | Mapping[str, Any] | None = None
+    compile_spec: CompileSpec | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sizes", _normalize_sizes(self.name, self.sizes))
@@ -186,6 +312,15 @@ class KernelSpec:
         )
         if self.default_shape is not None:
             object.__setattr__(self, "default_shape", dict(self.default_shape))
+        object.__setattr__(
+            self, "output_spec", _coerce_output_spec(self.name, self.output_spec)
+        )
+        object.__setattr__(
+            self, "backward_spec", _coerce_backward_spec(self.name, self.backward_spec)
+        )
+        object.__setattr__(
+            self, "compile_spec", _coerce_compile_spec(self.name, self.compile_spec)
+        )
         # Structural validation happens eagerly. The small/medium/large
         # requirement is a *registration* rule (see KernelRegistry.register) so
         # tools can still build narrower specifications for inspection.
@@ -329,6 +464,57 @@ def _normalize_tolerances(name: object, tolerances: Mapping[str, Any]) -> dict[s
                 f"dtype {dtype!r} must map to a Tolerance, got {type(tol).__name__}",
             )
     return out
+
+
+def _coerce_output_spec(
+    name: object, value: OutputSpec | Mapping[str, Any] | None
+) -> OutputSpec | None:
+    if value is None or isinstance(value, OutputSpec):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return OutputSpec(**value)
+        except TypeError as exc:
+            raise _fail(name, "output_spec", f"invalid OutputSpec mapping: {exc}") from exc
+    raise _fail(
+        name,
+        "output_spec",
+        f"expected an OutputSpec, mapping or None, got {type(value).__name__}",
+    )
+
+
+def _coerce_backward_spec(
+    name: object, value: BackwardSpec | Mapping[str, Any] | None
+) -> BackwardSpec | None:
+    if value is None or isinstance(value, BackwardSpec):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return BackwardSpec(**value)
+        except TypeError as exc:
+            raise _fail(name, "backward_spec", f"invalid BackwardSpec mapping: {exc}") from exc
+    raise _fail(
+        name,
+        "backward_spec",
+        f"expected a BackwardSpec, mapping or None, got {type(value).__name__}",
+    )
+
+
+def _coerce_compile_spec(
+    name: object, value: CompileSpec | Mapping[str, Any] | None
+) -> CompileSpec | None:
+    if value is None or isinstance(value, CompileSpec):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return CompileSpec(**value)
+        except TypeError as exc:
+            raise _fail(name, "compile_spec", f"invalid CompileSpec mapping: {exc}") from exc
+    raise _fail(
+        name,
+        "compile_spec",
+        f"expected a CompileSpec, mapping or None, got {type(value).__name__}",
+    )
 
 
 def _normalize_shape_keys(
@@ -590,3 +776,17 @@ def validate_spec(
             "speedup_estimate",
             f"expected a string or None, got {type(spec.speedup_estimate).__name__}",
         )
+
+    for field_name, expected_type in (
+        ("output_spec", OutputSpec),
+        ("backward_spec", BackwardSpec),
+        ("compile_spec", CompileSpec),
+    ):
+        value = getattr(spec, field_name)
+        if value is not None and not isinstance(value, expected_type):
+            raise _fail(
+                name,
+                field_name,
+                f"expected a {expected_type.__name__} or None, "
+                f"got {type(value).__name__}",
+            )

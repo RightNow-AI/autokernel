@@ -9,10 +9,13 @@ from conftest import make_spec, spec_kwargs
 
 from autokernel.specs import (
     DT_BYTES,
+    BackwardSpec,
+    CompileSpec,
     DuplicateSpecError,
     EdgeCase,
     KernelRegistry,
     KernelSpec,
+    OutputSpec,
     SpecNotFoundError,
     SpecValidationError,
     Tolerance,
@@ -381,3 +384,68 @@ def test_resolve_torch_dtype_translates_only_in_runtime(torch_mod):
 def test_validate_spec_rejects_non_spec_objects():
     with pytest.raises(SpecValidationError, match="expected a KernelSpec"):
         validate_spec(object())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Verification policy types (Week 2)
+# ---------------------------------------------------------------------------
+
+def test_verification_policies_default_to_none():
+    spec = make_spec()
+    assert spec.output_spec is None
+    assert spec.backward_spec is None
+    assert spec.compile_spec is None
+
+
+def test_output_spec_accepts_mapping_coercion():
+    spec = make_spec(output_spec={"included_paths": ("output[0]",), "compare_non_tensors": False})
+    assert isinstance(spec.output_spec, OutputSpec)
+    assert spec.output_spec.included_paths == ("output[0]",)
+    assert spec.output_spec.compare_non_tensors is False
+
+
+def test_output_spec_rejects_duplicate_paths():
+    with pytest.raises(SpecValidationError, match="duplicate path"):
+        OutputSpec(included_paths=("output", "output"))
+
+
+def test_output_spec_rejects_unknown_mapping_keys():
+    with pytest.raises(SpecValidationError, match="output_spec"):
+        make_spec(output_spec={"nonsense": True})
+
+
+def test_backward_spec_requires_differentiable_inputs():
+    with pytest.raises(SpecValidationError, match="at least one input"):
+        BackwardSpec(differentiable_inputs=())
+
+
+def test_backward_spec_normalizes_tolerances():
+    policy = BackwardSpec(
+        differentiable_inputs=("x",),
+        tolerances={"float32": {"atol": 1e-4, "rtol": 1e-4}},
+    )
+    assert policy.tolerances["float32"] == Tolerance(atol=1e-4, rtol=1e-4)
+
+
+def test_backward_spec_rejects_unknown_tolerance_dtype():
+    with pytest.raises(SpecValidationError, match="unknown dtype key"):
+        BackwardSpec(differentiable_inputs=("x",), tolerances={"float64": Tolerance(0.0, 0.0)})
+
+
+def test_backward_spec_rejects_infinite_tolerances():
+    with pytest.raises(SpecValidationError, match="must be finite"):
+        BackwardSpec(
+            differentiable_inputs=("x",),
+            tolerances={"float32": {"atol": float("inf"), "rtol": 0.0}},
+        )
+
+
+def test_compile_spec_rejects_non_bool_flags():
+    with pytest.raises(SpecValidationError, match="CompileSpec.fullgraph must be a bool"):
+        CompileSpec(fullgraph="yes")
+
+
+def test_kernel_spec_rejects_wrongly_typed_policies():
+    with pytest.raises(SpecValidationError, match="backward_spec"):
+        make_spec(backward_spec="not-a-spec")
+

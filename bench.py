@@ -53,6 +53,12 @@ from autokernel.specs import (  # noqa: E402  (path bootstrap must run first)
     resolve_spec,
     resolve_torch_dtype,
 )
+from autokernel.verification import (  # noqa: E402
+    TreeComparison,
+    compare_deterministic,
+    compare_output_trees,
+    tree_has_nan_or_inf,
+)
 
 # ---------------------------------------------------------------------------
 # Timeout helper (cross-platform)
@@ -322,41 +328,27 @@ def resolve_operation_name(
 # 3. CORRECTNESS TESTING (5 stages)
 # =========================================================================
 
-def _compare(output: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> dict:
-    """Compare two tensors and return statistics."""
-    if output.shape != expected.shape:
-        return {
-            "match": False,
-            "reason": f"shape mismatch: {output.shape} vs {expected.shape}",
-            "max_abs_error": float("inf"),
-            "mean_abs_error": float("inf"),
-            "pct_within_tol": 0.0,
-        }
+def _compare_outputs(output: Any, expected: Any, spec: KernelSpec, *, relax: float = 1.0) -> TreeComparison:
+    """Compare candidate and reference output trees using the spec's policy.
 
-    # Cast both to float32 for comparison
-    out_f = output.float()
-    exp_f = expected.float()
-
-    abs_diff = (out_f - exp_f).abs()
-    max_abs = abs_diff.max().item()
-    mean_abs = abs_diff.mean().item()
-
-    # Percentage of elements within tolerance
-    within = (abs_diff <= atol + rtol * exp_f.abs()).float().mean().item() * 100.0
-
-    match = torch.allclose(out_f, exp_f, atol=atol, rtol=rtol)
-    return {
-        "match": match,
-        "reason": "" if match else f"max_abs_error={max_abs:.6e} exceeds tol(atol={atol}, rtol={rtol})",
-        "max_abs_error": max_abs,
-        "mean_abs_error": mean_abs,
-        "pct_within_tol": within,
-    }
+    Single-tensor outputs behave exactly as the historical ``_compare`` did:
+    the tolerance declared for the benchmark dtype is applied, and the
+    failure reason is unchanged. Structured outputs are compared leaf by leaf
+    with stable diagnostic paths.
+    """
+    return compare_output_trees(
+        output,
+        expected,
+        spec.tolerances,
+        output_spec=spec.output_spec,
+        relax=relax,
+    )
 
 
-def _has_nan_inf(t: torch.Tensor) -> bool:
-    """Check for NaN or Inf."""
-    return bool(torch.isnan(t).any().item() or torch.isinf(t).any().item())
+def _record_leaves(records: List[Dict[str, Any]], stage: str, case: str, cmp: TreeComparison) -> None:
+    """Collect per-leaf comparison details for the structured result artifact."""
+    for leaf in cmp.leaf_records():
+        records.append({"stage": stage, "case": case, **leaf})
 
 
 def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) -> dict:
@@ -371,13 +363,13 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
         "correctness": "FAIL",
     }
     details = []
+    leaf_records: List[Dict[str, Any]] = []
     all_pass = True
 
     gen_fn = spec.input_generator
     ref_fn = _spec_reference(spec)
     sizes = _spec_sizes(spec)
     dtypes = _spec_dtypes(spec)
-    tols = _spec_tolerances(spec)
 
     # ------------------------------------------------------------------
     # Stage 1: SMOKE TEST -- tiny input, tight tolerance
@@ -392,22 +384,22 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
         with _Timeout(30):
             output = kernel_fn(**inputs)
 
-        if _has_nan_inf(output):
+        if tree_has_nan_or_inf(output):
             results["smoke_test"] = "FAIL"
             details.append(f"  smoke: NaN/Inf in output")
             all_pass = False
             print(f"  FAIL: NaN/Inf in output")
         else:
-            tol = tols.get(dtype0, {"atol": 1e-2, "rtol": 1e-2})
-            cmp = _compare(output, expected, **tol)
-            if cmp["match"]:
+            cmp = _compare_outputs(output, expected, spec)
+            _record_leaves(leaf_records, "smoke", tiny_label, cmp)
+            if cmp.match:
                 results["smoke_test"] = "PASS"
-                print(f"  PASS (max_abs_error={cmp['max_abs_error']:.6e})")
+                print(f"  PASS (max_abs_error={cmp.worst_abs_error:.6e})")
             else:
                 results["smoke_test"] = "FAIL"
-                details.append(f"  smoke: {cmp['reason']}")
+                details.append(f"  smoke: {cmp.reason}")
                 all_pass = False
-                print(f"  FAIL: {cmp['reason']}")
+                print(f"  FAIL: {cmp.reason}")
     except BenchTimeoutError:
         results["smoke_test"] = "FAIL"
         details.append("  smoke: TIMEOUT")
@@ -428,6 +420,7 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
     if results["smoke_test"] == "FAIL":
         results["correctness"] = "FAIL"
         results["details"] = details
+        results["leaf_details"] = leaf_records
         print(f"\ncorrectness: FAIL (smoke test failed, aborting remaining stages)")
         return results
 
@@ -450,27 +443,27 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
                 with _Timeout(30):
                     output = kernel_fn(**inputs)
 
-                if _has_nan_inf(output):
+                if tree_has_nan_or_inf(output):
                     sweep_pass = False
                     sweep_fail_count += 1
                     details.append(f"  sweep {label}/{dtype}: NaN/Inf")
                     print(f"  FAIL: {label} {dtype} -> NaN/Inf")
                     continue
 
-                tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                cmp = _compare(output, expected, **tol)
+                cmp = _compare_outputs(output, expected, spec)
+                _record_leaves(leaf_records, "sweep", f"{label}/{dtype}", cmp)
 
-                if cmp["max_abs_error"] > worst_error:
-                    worst_error = cmp["max_abs_error"]
+                if cmp.worst_abs_error > worst_error:
+                    worst_error = cmp.worst_abs_error
                     worst_case = f"{label}/{dtype}"
 
-                if not cmp["match"]:
+                if not cmp.match:
                     sweep_pass = False
                     sweep_fail_count += 1
-                    details.append(f"  sweep {label}/{dtype}: {cmp['reason']}")
-                    print(f"  FAIL: {label} {dtype} -> {cmp['reason']}")
+                    details.append(f"  sweep {label}/{dtype}: {cmp.reason}")
+                    print(f"  FAIL: {label} {dtype} -> {cmp.reason}")
                 else:
-                    print(f"  PASS: {label} {dtype} (max_err={cmp['max_abs_error']:.2e}, within_tol={cmp['pct_within_tol']:.1f}%)")
+                    print(f"  PASS: {label} {dtype} (max_err={cmp.worst_abs_error:.2e}, within_tol={cmp.worst_pct_within_tol:.1f}%)")
 
             except torch.cuda.OutOfMemoryError:
                 # OOM on larger sizes is acceptable -- just skip
@@ -507,6 +500,7 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
         results["edge_cases"] = "SKIP (quick mode)"
         results["correctness"] = "PASS" if all_pass else "FAIL"
         results["details"] = details
+        results["leaf_details"] = leaf_records
         print(f"\ncorrectness: {results['correctness']} (quick mode: stages 3-5 skipped)")
         return results
 
@@ -551,25 +545,23 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
             with _Timeout(30):
                 output = kernel_fn(**transformed)
 
-            if _has_nan_inf(output) and not _has_nan_inf(expected):
+            if tree_has_nan_or_inf(output) and not tree_has_nan_or_inf(expected):
                 stability_pass = False
                 details.append(f"  stability {case_name}: NaN/Inf (reference is clean)")
                 print(f"  FAIL: {case_name} -> NaN/Inf (reference is clean)")
-            elif _has_nan_inf(output) and _has_nan_inf(expected):
+            elif tree_has_nan_or_inf(output) and tree_has_nan_or_inf(expected):
                 # Both have NaN/Inf -- acceptable (e.g. overflow in near_max)
                 print(f"  PASS: {case_name} -> both have NaN/Inf (expected overflow)")
             else:
-                tol = tols.get(stab_dtype, {"atol": 1e-2, "rtol": 1e-2})
                 # Relax tolerances for adversarial inputs
-                relaxed_atol = tol["atol"] * 10
-                relaxed_rtol = tol["rtol"] * 10
-                cmp = _compare(output, expected, atol=relaxed_atol, rtol=relaxed_rtol)
-                if cmp["match"]:
-                    print(f"  PASS: {case_name} (max_err={cmp['max_abs_error']:.2e})")
+                cmp = _compare_outputs(output, expected, spec, relax=10.0)
+                _record_leaves(leaf_records, "stability", case_name, cmp)
+                if cmp.match:
+                    print(f"  PASS: {case_name} (max_err={cmp.worst_abs_error:.2e})")
                 else:
                     stability_pass = False
-                    details.append(f"  stability {case_name}: {cmp['reason']}")
-                    print(f"  FAIL: {case_name} -> {cmp['reason']}")
+                    details.append(f"  stability {case_name}: {cmp.reason}")
+                    print(f"  FAIL: {case_name} -> {cmp.reason}")
 
         except torch.cuda.OutOfMemoryError:
             print(f"  SKIP: {case_name} -> OOM")
@@ -609,11 +601,18 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
             outputs.append(out_i)
 
         for i in range(1, 3):
-            if not torch.equal(outputs[0], outputs[i]):
+            cmp = compare_deterministic(outputs[0], outputs[i], output_spec=spec.output_spec)
+            _record_leaves(leaf_records, "determinism", f"run_0_vs_{i}", cmp)
+            if not cmp.match:
                 determinism_pass = False
-                diff = (outputs[0].float() - outputs[i].float()).abs()
-                details.append(f"  determinism: run 0 vs run {i} differ (max_diff={diff.max().item():.6e})")
-                print(f"  FAIL: run 0 vs run {i} differ (max_diff={diff.max().item():.6e})")
+                failure = cmp.first_failure()
+                if failure is not None and failure.max_abs_error is not None:
+                    where = "" if failure.path == "output" else f" at {failure.path}"
+                    message = f"run 0 vs run {i} differ{where} (max_diff={failure.max_abs_error:.6e})"
+                else:
+                    message = f"run 0 vs run {i} differ ({cmp.reason})"
+                details.append(f"  determinism: {message}")
+                print(f"  FAIL: {message}")
 
         if determinism_pass:
             print("  PASS: 3 runs are bitwise identical")
@@ -653,19 +652,19 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
                 with _Timeout(30):
                     output = kernel_fn(**inputs)
 
-                if _has_nan_inf(output) and not _has_nan_inf(expected):
+                if tree_has_nan_or_inf(output) and not tree_has_nan_or_inf(expected):
                     edge_pass = False
                     details.append(f"  edge {label}: NaN/Inf")
                     print(f"  FAIL: {label} -> NaN/Inf")
                 else:
-                    tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                    cmp = _compare(output, expected, **tol)
-                    if cmp["match"]:
-                        print(f"  PASS: {label} (max_err={cmp['max_abs_error']:.2e})")
+                    cmp = _compare_outputs(output, expected, spec)
+                    _record_leaves(leaf_records, "edge", label, cmp)
+                    if cmp.match:
+                        print(f"  PASS: {label} (max_err={cmp.worst_abs_error:.2e})")
                     else:
                         edge_pass = False
-                        details.append(f"  edge {label}: {cmp['reason']}")
-                        print(f"  FAIL: {label} -> {cmp['reason']}")
+                        details.append(f"  edge {label}: {cmp.reason}")
+                        print(f"  FAIL: {label} -> {cmp.reason}")
 
             except torch.cuda.OutOfMemoryError:
                 print(f"  SKIP: {label} -> OOM")
@@ -689,6 +688,7 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
     # Final verdict
     results["correctness"] = "PASS" if all_pass else "FAIL"
     results["details"] = details
+    results["leaf_details"] = leaf_records
     print(f"\ncorrectness: {results['correctness']}")
     return results
 
