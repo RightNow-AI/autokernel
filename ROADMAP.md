@@ -1,5 +1,8 @@
 # Roadmap
 
+Detailed execution instructions for the first two milestones are available in
+[docs/WEEK_1_2_AGENT_BRIEF.md](docs/WEEK_1_2_AGENT_BRIEF.md).
+
 ## Milestone 0: downstream foundation
 
 - Preserve upstream provenance and MIT attribution.
