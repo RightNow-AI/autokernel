@@ -19,5 +19,5 @@ import torch
 def kernel_fn(x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -> dict:
     """Entry point called by bench.py. Must match the reference signature."""
     y = x * scale + bias
-    residual = y - x
+    residual = (y.float() - x.float()).to(x.dtype)
     return {"output": y, "aux": (residual, 3)}

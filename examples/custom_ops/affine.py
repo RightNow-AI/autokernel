@@ -54,7 +54,10 @@ def affine_ref(x: Any, scale: Any, bias: Any) -> dict:
     the affine expression).
     """
     y = x * scale + bias
-    residual = y - x
+    # Preserve the rounded output value before subtracting. The explicit
+    # float32 subtraction keeps eager and Inductor-fused FP16 execution
+    # numerically aligned without loosening the output tolerance.
+    residual = (y.float() - x.float()).to(x.dtype)
     return {"output": y, "aux": (residual, 3)}
 
 

@@ -54,6 +54,13 @@
   `workspace/bench_result.json`, configurable with `--result-json`
 - Added `examples/custom_ops/affine.py`, its candidate and a metadata-only
   shape corpus as a structured-output, backward and compile fixture
+- Made the float32 matmul starter request IEEE dot inputs instead of Triton's
+  TF32 default, kept strict BF16 LayerNorm parity through an explicit PyTorch
+  fallback pending a Welford Triton implementation, and made the affine
+  fixture's residual rounding stable under Inductor fusion
+- Kept the top-level `profile.py` CLI compatible with the standard-library
+  `profile` API so importing `cProfile` and initializing `torch.compile` from
+  the repository root no longer fails
 
 ## v1.3.0 -- 2026-03-13
 
