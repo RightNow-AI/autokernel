@@ -715,6 +715,17 @@ side effects.
 If `torch.compile` is not available in the installed PyTorch version, emit a
 clear unsupported result. Do not mark the check as passed.
 
+Implementation decisions (recorded by the Week 2 agent):
+
+- Compile checks run before the performance section and use one stable wrapper
+  around the candidate. Each selected shape is called twice through the
+  compiled callable.
+- Static checks use the small declared shape. Dynamic checks use small and
+  medium (or the first two available compatible shapes) through the same
+  callable.
+- `PASS`, `FAIL`, and `UNSUPPORTED` are distinct structured statuses, and
+  PyTorch, Triton, CUDA, device, GPU and compile-mode metadata are recorded.
+
 ## Step 7: add a structured-output fixture
 
 Add an example operation under `examples/custom_ops/` that returns:
@@ -766,6 +777,17 @@ COMPILE_CORRECTNESS: PASS
 ```
 
 Only print `PASS` after the complete requested stage succeeds.
+
+Implementation decisions (recorded by the Week 2 agent):
+
+- Normal runs write schema version 1 to
+  `workspace/bench_result.json`; `--result-json PATH` overrides the location.
+- The record contains the request, environment and GPU metadata, corpus
+  identity, forward leaf details, optional backward and compile reports,
+  performance results and elapsed time.
+- The writer creates and fsyncs a temporary file in the destination directory,
+  then replaces the destination atomically. Non-finite diagnostic values are
+  encoded as strings so the artifact remains strict JSON.
 
 ## Week 2 tests
 

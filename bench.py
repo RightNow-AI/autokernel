@@ -30,7 +30,7 @@ import signal
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -56,9 +56,13 @@ from autokernel.specs import (  # noqa: E402  (path bootstrap must run first)
 from autokernel.verification import (  # noqa: E402
     TreeComparison,
     check_backward,
+    check_compile,
+    collect_environment_metadata,
     compare_deterministic,
     compare_output_trees,
+    result_envelope,
     tree_has_nan_or_inf,
+    write_result_atomic,
 )
 from autokernel.verification.corpus import (  # noqa: E402
     CorpusError,
@@ -773,6 +777,19 @@ def run_backward_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
     return report.as_dict()
 
 
+def run_compile_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
+    """Run compile verification outside all timed performance regions."""
+    print(f"\n=== COMPILE CORRECTNESS ===")
+    report = check_compile(kernel_fn, spec, device=BENCH_DEVICE)
+    for case in report.cases:
+        detail = f": {case.reason}" if case.reason else ""
+        print(f"  {case.label}: {case.status}{detail}")
+    if report.reason and report.status != "PASS":
+        print(f"  {report.reason}")
+    print(f"COMPILE_CORRECTNESS: {report.status}")
+    return report.as_dict()
+
+
 # =========================================================================
 # 4. PERFORMANCE BENCHMARKING
 # =========================================================================
@@ -1071,6 +1088,14 @@ def main():
                         help="Also verify gradients against the reference "
                              "(requires the spec to declare a backward_spec; "
                              "correctness-only, no performance claims)")
+    parser.add_argument("--check-compile", action="store_true",
+                        help="Verify torch.compile parity using the spec's compile settings "
+                             "(correctness-only; compilation is never timed)")
+    parser.add_argument("--result-json", type=str,
+                        default=os.path.join(_SCRIPT_DIR, "workspace", "bench_result.json"),
+                        metavar="PATH",
+                        help="Atomic machine-readable result path "
+                             "(default: workspace/bench_result.json)")
     args = parser.parse_args()
     if args.shape_corpus_only and not args.shape_corpus:
         parser.error("--shape-corpus-only requires --shape-corpus PATH")
@@ -1209,6 +1234,7 @@ def main():
     print(f"determinism: {correctness_results.get('determinism', 'N/A')}")
     print(f"edge_cases: {correctness_results.get('edge_cases', 'N/A')}")
     print(f"correctness: {correctness_results['correctness']}")
+    print(f"FORWARD_CORRECTNESS: {correctness_results['correctness']}")
 
     # ------------------------------------------------------------------
     # Backward verification (opt-in; correctness-only, never timed)
@@ -1225,6 +1251,25 @@ def main():
             traceback.print_exc()
             backward_result = {"status": "FAIL", "reason": f"crash: {type(e).__name__}: {e}"}
             print(f"BACKWARD_CORRECTNESS: FAIL")
+
+    # ------------------------------------------------------------------
+    # Compile verification (opt-in; correctness-only, never timed)
+    # ------------------------------------------------------------------
+    compile_result = None
+    compile_requested = args.check_compile or (
+        spec.compile_spec is not None and spec.compile_spec.enabled
+    )
+    if compile_requested:
+        try:
+            compile_result = run_compile_check(kernel_fn, spec)
+        except Exception as e:
+            print(f"\nFATAL: Compile verification crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            compile_result = {
+                "status": "FAIL",
+                "reason": f"crash: {type(e).__name__}: {e}",
+            }
+            print(f"COMPILE_CORRECTNESS: FAIL")
 
     # ------------------------------------------------------------------
     # Performance
@@ -1326,6 +1371,50 @@ def main():
     # ------------------------------------------------------------------
     t_elapsed = time.time() - t_start
     throughput = primary["throughput_tflops"] if primary else 0.0
+
+    corpus_identity = None
+    if args.shape_corpus:
+        corpus_identity = {
+            "source": os.path.abspath(args.shape_corpus),
+            "mode": "only" if args.shape_corpus_only else "append",
+            "cases": [
+                {
+                    "name": case.name,
+                    "size": dict(case.size),
+                    "dtype": case.dtype,
+                    "weight": case.weight,
+                    "tags": list(case.tags),
+                }
+                for case in (corpus_cases or ())
+            ],
+        }
+    result_payload = result_envelope(
+        kernel_type,
+        environment=collect_environment_metadata(BENCH_DEVICE),
+        request={
+            "spec": args.spec,
+            "sizes": args.sizes,
+            "quick": args.quick,
+            "profile": args.profile,
+            "check_backward": backward_requested,
+            "check_compile": compile_requested,
+        },
+        gpu=asdict(gpu),
+        shape_corpus=corpus_identity,
+        forward=correctness_results,
+        backward=backward_result,
+        compile=compile_result,
+        performance={
+            **perf_results,
+            "peak_vram_mb": peak_vram_mb,
+        },
+        bench_time_seconds=t_elapsed,
+    )
+    try:
+        result_path = write_result_atomic(args.result_json, result_payload)
+        print(f"result_json: {result_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to write result JSON: {type(e).__name__}: {e}")
 
     print(f"\n=== FINAL ===")
     print(f"kernel_type: {kernel_type}")

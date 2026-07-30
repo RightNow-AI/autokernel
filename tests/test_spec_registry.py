@@ -244,6 +244,26 @@ def test_reject_non_positive_size():
         )
 
 
+@pytest.mark.parametrize("bad_dimension", [0, -1, 1.5, True])
+def test_reject_invalid_edge_case_dimension(bad_dimension):
+    edge = EdgeCase(
+        name="bad", size={"rows": bad_dimension, "cols": 1}
+    )
+    with pytest.raises(SpecValidationError, match=r"edge_cases\[0\]\.size"):
+        make_spec(edge_cases=(edge,))
+
+
+@pytest.mark.parametrize("bad_dimension", [0, -1, 1.5, True])
+def test_reject_invalid_default_shape_dimension(bad_dimension):
+    with pytest.raises(SpecValidationError, match="default_shape"):
+        make_spec(default_shape={"rows": bad_dimension, "cols": 1})
+
+
+def test_empty_starter_kernels_are_valid_for_benchmark_only_specs():
+    spec = make_spec(starter_kernels={})
+    assert spec.starter_kernel("triton") is None
+
+
 def test_reject_duplicate_edge_case_names():
     edges = (
         EdgeCase(name="dup", size={"rows": 1, "cols": 1}),
@@ -448,4 +468,3 @@ def test_compile_spec_rejects_non_bool_flags():
 def test_kernel_spec_rejects_wrongly_typed_policies():
     with pytest.raises(SpecValidationError, match="backward_spec"):
         make_spec(backward_spec="not-a-spec")
-

@@ -300,7 +300,9 @@ class KernelSpec:
         object.__setattr__(
             self, "tolerances", _normalize_tolerances(self.name, self.tolerances)
         )
-        object.__setattr__(self, "edge_cases", tuple(self.edge_cases))
+        object.__setattr__(
+            self, "edge_cases", _normalize_edge_cases(self.name, self.edge_cases)
+        )
         object.__setattr__(
             self, "shape_keys", _normalize_shape_keys(self.name, self.shape_keys, self.sizes)
         )
@@ -311,7 +313,11 @@ class KernelSpec:
             self, "starter_kernels", _normalize_starters(self.name, self.starter_kernels)
         )
         if self.default_shape is not None:
-            object.__setattr__(self, "default_shape", dict(self.default_shape))
+            object.__setattr__(
+                self,
+                "default_shape",
+                _normalize_size_map(self.name, "default_shape", self.default_shape),
+            )
         object.__setattr__(
             self, "output_spec", _coerce_output_spec(self.name, self.output_spec)
         )
@@ -387,23 +393,55 @@ def _normalize_sizes(
             raise _fail(name, "sizes", f"size label must be a non-empty string, got {label!r}")
         if label in out:
             raise _fail(name, "sizes", f"duplicate size label {label!r}")
-        if not isinstance(size, Mapping) or not size:
-            raise _fail(name, "sizes", f"size {label!r} must be a non-empty mapping")
-        normalized: dict[str, int] = {}
-        for key, value in size.items():
-            if not isinstance(key, str) or not key:
-                raise _fail(name, "sizes", f"size {label!r} has a non-string key {key!r}")
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise _fail(
-                    name, "sizes", f"size {label!r} key {key!r} must be an int, got {value!r}"
-                )
-            if value <= 0:
-                raise _fail(
-                    name, "sizes", f"size {label!r} key {key!r} must be positive, got {value!r}"
-                )
-            normalized[key] = value
-        out[label] = normalized
+        out[label] = _normalize_size_map(name, f"sizes[{label!r}]", size)
     return out
+
+
+def _normalize_size_map(
+    name: object, field_name: str, size: object
+) -> dict[str, int]:
+    """Normalize one shape mapping and reject unusable dimensions."""
+    if not isinstance(size, Mapping) or not size:
+        raise _fail(name, field_name, "must be a non-empty mapping")
+    normalized: dict[str, int] = {}
+    for key, value in size.items():
+        if not isinstance(key, str) or not key:
+            raise _fail(name, field_name, f"has a non-string key {key!r}")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _fail(
+                name, field_name, f"key {key!r} must be an int, got {value!r}"
+            )
+        if value <= 0:
+            raise _fail(
+                name, field_name, f"key {key!r} must be positive, got {value!r}"
+            )
+        normalized[key] = value
+    return normalized
+
+
+def _normalize_edge_cases(
+    name: object, edge_cases: Iterable[EdgeCase]
+) -> tuple[EdgeCase, ...]:
+    if isinstance(edge_cases, (str, bytes)) or not isinstance(edge_cases, Iterable):
+        raise _fail(name, "edge_cases", "expected an iterable of EdgeCase values")
+    normalized: list[EdgeCase] = []
+    for index, edge in enumerate(edge_cases):
+        if not isinstance(edge, EdgeCase):
+            raise _fail(
+                name, "edge_cases", f"expected EdgeCase, got {type(edge).__name__}"
+            )
+        normalized.append(
+            EdgeCase(
+                name=edge.name,
+                size=_normalize_size_map(
+                    name, f"edge_cases[{index}].size", edge.size
+                ),
+                dtype=edge.dtype,
+                seed=edge.seed,
+                input_transform=edge.input_transform,
+            )
+        )
+    return tuple(normalized)
 
 
 def _normalize_dtypes(name: object, dtypes: Iterable[str]) -> tuple[str, ...]:

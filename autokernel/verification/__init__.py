@@ -26,6 +26,7 @@ from .corpus import (
     validate_corpus_against_spec,
     weighted_aggregate,
 )
+from .compile import CompileCaseRecord, CompileReport, check_compile
 from .outputs import (
     DEFAULT_TOLERANCE,
     LeafRecord,
@@ -37,25 +38,38 @@ from .outputs import (
     flatten_output_tree,
     tree_has_nan_or_inf,
 )
+from .results import (
+    RESULT_SCHEMA_VERSION,
+    collect_environment_metadata,
+    result_envelope,
+    write_result_atomic,
+)
 
 __all__ = [
     "BackwardReport",
     "CORPUS_SCHEMA_VERSION",
+    "CompileCaseRecord",
+    "CompileReport",
     "CorpusCase",
     "CorpusError",
     "DEFAULT_TOLERANCE",
     "GradientRecord",
     "LeafRecord",
     "OutputTreeError",
+    "RESULT_SCHEMA_VERSION",
     "ShapeCorpus",
     "TreeComparison",
     "check_backward",
+    "check_compile",
+    "collect_environment_metadata",
     "compare_deterministic",
     "compare_output_trees",
     "compare_tensor_leaf",
     "flatten_output_tree",
     "load_shape_corpus",
+    "result_envelope",
     "tree_has_nan_or_inf",
     "validate_corpus_against_spec",
     "weighted_aggregate",
+    "write_result_atomic",
 ]

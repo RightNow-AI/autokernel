@@ -31,6 +31,29 @@
   for out-of-tree callers
 - `Tolerance` rejects negative, NaN, and infinite `atol`/`rtol` values, so a
   malformed specification cannot silently disable the correctness gate
+- All declared built-in, edge-case and default-shape dimensions must be
+  positive integers; empty starter-kernel mappings are explicitly supported
+  for benchmark-only external specifications
+
+### Generalized verification
+
+- Added deterministic comparison for tensor, tuple, list, dictionary,
+  named-tuple and nested output trees, including exact metadata comparison and
+  per-leaf NaN, infinity and error diagnostics
+- Added versioned production shape corpora, append and corpus-only benchmark
+  modes, and weighted aggregates that remain separated by dtype
+- Added optional `BackwardSpec` gradient verification with deterministic
+  upstream gradients and per-input diagnostics
+- Added optional `CompileSpec` verification and `--check-compile`; candidates
+  compile with full-graph mode by default, run at least twice, reuse one
+  compiled callable for dynamic shapes and compare through the normal output
+  tree gate outside performance timing
+- Added `FORWARD_CORRECTNESS`, `BACKWARD_CORRECTNESS` and
+  `COMPILE_CORRECTNESS` console verdicts
+- Added schema-versioned, atomic JSON results under
+  `workspace/bench_result.json`, configurable with `--result-json`
+- Added `examples/custom_ops/affine.py`, its candidate and a metadata-only
+  shape corpus as a structured-output, backward and compile fixture
 
 ## v1.3.0 -- 2026-03-13
 
