@@ -100,17 +100,19 @@ def _import_from_path(target: str, locator: str) -> Any:
             f"cannot load spec {locator!r}: {path} is not an importable Python file"
         )
     module = importlib.util.module_from_spec(module_spec)
-    # Register before exec so dataclasses and relative lookups inside the module
-    # resolve; remove it again on failure so a broken file leaves no trace.
+    # Register during exec so dataclasses and relative lookups inside the module
+    # resolve. The returned objects retain the module globals they need, so the
+    # temporary UUID module can always be evicted afterward.
     sys.modules[module_name] = module
     try:
         module_spec.loader.exec_module(module)
     except Exception as exc:
-        sys.modules.pop(module_name, None)
         raise SpecLoadError(
             f"cannot load spec {locator!r}: importing {path} raised "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+    finally:
+        sys.modules.pop(module_name, None)
     return module
 
 

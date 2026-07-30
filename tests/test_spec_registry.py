@@ -241,6 +241,12 @@ def test_reject_non_positive_size():
         )
 
 
+@pytest.mark.parametrize("bad_dimension", [0, -1, 1.5, True])
+def test_reject_invalid_default_shape_dimension(bad_dimension):
+    with pytest.raises(SpecValidationError, match="default_shape"):
+        make_spec(default_shape={"rows": bad_dimension, "cols": 1})
+
+
 def test_reject_duplicate_edge_case_names():
     edges = (
         EdgeCase(name="dup", size={"rows": 1, "cols": 1}),
