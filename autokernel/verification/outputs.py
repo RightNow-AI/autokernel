@@ -471,9 +471,11 @@ def compare_deterministic(
     for (path, a), (_, b) in zip(first_leaves, other_leaves):
         if _is_tensor(a):
             max_diff: float | None = None
+            mean_diff: float | None = None
             if a.shape == b.shape and a.dtype == b.dtype and a.is_floating_point():
                 diff = (a.float() - b.float()).abs()
                 max_diff = diff.max().item() if diff.numel() else 0.0
+                mean_diff = diff.mean().item() if diff.numel() else 0.0
             equal = bool(torch.equal(a, b))
             if equal:
                 reason = ""
@@ -488,7 +490,7 @@ def compare_deterministic(
                     match=equal,
                     reason=reason,
                     max_abs_error=max_diff,
-                    mean_abs_error=max_diff,
+                    mean_abs_error=mean_diff,
                 )
             )
             continue
@@ -525,4 +527,3 @@ def tree_has_nan_or_inf(tree: Any) -> bool:
             if bool(torch.isnan(leaf).any().item()) or bool(torch.isinf(leaf).any().item()):
                 return True
     return False
-

@@ -250,6 +250,14 @@ def test_determinism_detects_any_leaf_difference():
     assert failure.max_abs_error is not None
 
 
+def test_determinism_reports_distinct_mean_and_max_errors():
+    cmp = compare_deterministic(_t(0.0, 0.0), _t(0.0, 2.0))
+    failure = cmp.first_failure()
+    assert failure is not None
+    assert failure.max_abs_error == pytest.approx(2.0)
+    assert failure.mean_abs_error == pytest.approx(1.0)
+
+
 def test_determinism_detects_metadata_change():
     cmp = compare_deterministic((_t(1.0), 3), (_t(1.0), 4))
     assert not cmp.match
@@ -273,4 +281,3 @@ def test_relax_multiplies_tolerances():
     assert not strict.match
     relaxed = compare_output_trees(candidate, expected, TOLS, relax=10.0)
     assert relaxed.match
-

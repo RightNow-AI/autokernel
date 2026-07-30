@@ -95,7 +95,7 @@ SPEC = KernelSpec(
     # mul + add + residual sub per element
     flops_fn=3 * size("rows") * size("cols"),
     # read x, scale, bias; write output and residual (metadata is tiny)
-    bytes_fn=(3 * size("rows") + 2 * size("cols")) * size("cols") * DT_BYTES,
+    bytes_fn=(3 * size("rows") + 2) * size("cols") * DT_BYTES,
     edge_cases=(
         EdgeCase(name="edge_1023", size={"rows": 1023, "cols": 1023}),
         EdgeCase(name="edge_single_row", size={"rows": 1, "cols": 1025}),

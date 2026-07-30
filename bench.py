@@ -977,13 +977,15 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
     corpus_entries = [entry for entry in all_results if entry["source"] == "corpus"]
     if corpus_entries:
         weighted = weighted_aggregate(
-            {
-                "dtype": entry["dtype"],
-                "weight": entry["weight"],
-                "kernel_ms": entry["kernel_latency_us"] / 1000.0,
-                "ref_ms": entry["pytorch_latency_us"] / 1000.0,
-            }
-            for entry in corpus_entries
+            [
+                {
+                    "dtype": entry["dtype"],
+                    "weight": entry["weight"],
+                    "kernel_ms": entry["kernel_latency_us"] / 1000.0,
+                    "ref_ms": entry["pytorch_latency_us"] / 1000.0,
+                }
+                for entry in corpus_entries
+            ]
         )
         corpus_summary = {"cases": corpus_entries, "weighted": weighted}
         print(f"\n  === SHAPE CORPUS: weighted aggregates ===")

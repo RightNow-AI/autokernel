@@ -79,6 +79,12 @@ def test_affine_example_fixture_passes_backward(repo_root):
     assert report.status == "PASS"
 
 
+def test_affine_example_byte_accounting(repo_root):
+    spec = load_spec(str(repo_root / "examples" / "custom_ops" / "affine.py") + ":SPEC")
+    size_map = {"rows": 4, "cols": 8}
+    assert spec.bytes_fn(size_map, 2) == (3 * 4 + 2) * 8 * 2
+
+
 def test_perturbed_candidate_reports_mismatch_with_stats():
     def perturbed(x, scale, bias):
         y = x * scale * 2 + bias  # wrong gradient wrt x and scale
@@ -266,4 +272,3 @@ def test_bench_run_backward_check_unsupported(monkeypatch, capsys):
     assert result["status"] == "FAIL"
     assert "BACKWARD_CORRECTNESS: FAIL" in captured
     assert "unsupported" in captured
-
