@@ -249,3 +249,89 @@ def test_dropped_output_branch_fails_structure_check(cpu_device):
     assert results["correctness"] == "FAIL"
     assert any("missing output path" in detail for detail in results["details"])
 
+
+
+# ---------------------------------------------------------------------------
+# Shape corpora
+# ---------------------------------------------------------------------------
+
+def _corpus_cases() -> tuple:
+    from autokernel.verification import CorpusCase
+
+    return (
+        CorpusCase(name="prod-a", size={"rows": 8, "cols": 16}, weight=3),
+        CorpusCase(name="prod-b", size={"rows": 7, "cols": 13}, weight=1),
+    )
+
+
+def test_corpus_cases_join_the_shape_sweep(cpu_device, capsys):
+    results = bench.run_correctness(
+        _good_kernel, _spec(), quick=True, corpus_cases=_corpus_cases()
+    )
+    captured = capsys.readouterr().out
+    assert results["correctness"] == "PASS"
+    assert "PASS: prod-a" in captured
+    assert "PASS: prod-b" in captured
+    assert "PASS: small" in captured  # built-in sweep still runs
+
+
+def test_corpus_only_replaces_the_builtin_sweep(cpu_device, capsys):
+    results = bench.run_correctness(
+        _good_kernel, _spec(), quick=True,
+        corpus_cases=_corpus_cases(), corpus_only=True,
+    )
+    captured = capsys.readouterr().out
+    assert results["correctness"] == "PASS"
+    assert "PASS: prod-a" in captured
+    assert "PASS: small" not in captured
+
+
+def test_wrong_kernel_fails_a_corpus_case(cpu_device, capsys):
+    """A candidate that is correct on built-in sizes but wrong on a corpus
+    shape must fail with the corpus case named."""
+
+    def wrong_on_odd_rows(x, y):
+        out = x + y
+        if x.shape[0] == 7:  # prod-b is 7x13
+            out = out + 1.0
+        return out
+
+    results = bench.run_correctness(
+        wrong_on_odd_rows, _spec(), quick=True, corpus_cases=_corpus_cases()
+    )
+    captured = capsys.readouterr().out
+    assert results["correctness"] == "FAIL"
+    assert "FAIL: prod-b" in captured
+    assert "PASS: prod-a" in captured
+
+
+def test_performance_benches_corpus_cases_with_weights(cpu_device, stub_timer):
+    spec = _spec()
+    gpu = bench.GPUSpec(name="cpu-test", peak_tflops_fp16=100.0, peak_bandwidth_gb_s=1000.0)
+    perf = bench.run_performance(
+        _good_kernel, spec, gpu, sizes_filter="all", corpus_cases=_corpus_cases()
+    )
+
+    labels = [entry["label"] for entry in perf["all"]]
+    assert labels == ["small", "medium", "large", "prod-a", "prod-b"]
+    corpus = perf["corpus"]
+    assert corpus is not None
+    assert [entry["weight"] for entry in corpus["cases"]] == [3, 1]
+    weighted = corpus["weighted"]["torch.float32"]
+    assert weighted["cases"] == 2
+    assert weighted["weight"] == 4
+    # the stub timer returns 0.5 ms for every call; weight must not repeat loops
+    assert weighted["kernel_ms"] == pytest.approx(0.5)
+    assert len(stub_timer) == 2 * 5  # candidate + reference per configuration
+
+
+def test_performance_corpus_only_skips_builtin_sizes(cpu_device, stub_timer):
+    spec = _spec()
+    gpu = bench.GPUSpec(name="cpu-test", peak_tflops_fp16=100.0, peak_bandwidth_gb_s=1000.0)
+    perf = bench.run_performance(
+        _good_kernel, spec, gpu, sizes_filter="all",
+        corpus_cases=_corpus_cases(), corpus_only=True,
+    )
+    labels = [entry["label"] for entry in perf["all"]]
+    assert labels == ["prod-a", "prod-b"]
+

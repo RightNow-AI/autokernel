@@ -12,6 +12,15 @@ lazily inside the functions that need it.
 
 from __future__ import annotations
 
+from .corpus import (
+    CORPUS_SCHEMA_VERSION,
+    CorpusCase,
+    CorpusError,
+    ShapeCorpus,
+    load_shape_corpus,
+    validate_corpus_against_spec,
+    weighted_aggregate,
+)
 from .outputs import (
     DEFAULT_TOLERANCE,
     LeafRecord,
@@ -24,12 +33,19 @@ from .outputs import (
 )
 
 __all__ = [
+    "CORPUS_SCHEMA_VERSION",
+    "CorpusCase",
+    "CorpusError",
     "DEFAULT_TOLERANCE",
     "LeafRecord",
     "OutputTreeError",
+    "ShapeCorpus",
     "TreeComparison",
     "compare_deterministic",
     "compare_output_trees",
     "flatten_output_tree",
+    "load_shape_corpus",
     "tree_has_nan_or_inf",
+    "validate_corpus_against_spec",
+    "weighted_aggregate",
 ]

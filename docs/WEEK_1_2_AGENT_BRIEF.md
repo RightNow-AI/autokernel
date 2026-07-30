@@ -625,6 +625,20 @@ Add merge behavior:
 - `--shape-corpus`: append validated corpus cases;
 - `--shape-corpus-only`: use only corpus cases.
 
+Implementation decisions (recorded by the Week 2 agent):
+
+- `--shape-corpus-only` is a flag companion to `--shape-corpus PATH`
+  (argparse rejects it without a path); corpus cases join the stage-2
+  correctness sweep and are each benchmarked once in the performance loop,
+  with weighted aggregates reported per dtype.
+- Corpus loading and validation run before the candidate module is imported
+  whenever the operation is explicitly selected (`--spec`/`--kernel`), and
+  always before GPU detection: malformed metadata must fail without
+  executing candidate code.
+- Two cases resolving to the same `(size, dtype)` configuration are
+  rejected with an actionable "merge their weights" message (the plan's
+  "deduplicated or rejected" choice, made explicit).
+
 Use `weight` for aggregate reporting, not to repeat allocations or benchmark
 loops unnecessarily.
 

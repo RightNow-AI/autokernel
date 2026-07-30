@@ -31,7 +31,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +58,12 @@ from autokernel.verification import (  # noqa: E402
     compare_deterministic,
     compare_output_trees,
     tree_has_nan_or_inf,
+)
+from autokernel.verification.corpus import (  # noqa: E402
+    CorpusError,
+    load_shape_corpus,
+    validate_corpus_against_spec,
+    weighted_aggregate,
 )
 
 # ---------------------------------------------------------------------------
@@ -324,6 +330,41 @@ def resolve_operation_name(
     return spec_name or kernel_arg or declared_type
 
 
+def _get_spec_or_exit(registry: KernelRegistry, kernel_type: str) -> KernelSpec:
+    """Fetch a spec from the registry, preserving the CLI failure contract."""
+    try:
+        return registry.get(kernel_type)
+    except SpecNotFoundError:
+        print(f"\nERROR: Unknown kernel type '{kernel_type}'")
+        print(f"  Available: {', '.join(registry.list_names())}")
+        print(f"\ncorrectness: FAIL")
+        print(f"throughput_tflops: 0.000")
+        sys.exit(1)
+
+
+def _load_validated_corpus(args: argparse.Namespace, spec: KernelSpec):
+    """Load and validate ``--shape-corpus`` against the selected spec.
+
+    Returns the validated cases, or None when no corpus was requested. Exits
+    with the greppable failure contract on any corpus error. Runs before the
+    candidate module is imported and before any GPU allocation, so a malformed
+    corpus never executes candidate code or touches the device.
+    """
+    if not args.shape_corpus:
+        return None
+    try:
+        corpus = load_shape_corpus(args.shape_corpus)
+        validate_corpus_against_spec(corpus, spec)
+    except CorpusError as e:
+        print(f"\nERROR: {e}")
+        print(f"\ncorrectness: FAIL")
+        print(f"throughput_tflops: 0.000")
+        sys.exit(1)
+    mode = "corpus-only" if args.shape_corpus_only else "append"
+    print(f"shape_corpus: {args.shape_corpus} ({len(corpus.cases)} cases, mode={mode})")
+    return corpus.cases
+
+
 # =========================================================================
 # 3. CORRECTNESS TESTING (5 stages)
 # =========================================================================
@@ -351,8 +392,18 @@ def _record_leaves(records: List[Dict[str, Any]], stage: str, case: str, cmp: Tr
         records.append({"stage": stage, "case": case, **leaf})
 
 
-def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) -> dict:
-    """Run all correctness stages. Returns dict with results."""
+def run_correctness(
+    kernel_fn: Callable,
+    spec: KernelSpec,
+    quick: bool = False,
+    corpus_cases: Optional[Sequence] = None,
+    corpus_only: bool = False,
+) -> dict:
+    """Run all correctness stages. Returns dict with results.
+
+    ``corpus_cases`` appends validated production shapes to the stage-2 shape
+    sweep; ``corpus_only`` replaces the built-in size/dtype sweep with them.
+    """
     device = BENCH_DEVICE
     results = {
         "smoke_test": "SKIP",
@@ -434,8 +485,17 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
     worst_error = 0.0
     worst_case = ""
 
-    for label, sz in sizes:
-        for dtype in dtypes:
+    sweep_configs: List[Tuple[str, Dict[str, int], torch.dtype]] = []
+    if not corpus_only:
+        for label, sz in sizes:
+            for dtype in dtypes:
+                sweep_configs.append((label, sz, dtype))
+    if corpus_cases:
+        for case in corpus_cases:
+            case_dtype = resolve_torch_dtype(case.dtype) if case.dtype else dtypes[0]
+            sweep_configs.append((case.name, dict(case.size), case_dtype))
+
+    for label, sz, dtype in sweep_configs:
             sweep_count += 1
             try:
                 inputs = gen_fn(sz, dtype, device, seed=42)
@@ -728,8 +788,15 @@ def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
 
 
 def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
-                    sizes_filter: str = "all") -> dict:
-    """Run performance benchmarks. Returns dict with metrics."""
+                    sizes_filter: str = "all",
+                    corpus_cases: Optional[Sequence] = None,
+                    corpus_only: bool = False) -> dict:
+    """Run performance benchmarks. Returns dict with metrics.
+
+    ``corpus_cases`` appends production shapes (each benchmarked once; their
+    weights feed aggregate reporting, not repetition). ``corpus_only``
+    benchmarks only those shapes.
+    """
     device = BENCH_DEVICE
     gen_fn = spec.input_generator
     ref_fn = _spec_reference(spec)
@@ -740,7 +807,9 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
     # Select benchmark size
     sizes = _spec_sizes(spec)
     bench_sizes = []
-    if sizes_filter == "all":
+    if corpus_only:
+        bench_sizes = []
+    elif sizes_filter == "all":
         bench_sizes = sizes
     else:
         for label, sz in sizes:
@@ -769,10 +838,21 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
 
     dtype = dtypes[0]  # primary dtype for benchmarking
 
+    # (label, size, dtype, weight, source) benchmark configurations. Built-in
+    # sizes carry weight 1; corpus cases carry their declared weight, which is
+    # used only for aggregate reporting, never to repeat benchmark loops.
+    bench_configs: List[Tuple[str, Dict[str, int], torch.dtype, int, str]] = [
+        (label, sz, dtype, 1, "builtin") for label, sz in bench_sizes
+    ]
+    if corpus_cases:
+        for case in corpus_cases:
+            case_dtype = resolve_torch_dtype(case.dtype) if case.dtype else dtype
+            bench_configs.append((case.name, dict(case.size), case_dtype, case.weight, "corpus"))
+
     all_results = []
     primary_result = None
 
-    for label, sz in bench_sizes:
+    for label, sz, dtype, weight, source in bench_configs:
         print(f"\n  Benchmarking: {label} ...")
         try:
             flops = flops_fn(sz)
@@ -814,6 +894,8 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
                 "label": label,
                 "size": sz,
                 "dtype": str(dtype),
+                "weight": weight,
+                "source": source,
                 "flops": flops,
                 "bytes": nbytes,
                 "kernel_latency_us": kernel_us,
@@ -852,9 +934,32 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
     if primary_result is None and all_results:
         primary_result = all_results[-1]
 
+    # Weighted aggregate reporting for corpus cases, grouped per dtype so
+    # results from different dtypes are never mixed into one aggregate.
+    corpus_summary = None
+    corpus_entries = [entry for entry in all_results if entry["source"] == "corpus"]
+    if corpus_entries:
+        weighted = weighted_aggregate(
+            {
+                "dtype": entry["dtype"],
+                "weight": entry["weight"],
+                "kernel_ms": entry["kernel_latency_us"] / 1000.0,
+                "ref_ms": entry["pytorch_latency_us"] / 1000.0,
+            }
+            for entry in corpus_entries
+        )
+        corpus_summary = {"cases": corpus_entries, "weighted": weighted}
+        print(f"\n  === SHAPE CORPUS: weighted aggregates ===")
+        for dtype_name, agg in weighted.items():
+            print(f"  dtype={dtype_name}: cases={agg['cases']}, total_weight={agg['weight']}")
+            print(f"    weighted_kernel_latency_us: {agg['kernel_ms'] * 1000.0:.2f}")
+            print(f"    weighted_pytorch_latency_us: {agg['ref_ms'] * 1000.0:.2f}")
+            print(f"    weighted_speedup_vs_pytorch: {agg['speedup']:.3f}x")
+
     return {
         "primary": primary_result,
         "all": all_results,
+        "corpus": corpus_summary,
     }
 
 
@@ -936,7 +1041,15 @@ def main():
                         help="Quick mode: skip correctness stages 3-5, bench only large size")
     parser.add_argument("--profile", action="store_true",
                         help="Enable torch profiler trace")
+    parser.add_argument("--shape-corpus", type=str, default=None, metavar="PATH",
+                        help="Versioned JSON shape corpus; validated cases are "
+                             "appended to the built-in sweep and benchmarked once each")
+    parser.add_argument("--shape-corpus-only", action="store_true",
+                        help="Benchmark only the --shape-corpus cases, skipping the "
+                             "built-in size sweep (requires --shape-corpus)")
     args = parser.parse_args()
+    if args.shape_corpus_only and not args.shape_corpus:
+        parser.error("--shape-corpus-only requires --shape-corpus PATH")
 
     # ------------------------------------------------------------------
     # Import the kernel module
@@ -972,6 +1085,18 @@ def main():
         kernel_type = spec.name
         print(f"kernel_spec: {args.spec}")
 
+    # When the operation is already determined (--spec or --kernel), fetch its
+    # spec and validate the shape corpus *before* importing the candidate
+    # module: malformed metadata must fail without executing candidate code
+    # and before any GPU allocation.
+    kernel_type = spec.name if spec is not None else args.kernel
+    spec_locked = kernel_type is not None
+    corpus_cases = None
+    if spec_locked:
+        if spec is None:
+            spec = _get_spec_or_exit(registry, kernel_type)
+        corpus_cases = _load_validated_corpus(args, spec)
+
     try:
         # Add cwd to path so 'import kernel' works
         if os.getcwd() not in sys.path:
@@ -985,9 +1110,10 @@ def main():
         kernel_fn = kernel_module.kernel_fn
 
         declared_type = getattr(kernel_module, "KERNEL_TYPE", None)
-        resolved = resolve_operation_name(
-            spec.name if spec is not None else None, args.kernel, declared_type
-        )
+        if spec_locked:
+            resolved = kernel_type
+        else:
+            resolved = resolve_operation_name(None, args.kernel, declared_type)
         if resolved is None:
             print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
             sys.exit(1)
@@ -1015,16 +1141,11 @@ def main():
         print(f"throughput_tflops: 0.000")
         sys.exit(1)
 
-    # Validate kernel type against the registry
-    if spec is None:
-        try:
-            spec = registry.get(kernel_type)
-        except SpecNotFoundError:
-            print(f"\nERROR: Unknown kernel type '{kernel_type}'")
-            print(f"  Available: {', '.join(registry.list_names())}")
-            print(f"\ncorrectness: FAIL")
-            print(f"throughput_tflops: 0.000")
-            sys.exit(1)
+    # The default selection path (kernel.py::KERNEL_TYPE) resolves the spec
+    # and validates the corpus only after the candidate import.
+    if not spec_locked:
+        spec = _get_spec_or_exit(registry, kernel_type)
+        corpus_cases = _load_validated_corpus(args, spec)
 
     # ------------------------------------------------------------------
     # GPU Detection
@@ -1047,7 +1168,10 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n=== CORRECTNESS ===")
     try:
-        correctness_results = run_correctness(kernel_fn, spec, quick=args.quick)
+        correctness_results = run_correctness(
+            kernel_fn, spec, quick=args.quick,
+            corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
+        )
     except Exception as e:
         print(f"\nFATAL: Correctness testing crashed: {type(e).__name__}: {e}")
         traceback.print_exc()
@@ -1087,7 +1211,10 @@ def main():
         if args.quick:
             sizes_filter = "large"
         torch.cuda.reset_peak_memory_stats()
-        perf_results = run_performance(kernel_fn, spec, gpu, sizes_filter=sizes_filter)
+        perf_results = run_performance(
+            kernel_fn, spec, gpu, sizes_filter=sizes_filter,
+            corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
+        )
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")

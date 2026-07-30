@@ -9,6 +9,7 @@ These tests protect two things the autonomous loop depends on:
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -265,3 +266,48 @@ def test_extract_synthesizes_a_target_from_a_spec_alone():
     assert entry["op_type"] == "fixture_add"
     assert entry["autokernel_supported"] is True
     assert entry["shapes"] == spec.extraction_shape()
+
+
+# ---------------------------------------------------------------------------
+# bench.py shape-corpus command line
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--shape-corpus", "--shape-corpus-only"])
+def test_bench_help_lists_corpus_flags(flag):
+    result = run_script("bench.py", "--help")
+    assert result.returncode == 0, result.stderr
+    assert flag in result.stdout
+
+
+def test_bench_corpus_only_requires_corpus_path():
+    result = run_script("bench.py", "--shape-corpus-only")
+    assert result.returncode == 2
+    assert "requires --shape-corpus" in result.stderr
+
+
+def test_bench_invalid_corpus_fails_before_gpu_detection(tmp_path: Path):
+    """An invalid corpus must fail before any GPU probing or allocation."""
+    bad = tmp_path / "bad_corpus.json"
+    bad.write_text(json.dumps({"schema_version": 1, "operation": "matmul", "cases": []}))
+    result = run_script("bench.py", "--kernel", "matmul", "--shape-corpus", str(bad))
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "correctness: FAIL" in combined
+    assert "throughput_tflops: 0.000" in combined
+    assert str(bad) in combined
+    # The GPU info block is printed only after detection; it must not appear.
+    assert "gpu_name:" not in combined
+
+
+def test_bench_corpus_operation_mismatch_is_actionable(tmp_path: Path):
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text(json.dumps({
+        "schema_version": 1,
+        "operation": "some_other_op",
+        "cases": [{"name": "a", "size": {"M": 4, "N": 4, "K": 4}}],
+    }))
+    result = run_script("bench.py", "--kernel", "matmul", "--shape-corpus", str(corpus))
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "does not match the selected spec" in combined
+
