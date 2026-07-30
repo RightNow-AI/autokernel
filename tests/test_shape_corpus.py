@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import make_spec
 
 from autokernel.verification import (
     CorpusError,
@@ -14,6 +13,7 @@ from autokernel.verification import (
     validate_corpus_against_spec,
     weighted_aggregate,
 )
+from conftest import make_spec
 
 
 def _write(tmp_path: Path, payload: object, name: str = "corpus.json") -> Path:
@@ -87,6 +87,13 @@ def test_invalid_json_fails(tmp_path):
     path = tmp_path / "bad.json"
     path.write_text("{not json")
     with pytest.raises(CorpusError, match="invalid JSON"):
+        load_shape_corpus(path)
+
+
+def test_non_utf8_corpus_fails_with_corpus_error(tmp_path):
+    path = tmp_path / "bad-encoding.json"
+    path.write_bytes(b"\xff\xfe")
+    with pytest.raises(CorpusError, match="cannot read file"):
         load_shape_corpus(path)
 
 
@@ -269,4 +276,3 @@ def test_weighted_aggregate_zero_kernel_latency_guards_division():
         [{"dtype": "torch.float16", "weight": 1, "kernel_ms": 0.0, "ref_ms": 1.0}]
     )
     assert agg["torch.float16"]["speedup"] == 0.0
-

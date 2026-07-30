@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,21 @@ def test_write_result_atomic_serializes_non_finite_values_safely(tmp_path: Path)
     results.write_result_atomic(destination, {"bad": float("nan")})
     assert json.loads(destination.read_text()) == {"bad": "nan"}
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_write_result_atomic_sanitizes_values_from_as_dict(tmp_path: Path):
+    @dataclass
+    class Record:
+        error: float
+
+        def as_dict(self):
+            return {"nested": {"error": self.error}}
+
+    destination = tmp_path / "bench_result.json"
+    results.write_result_atomic(destination, {"record": Record(float("inf"))})
+    assert json.loads(destination.read_text()) == {
+        "record": {"nested": {"error": "inf"}}
+    }
 
 
 def test_write_result_atomic_preserves_old_file_on_failure(

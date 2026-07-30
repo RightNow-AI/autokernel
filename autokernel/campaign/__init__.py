@@ -5,10 +5,10 @@ from .types import (
     CampaignError,
     CampaignTarget,
     OptimizationCampaign,
-    prepare_campaign,
     ShapeObservation,
     TensorSignature,
     load_campaign,
+    prepare_campaign,
     rank_targets,
     write_optimization_plan,
 )
@@ -18,10 +18,10 @@ __all__ = [
     "CampaignError",
     "CampaignTarget",
     "OptimizationCampaign",
-    "prepare_campaign",
     "ShapeObservation",
     "TensorSignature",
     "load_campaign",
+    "prepare_campaign",
     "rank_targets",
     "write_optimization_plan",
 ]

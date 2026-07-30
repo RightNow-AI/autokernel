@@ -56,8 +56,8 @@ def test_wan_reference_matches_explicit_fastvideo_dtype_boundary():
     expected_normalized = F.layer_norm(
         expected_updated_fp32,
         (size["hidden"],),
-        inputs["weight"],
-        inputs["bias"],
+        inputs["weight"].float(),
+        inputs["bias"].float(),
         1e-6,
     ).to(torch.bfloat16)
 

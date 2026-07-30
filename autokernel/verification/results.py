@@ -63,7 +63,7 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if hasattr(value, "as_dict"):
-        return value.as_dict()
+        return _json_safe(value.as_dict())
     return str(value)
 
 

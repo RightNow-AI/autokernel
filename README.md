@@ -132,7 +132,8 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 
 Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
 
-Every operation is described by one `KernelSpec` in `autokernel/specs/builtins.py`. That
+Every built-in operation is described by one `KernelSpec` in
+`autokernel/specs/builtins.py`. That
 specification is the single source of truth for sizes, dtypes, tolerances, edge cases,
 FLOP/byte accounting, profiler shape aliases and starter kernels -- `bench.py` and
 `extract.py` read it instead of carrying their own per-operation tables.

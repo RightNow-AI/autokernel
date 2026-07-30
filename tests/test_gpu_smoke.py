@@ -11,10 +11,10 @@ means the registry refactor changed kernel behavior.
 from __future__ import annotations
 
 import pytest
-from conftest import REPO_ROOT, requires_gpu
 
 from autokernel.specs import create_builtin_registry, load_spec
 from autokernel.verification import check_backward, check_compile
+from conftest import REPO_ROOT, requires_gpu
 
 pytestmark = [pytest.mark.gpu, requires_gpu]
 
@@ -50,6 +50,34 @@ def test_external_spec_runs_through_the_same_harness():
 
     results = bench.run_correctness(kernel_fn, spec, quick=False)
     assert results["correctness"] == "PASS", results.get("details")
+
+
+def test_wan_starter_kernel_passes_correctness():
+    bench = pytest.importorskip("bench")
+    model = REPO_ROOT / "models" / "wan_gated_residual_norm.py"
+    spec = load_spec(f"{model}:SPEC")
+    kernel_fn = _load_kernel_fn(spec.starter_kernel("triton"))
+
+    results = bench.run_correctness(kernel_fn, spec, quick=True)
+    assert results["correctness"] == "PASS", results.get("details")
+
+
+def test_wan_starter_rejects_noncontiguous_and_cross_device_inputs():
+    import torch
+
+    model = REPO_ROOT / "models" / "wan_gated_residual_norm.py"
+    spec = load_spec(f"{model}:SPEC")
+    kernel_fn = _load_kernel_fn(spec.starter_kernel("triton"))
+    residual = torch.randn(1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn_like(residual)
+    gate = torch.randn(1, 16, device="cuda")[:, ::2]
+    weight = torch.randn(8, device="cuda")
+    bias = torch.randn(8, device="cuda")
+
+    with pytest.raises(ValueError, match="gate, weight, and bias"):
+        kernel_fn(residual, x, gate, weight, bias)
+    with pytest.raises(ValueError, match="residual device"):
+        kernel_fn(residual, x, gate.contiguous(), weight, bias.cpu())
 
 
 def test_external_spec_performance_path():

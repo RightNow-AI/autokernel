@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import make_spec, spec_kwargs
 
 from autokernel.specs import (
     DT_BYTES,
@@ -26,7 +25,7 @@ from autokernel.specs import (
     size,
     validate_spec,
 )
-
+from conftest import make_spec, spec_kwargs
 
 # ---------------------------------------------------------------------------
 # Registry behavior
@@ -193,8 +192,9 @@ def test_extra_tolerances_are_allowed():
 
 def test_reject_missing_starter_kernel_file(tmp_path: Path):
     missing = tmp_path / "nope.py"
+    spec = make_spec(starter_kernels={"triton": missing})
     with pytest.raises(SpecValidationError, match="starter kernel not found"):
-        make_spec(starter_kernels={"triton": missing})
+        KernelRegistry().register(spec)
 
 
 def test_accept_existing_starter_kernel_file(tmp_path: Path):
@@ -354,6 +354,12 @@ def test_accounting_power_is_right_associative_in_source():
     assert expr({"s": 3}) == 36
 
 
+def test_accounting_supports_reflected_power():
+    expr = 2 ** size("s")
+    assert expr.to_source() == "2 ** s['s']"
+    assert expr({"s": 4}) == 16
+
+
 def test_accounting_expression_requires_dtype_bytes_when_used():
     expr = size("rows") * DT_BYTES
     with pytest.raises(ValueError, match="dtype byte width"):
@@ -427,6 +433,13 @@ def test_output_spec_accepts_mapping_coercion():
 def test_output_spec_rejects_duplicate_paths():
     with pytest.raises(SpecValidationError, match="duplicate path"):
         OutputSpec(included_paths=("output", "output"))
+
+
+def test_output_and_backward_specs_reject_empty_output_paths():
+    with pytest.raises(SpecValidationError, match="at least one path"):
+        OutputSpec(included_paths=())
+    with pytest.raises(SpecValidationError, match="at least one path"):
+        BackwardSpec(differentiable_inputs=("x",), output_paths=())
 
 
 def test_output_spec_rejects_unknown_mapping_keys():

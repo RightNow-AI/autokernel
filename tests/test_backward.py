@@ -75,6 +75,14 @@ def test_gradient_parity_for_reference_candidate():
     assert set(report.output_paths) == {'output["aux"][0]', 'output["output"]'}
 
 
+def test_empty_sizes_returns_structured_failure():
+    spec = _spec()
+    object.__setattr__(spec, "sizes", {})
+    report = check_backward(_affine_ref, spec, device="cpu")
+    assert report.status == "FAIL"
+    assert "declares no sizes" in report.reason
+
+
 def test_upstream_generator_fallback_generates_on_cpu_then_moves(monkeypatch):
     original_generator = torch.Generator
     moves = []

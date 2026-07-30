@@ -155,7 +155,11 @@ def load_shape_corpus(path: str | Path) -> ShapeCorpus:
     if not file_path.is_file():
         raise _fail(source, "file not found")
     try:
-        raw = json.loads(file_path.read_text(encoding="utf-8"))
+        text = file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _fail(source, f"cannot read file: {exc}") from exc
+    try:
+        raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise _fail(source, f"invalid JSON: {exc}") from exc
 
@@ -275,4 +279,3 @@ def weighted_aggregate(
             "speedup": (ref_ms / kernel_ms) if kernel_ms > 0 else 0.0,
         }
     return out
-

@@ -537,7 +537,10 @@ def extract_kernels(
     if not extracted:
         print("ERROR: No kernels were successfully extracted.")
         if skipped > 0:
-            print(f"       {skipped} kernel(s) skipped due to missing starter files.")
+            print(
+                f"       {skipped} kernel(s) skipped "
+                "(missing spec or starter kernel)."
+            )
         sys.exit(1)
 
     # -- Generate optimization plan --

@@ -342,8 +342,8 @@ def _get_spec_or_exit(registry: KernelRegistry, kernel_type: str) -> KernelSpec:
     except SpecNotFoundError:
         print(f"\nERROR: Unknown kernel type '{kernel_type}'")
         print(f"  Available: {', '.join(registry.list_names())}")
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
         sys.exit(1)
 
 
@@ -362,8 +362,8 @@ def _load_validated_corpus(args: argparse.Namespace, spec: KernelSpec):
         validate_corpus_against_spec(corpus, spec)
     except CorpusError as e:
         print(f"\nERROR: {e}")
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
         sys.exit(1)
     mode = "corpus-only" if args.shape_corpus_only else "append"
     print(f"shape_corpus: {args.shape_corpus} ({len(corpus.cases)} cases, mode={mode})")
@@ -442,9 +442,9 @@ def run_correctness(
 
         if tree_has_nan_or_inf(output):
             results["smoke_test"] = "FAIL"
-            details.append(f"  smoke: NaN/Inf in output")
+            details.append("  smoke: NaN/Inf in output")
             all_pass = False
-            print(f"  FAIL: NaN/Inf in output")
+            print("  FAIL: NaN/Inf in output")
         else:
             cmp = _compare_outputs(output, expected, spec)
             _record_leaves(leaf_records, "smoke", tiny_label, cmp)
@@ -477,7 +477,7 @@ def run_correctness(
         results["correctness"] = "FAIL"
         results["details"] = details
         results["leaf_details"] = leaf_records
-        print(f"\ncorrectness: FAIL (smoke test failed, aborting remaining stages)")
+        print("\ncorrectness: FAIL (smoke test failed, aborting remaining stages)")
         return results
 
     # ------------------------------------------------------------------
@@ -501,52 +501,58 @@ def run_correctness(
             sweep_configs.append((case.name, dict(case.size), case_dtype))
 
     for label, sz, dtype in sweep_configs:
-            sweep_count += 1
-            try:
-                inputs = gen_fn(sz, dtype, device, seed=42)
-                expected = ref_fn(inputs)
-                with _Timeout(30):
-                    output = kernel_fn(**inputs)
+        sweep_count += 1
+        try:
+            inputs = gen_fn(sz, dtype, device, seed=42)
+            expected = ref_fn(inputs)
+            with _Timeout(30):
+                output = kernel_fn(**inputs)
 
-                if tree_has_nan_or_inf(output):
-                    sweep_pass = False
-                    sweep_fail_count += 1
-                    details.append(f"  sweep {label}/{dtype}: NaN/Inf")
-                    print(f"  FAIL: {label} {dtype} -> NaN/Inf")
-                    continue
-
-                cmp = _compare_outputs(output, expected, spec)
-                _record_leaves(leaf_records, "sweep", f"{label}/{dtype}", cmp)
-
-                if cmp.worst_abs_error > worst_error:
-                    worst_error = cmp.worst_abs_error
-                    worst_case = f"{label}/{dtype}"
-
-                if not cmp.match:
-                    sweep_pass = False
-                    sweep_fail_count += 1
-                    details.append(f"  sweep {label}/{dtype}: {cmp.reason}")
-                    print(f"  FAIL: {label} {dtype} -> {cmp.reason}")
-                else:
-                    print(f"  PASS: {label} {dtype} (max_err={cmp.worst_abs_error:.2e}, within_tol={cmp.worst_pct_within_tol:.1f}%)")
-
-            except torch.cuda.OutOfMemoryError:
-                # OOM on larger sizes is acceptable -- just skip
-                print(f"  SKIP: {label} {dtype} -> OOM")
-                torch.cuda.empty_cache()
+            if tree_has_nan_or_inf(output):
+                sweep_pass = False
+                sweep_fail_count += 1
+                details.append(f"  sweep {label}/{dtype}: NaN/Inf")
+                print(f"  FAIL: {label} {dtype} -> NaN/Inf")
                 continue
-            except BenchTimeoutError:
+
+            cmp = _compare_outputs(output, expected, spec)
+            _record_leaves(leaf_records, "sweep", f"{label}/{dtype}", cmp)
+
+            if cmp.worst_abs_error > worst_error:
+                worst_error = cmp.worst_abs_error
+                worst_case = f"{label}/{dtype}"
+
+            if not cmp.match:
                 sweep_pass = False
                 sweep_fail_count += 1
-                details.append(f"  sweep {label}/{dtype}: TIMEOUT")
-                print(f"  FAIL: {label} {dtype} -> TIMEOUT")
-            except Exception as e:
-                sweep_pass = False
-                sweep_fail_count += 1
-                details.append(f"  sweep {label}/{dtype}: {type(e).__name__}: {e}")
-                print(f"  FAIL: {label} {dtype} -> {type(e).__name__}: {e}")
-            finally:
-                torch.cuda.empty_cache()
+                details.append(f"  sweep {label}/{dtype}: {cmp.reason}")
+                print(f"  FAIL: {label} {dtype} -> {cmp.reason}")
+            else:
+                print(
+                    f"  PASS: {label} {dtype} "
+                    f"(max_err={cmp.worst_abs_error:.2e}, "
+                    f"within_tol={cmp.worst_pct_within_tol:.1f}%)"
+                )
+
+        except torch.cuda.OutOfMemoryError:
+            # OOM on larger sizes is acceptable -- just skip
+            print(f"  SKIP: {label} {dtype} -> OOM")
+            torch.cuda.empty_cache()
+            continue
+        except BenchTimeoutError:
+            sweep_pass = False
+            sweep_fail_count += 1
+            details.append(f"  sweep {label}/{dtype}: TIMEOUT")
+            print(f"  FAIL: {label} {dtype} -> TIMEOUT")
+        except Exception as e:
+            sweep_pass = False
+            sweep_fail_count += 1
+            details.append(
+                f"  sweep {label}/{dtype}: {type(e).__name__}: {e}"
+            )
+            print(f"  FAIL: {label} {dtype} -> {type(e).__name__}: {e}")
+        finally:
+            torch.cuda.empty_cache()
 
     if sweep_pass:
         results["shape_sweep"] = f"PASS ({sweep_count} configs, worst_err={worst_error:.2e} at {worst_case})"
@@ -761,7 +767,7 @@ def run_correctness(
 def run_backward_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
     """Opt-in gradient verification. Prints the greppable verdict line and
     returns the structured report."""
-    print(f"\n=== BACKWARD CORRECTNESS ===")
+    print("\n=== BACKWARD CORRECTNESS ===")
     report = check_backward(kernel_fn, spec, device=BENCH_DEVICE)
     if report.status == "PASS":
         print(f"  upstream outputs: {', '.join(report.output_paths)}")
@@ -779,7 +785,7 @@ def run_backward_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
 
 def run_compile_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
     """Run compile verification outside all timed performance regions."""
-    print(f"\n=== COMPILE CORRECTNESS ===")
+    print("\n=== COMPILE CORRECTNESS ===")
     report = check_compile(kernel_fn, spec, device=BENCH_DEVICE)
     for case in report.cases:
         detail = f": {case.reason}" if case.reason else ""
@@ -988,7 +994,7 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
             ]
         )
         corpus_summary = {"cases": corpus_entries, "weighted": weighted}
-        print(f"\n  === SHAPE CORPUS: weighted aggregates ===")
+        print("\n  === SHAPE CORPUS: weighted aggregates ===")
         for dtype_name, agg in weighted.items():
             print(f"  dtype={dtype_name}: cases={agg['cases']}, total_weight={agg['weight']}")
             print(f"    weighted_kernel_latency_us: {agg['kernel_ms'] * 1000.0:.2f}")
@@ -1130,8 +1136,8 @@ def main():
             )
         except (SpecLoadError, SpecValidationError) as e:
             print(f"\nERROR: {e}")
-            print(f"\ncorrectness: FAIL")
-            print(f"throughput_tflops: 0.000")
+            print("\ncorrectness: FAIL")
+            print("throughput_tflops: 0.000")
             sys.exit(1)
         kernel_type = spec.name
         print(f"kernel_spec: {args.spec}")
@@ -1175,21 +1181,21 @@ def main():
         kernel_type = resolved
 
         print(f"kernel_type: {kernel_type}")
-        print(f"kernel_module: kernel.py loaded successfully")
+        print("kernel_module: kernel.py loaded successfully")
 
     except SyntaxError as e:
-        print(f"\nERROR: kernel.py has a syntax error:")
+        print("\nERROR: kernel.py has a syntax error:")
         print(f"  {e}")
         traceback.print_exc()
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
         sys.exit(1)
     except Exception as e:
-        print(f"\nERROR: Failed to import kernel.py:")
+        print("\nERROR: Failed to import kernel.py:")
         print(f"  {type(e).__name__}: {e}")
         traceback.print_exc()
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
         sys.exit(1)
 
     # The default selection path (kernel.py::KERNEL_TYPE) resolves the spec
@@ -1203,7 +1209,7 @@ def main():
     # ------------------------------------------------------------------
     gpu = detect_gpu()
 
-    print(f"\n=== GPU INFO ===")
+    print("\n=== GPU INFO ===")
     print(f"gpu_name: {gpu.name}")
     print(f"gpu_sm_count: {gpu.sm_count}")
     print(f"gpu_memory_gb: {gpu.memory_gb}")
@@ -1217,7 +1223,7 @@ def main():
     # ------------------------------------------------------------------
     # Correctness
     # ------------------------------------------------------------------
-    print(f"\n=== CORRECTNESS ===")
+    print("\n=== CORRECTNESS ===")
     try:
         correctness_results = run_correctness(
             kernel_fn, spec, quick=args.quick,
@@ -1229,7 +1235,7 @@ def main():
         correctness_results = {"correctness": "FAIL", "smoke_test": "CRASH", "shape_sweep": "CRASH",
                                "numerical_stability": "CRASH", "determinism": "CRASH", "edge_cases": "CRASH"}
 
-    print(f"\n--- Correctness Summary ---")
+    print("\n--- Correctness Summary ---")
     print(f"smoke_test: {correctness_results.get('smoke_test', 'N/A')}")
     print(f"shape_sweep: {correctness_results.get('shape_sweep', 'N/A')}")
     print(f"numerical_stability: {correctness_results.get('numerical_stability', 'N/A')}")
@@ -1252,7 +1258,7 @@ def main():
             print(f"\nFATAL: Backward verification crashed: {type(e).__name__}: {e}")
             traceback.print_exc()
             backward_result = {"status": "FAIL", "reason": f"crash: {type(e).__name__}: {e}"}
-            print(f"BACKWARD_CORRECTNESS: FAIL")
+            print("BACKWARD_CORRECTNESS: FAIL")
 
     # ------------------------------------------------------------------
     # Compile verification (opt-in; correctness-only, never timed)
@@ -1271,7 +1277,7 @@ def main():
                 "status": "FAIL",
                 "reason": f"crash: {type(e).__name__}: {e}",
             }
-            print(f"COMPILE_CORRECTNESS: FAIL")
+            print("COMPILE_CORRECTNESS: FAIL")
 
     # ------------------------------------------------------------------
     # Performance
@@ -1323,7 +1329,7 @@ def main():
         print(f"bytes: {primary['bytes']}")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
 
-        print(f"\n=== COMPARISON VS PYTORCH ===")
+        print("\n=== COMPARISON VS PYTORCH ===")
         print(f"pytorch_latency_us: {primary['pytorch_latency_us']:.2f}")
         print(f"pytorch_latency_ms: {primary['pytorch_latency_us'] / 1000.0:.4f}")
         print(f"kernel_latency_us: {primary['kernel_latency_us']:.2f}")
@@ -1332,26 +1338,26 @@ def main():
         print(f"pytorch_tflops: {primary['ref_throughput_tflops']:.3f}")
         print(f"kernel_tflops: {primary['throughput_tflops']:.3f}")
     else:
-        print(f"\nlatency_us: 0.00")
-        print(f"latency_ms: 0.0000")
-        print(f"throughput_tflops: 0.000")
-        print(f"bandwidth_gb_s: 0.0")
-        print(f"pct_peak_compute: 0.0%")
-        print(f"pct_peak_bandwidth: 0.0%")
+        print("\nlatency_us: 0.00")
+        print("latency_ms: 0.0000")
+        print("throughput_tflops: 0.000")
+        print("bandwidth_gb_s: 0.0")
+        print("pct_peak_compute: 0.0%")
+        print("pct_peak_bandwidth: 0.0%")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
-        print(f"\n=== COMPARISON VS PYTORCH ===")
-        print(f"pytorch_latency_us: 0.00")
-        print(f"pytorch_latency_ms: 0.0000")
-        print(f"kernel_latency_us: 0.00")
-        print(f"kernel_latency_ms: 0.0000")
-        print(f"speedup_vs_pytorch: 0.000x")
+        print("\n=== COMPARISON VS PYTORCH ===")
+        print("pytorch_latency_us: 0.00")
+        print("pytorch_latency_ms: 0.0000")
+        print("kernel_latency_us: 0.00")
+        print("kernel_latency_ms: 0.0000")
+        print("speedup_vs_pytorch: 0.000x")
 
     # ------------------------------------------------------------------
     # All sizes summary table
     # ------------------------------------------------------------------
     all_perf = perf_results.get("all", [])
     if len(all_perf) > 1:
-        print(f"\n=== SIZE SWEEP ===")
+        print("\n=== SIZE SWEEP ===")
         print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8}")
         print("-" * 66)
         for entry in all_perf:
@@ -1418,7 +1424,7 @@ def main():
     except Exception as e:
         print(f"WARNING: Failed to write result JSON: {type(e).__name__}: {e}")
 
-    print(f"\n=== FINAL ===")
+    print("\n=== FINAL ===")
     print(f"kernel_type: {kernel_type}")
     print(f"correctness: {correctness_results['correctness']}")
     print(f"throughput_tflops: {throughput:.3f}")
@@ -1426,8 +1432,8 @@ def main():
         print(f"speedup_vs_pytorch: {primary['speedup_vs_pytorch']:.3f}x")
         print(f"pct_peak_compute: {primary['pct_peak_compute']:.1f}%")
     else:
-        print(f"speedup_vs_pytorch: 0.000x")
-        print(f"pct_peak_compute: 0.0%")
+        print("speedup_vs_pytorch: 0.000x")
+        print("pct_peak_compute: 0.0%")
     print(f"bench_time_seconds: {t_elapsed:.1f}")
 
     if t_elapsed > 90:

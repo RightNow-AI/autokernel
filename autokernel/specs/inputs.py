@@ -66,8 +66,8 @@ def gen_layernorm_inputs(size: SizeMap, dtype: Any, device: str, seed: int = 42)
     dtype = _prepare(dtype, seed)
     batch, dim = size["batch"], size["dim"]
     x = torch.randn(batch, dim, device=device, dtype=dtype)
-    weight = torch.ones(dim, device=device, dtype=dtype)
-    bias = torch.zeros(dim, device=device, dtype=dtype)
+    weight = torch.randn(dim, device=device, dtype=dtype) * 0.1
+    bias = torch.randn(dim, device=device, dtype=dtype) * 0.1
     return {"x": x, "weight": weight, "bias": bias}
 
 

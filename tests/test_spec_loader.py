@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import FIXTURES_DIR, make_spec
 
 from autokernel.specs import (
     KernelRegistry,
@@ -19,6 +18,7 @@ from autokernel.specs import (
     parse_locator,
     resolve_spec,
 )
+from conftest import FIXTURES_DIR, make_spec
 
 FIXTURE_FILE = FIXTURES_DIR / "custom_add.py"
 
@@ -204,7 +204,7 @@ def test_starter_kernel_must_exist_for_loaded_spec(tmp_path: Path):
         "    starter_kernels={'triton': '/nope/does_not_exist.py'},\n"
         ")\n"
     )
-    with pytest.raises(SpecLoadError) as exc:
+    with pytest.raises(SpecValidationError) as exc:
         load_spec(f"{bad}:SPEC")
     assert "starter kernel not found" in str(exc.value)
 
@@ -240,7 +240,7 @@ def test_resolve_spec_prefers_locator_over_name():
 
 
 def test_resolve_spec_falls_back_to_name():
-    spec, registry = resolve_spec(name="rmsnorm")
+    spec, _registry = resolve_spec(name="rmsnorm")
     assert spec.name == "rmsnorm"
 
 
@@ -251,7 +251,9 @@ def test_resolve_spec_requires_a_selection():
 
 def test_resolve_spec_registers_into_the_supplied_registry_only():
     isolated = KernelRegistry([make_spec(name="only_here")])
-    spec, registry = resolve_spec(spec_locator=f"{FIXTURE_FILE}:SPEC", registry=isolated)
+    _spec, registry = resolve_spec(
+        spec_locator=f"{FIXTURE_FILE}:SPEC", registry=isolated
+    )
     assert registry is isolated
     assert isolated.list_names() == ("only_here", "fixture_add")
     assert not create_builtin_registry().contains("fixture_add")
