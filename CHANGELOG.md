@@ -2,6 +2,12 @@
 
 ## Unreleased (downstream)
 
+### Model optimization campaigns
+
+- Added a versioned, metadata-only campaign contract with strict validation,
+  impact ranking, legacy orchestration-plan generation, and trusted
+  starter-kernel preparation through `campaign.py`
+
 ### MotionKernel identity
 
 - Renamed the downstream distribution to MotionKernel and reset its independent

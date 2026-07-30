@@ -212,6 +212,33 @@ A complete, runnable example lives in `examples/custom_ops/add.py` (spec) and
 Note that loading a spec executes the Python file you point at, exactly like running
 `python that_file.py`. Only pass locators you trust.
 
+## Model Optimization Campaigns
+
+FastVideo and other runtimes can export a versioned campaign containing only
+operation identities, tensor shape/layout signatures, call counts, aggregate
+timings, and environment identity. Validate and rank a campaign without loading
+PyTorch or executing any referenced Python:
+
+```bash
+uv run campaign.py validate /path/to/campaign.json
+uv run campaign.py rank /path/to/campaign.json
+uv run campaign.py plan /path/to/campaign.json
+```
+
+Once the campaign and its spec locators have been reviewed, prepare all ranked
+starter kernels and the existing orchestration state in one step:
+
+```bash
+uv run campaign.py prepare /path/to/campaign.json --trust-specs
+uv run orchestrate.py plan
+```
+
+Preparation writes `workspace/optimization_plan.json`, one candidate kernel per
+ranked target, and `workspace/campaign_receipt.json`. The explicit trust flag is
+required because a Python spec locator executes code. Continue with `program.md`
+for the autonomous experiment loop; every candidate still passes the fixed
+correctness gates in `bench.py` before a result can be kept.
+
 ## Generalized Verification
 
 The harness compares complete output trees, including nested tensors and metadata. An
