@@ -630,6 +630,7 @@ def prepare_campaign(
     output_dir: str | Path = "workspace",
     *,
     trust_specs: bool = False,
+    spec_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Materialize trusted starter kernels and an orchestration receipt."""
     if not trust_specs:
@@ -656,8 +657,15 @@ def prepare_campaign(
                 f"target {target.name!r}.spec_locator",
                 "is required for campaign preparation",
             )
+        locator = target.spec_locator
+        if spec_root is not None:
+            module, separator, attribute = locator.rpartition(":")
+            module_path = Path(module)
+            rooted = Path(spec_root).resolve() / module_path
+            if separator and not module_path.is_absolute() and rooted.is_file():
+                locator = f"{rooted}:{attribute}"
         try:
-            spec = load_spec(target.spec_locator)
+            spec = load_spec(locator)
         except SpecLoadError as exc:
             raise _fail(
                 campaign.source,

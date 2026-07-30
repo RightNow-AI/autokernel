@@ -29,11 +29,12 @@ The reusable kernel specification registry, production shape corpora,
 structured-output comparison, backward verification, `torch.compile`
 verification, and reproducible JSON result artifacts are implemented.
 
-The first video-specific operation is a Wan post-attention gated residual and
-LayerNorm fusion. It has been validated across its production shape corpus on
-an NVIDIA GB200. Model-wide graph discovery, automatic replacement, and
-complete model kernel packs remain roadmap work; support for a model is not
-claimed until its integration and end-to-end benchmark are published.
+The first video-specific pack covers three Wan boundaries: modulated
+pre-attention LayerNorm, post-attention gated residual plus LayerNorm, and the
+post-MLP gated residual. The post-attention fusion has been validated across
+its production shape corpus on an NVIDIA GB200; the other two are ready for
+the same GPU campaign. Complete model packs still require end-to-end benchmark
+publication before support is claimed.
 
 MotionKernel currently retains the `autokernel` Python import namespace for
 compatibility with the upstream project. The import namespace will only move
@@ -236,9 +237,23 @@ uv run orchestrate.py plan
 
 Preparation writes `workspace/optimization_plan.json`, one candidate kernel per
 ranked target, and `workspace/campaign_receipt.json`. The explicit trust flag is
-required because a Python spec locator executes code. Continue with `program.md`
-for the autonomous experiment loop; every candidate still passes the fixed
-correctness gates in `bench.py` before a result can be kept.
+required because a Python spec locator executes code. Continue with
+`program.md` for the autonomous experiment loop; every candidate still passes
+the fixed correctness gates in `bench.py` before a result can be kept.
+
+For an unattended, resumable run, preparation and the agent loop are one
+command:
+
+```bash
+uv run campaign.py run /path/to/wan-campaign.json --budget-hours 10
+```
+
+Use `--dry-run` to inspect `workspace/overnight_prompt.md` without launching an
+agent, and `--resume` after an interrupted run. By default the runner invokes
+the Codex CLI; `--agent-command` supports trusted alternatives with `{repo}`
+and `{prompt_file}` placeholders. The next morning, inspect
+`workspace/morning_report.md`, the terminal receipt, agent log, and verified
+`kernel_<operation>_<rank>_optimized.py` artifacts in the same directory.
 
 ## Generalized Verification
 

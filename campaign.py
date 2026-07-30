@@ -17,8 +17,10 @@ from pathlib import Path
 from autokernel.campaign import (
     CampaignError,
     load_campaign,
+    parse_agent_command,
     prepare_campaign,
     rank_targets,
+    run_campaign,
     write_optimization_plan,
 )
 
@@ -49,6 +51,18 @@ def _parser() -> argparse.ArgumentParser:
         "--trust-specs",
         action="store_true",
         help="Allow loading Python spec locators from this campaign",
+    )
+    run = subparsers.add_parser("run")
+    run.add_argument("campaign", type=Path)
+    run.add_argument("--budget-hours", type=float, default=10.0)
+    run.add_argument("--resume", action="store_true")
+    run.add_argument("--dry-run", action="store_true")
+    run.add_argument(
+        "--agent-command",
+        help=(
+            "Alternative agent command; supports {repo} and {prompt_file} "
+            "placeholders and is executed without a shell"
+        ),
     )
     return parser
 
@@ -90,6 +104,35 @@ def main(argv: list[str] | None = None) -> int:
         print("CAMPAIGN_PLAN: PASS")
         print(f"output: {args.output}")
         print(f"targets: {len(plan['kernels_to_optimize'])}")
+        return 0
+
+    if args.command == "run":
+        repo_root = Path(__file__).resolve().parent
+        prompt_path = repo_root / "workspace" / "overnight_prompt.md"
+        command = (
+            parse_agent_command(
+                args.agent_command,
+                repo_root=repo_root,
+                prompt_path=prompt_path,
+            )
+            if args.agent_command
+            else None
+        )
+        try:
+            receipt = run_campaign(
+                campaign,
+                repo_root=repo_root,
+                budget_hours=args.budget_hours,
+                resume=args.resume,
+                dry_run=args.dry_run,
+                agent_command=command,
+            )
+        except CampaignError as exc:
+            print(f"CAMPAIGN_RUN: FAIL\n{exc}", file=sys.stderr)
+            return 2
+        print("CAMPAIGN_RUN: PASS")
+        print(f"status: {receipt['status']}")
+        print(f"receipt: {repo_root / 'workspace' / 'overnight_receipt.json'}")
         return 0
 
     try:

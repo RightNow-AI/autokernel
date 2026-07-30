@@ -52,9 +52,17 @@ def test_external_spec_runs_through_the_same_harness():
     assert results["correctness"] == "PASS", results.get("details")
 
 
-def test_wan_starter_kernel_passes_correctness():
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "wan_gated_residual_norm",
+        "wan_modulated_layer_norm",
+        "wan_gated_residual",
+    ],
+)
+def test_wan_starter_kernel_passes_correctness(operation):
     bench = pytest.importorskip("bench")
-    model = REPO_ROOT / "models" / "wan_gated_residual_norm.py"
+    model = REPO_ROOT / "models" / f"{operation}.py"
     spec = load_spec(f"{model}:SPEC")
     kernel_fn = _load_kernel_fn(spec.starter_kernel("triton"))
 

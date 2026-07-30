@@ -12,8 +12,10 @@ from autokernel.campaign import (
     CampaignError,
     OptimizationCampaign,
     load_campaign,
+    parse_agent_command,
     prepare_campaign,
     rank_targets,
+    run_campaign,
     write_optimization_plan,
 )
 
@@ -172,3 +174,73 @@ def test_prepare_materializes_starter_and_receipt(
     assert receipt["status"] == "prepared"
     assert (output / "optimization_plan.json").is_file()
     assert (output / "campaign_receipt.json").is_file()
+
+
+def _single_wan_target(fixtures_dir) -> OptimizationCampaign:
+    payload = json.loads(
+        (fixtures_dir / "wan_campaign.json").read_text(encoding="utf-8")
+    )
+    payload["targets"] = payload["targets"][:1]
+    return OptimizationCampaign.from_dict(payload, source="test-campaign")
+
+
+def test_overnight_dry_run_is_cwd_independent(
+    repo_root, fixtures_dir, tmp_path, monkeypatch
+):
+    campaign = _single_wan_target(fixtures_dir)
+    monkeypatch.chdir(tmp_path)
+    receipt = run_campaign(
+        campaign,
+        repo_root=repo_root,
+        budget_hours=0.25,
+        dry_run=True,
+    )
+    assert receipt["status"] == "prepared"
+    prompt = (repo_root / "workspace" / "overnight_prompt.md").read_text(
+        encoding="utf-8"
+    )
+    assert "--spec models/wan_gated_residual_norm.py:SPEC" in prompt
+    assert (
+        "--shape-corpus models/wan_gated_residual_norm_corpus.json"
+        in prompt
+    )
+
+
+def test_parse_agent_command_substitutes_embedded_placeholders(tmp_path):
+    command = parse_agent_command(
+        "agent --repo={repo} --prompt={prompt_file}",
+        repo_root=tmp_path,
+        prompt_path=tmp_path / "prompt.md",
+    )
+    assert command == [
+        "agent",
+        f"--repo={tmp_path}",
+        f"--prompt={tmp_path / 'prompt.md'}",
+    ]
+
+
+def test_overnight_runner_writes_terminal_morning_report(
+    repo_root, fixtures_dir
+):
+    campaign = _single_wan_target(fixtures_dir)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import subprocess,sys;"
+            "subprocess.run([sys.executable,'orchestrate.py','next'],"
+            "check=True)"
+        ),
+    ]
+    receipt = run_campaign(
+        campaign,
+        repo_root=repo_root,
+        budget_hours=0.25,
+        agent_command=command,
+        timeout_seconds=10,
+    )
+    assert receipt["status"] == "incomplete"
+    assert receipt["progress"]["completed_targets"] == 0
+    report = repo_root / "workspace" / "morning_report.md"
+    assert report.is_file()
+    assert "wan_gated_residual_norm" in report.read_text(encoding="utf-8")
