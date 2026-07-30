@@ -112,6 +112,9 @@ class Expression:
     def __pow__(self, other: "Expression | Number") -> "Expression":
         return BinaryOp("**", self, _coerce(other))
 
+    def __rpow__(self, other: "Expression | Number") -> "Expression":
+        return BinaryOp("**", _coerce(other), self)
+
 
 @dataclass(frozen=True)
 class Constant(Expression):

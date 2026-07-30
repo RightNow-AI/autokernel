@@ -16,7 +16,7 @@ def _wan_gated_residual_norm_kernel(
     bias_ptr,
     normalized_ptr,
     updated_ptr,
-    tokens: tl.constexpr,
+    tokens,
     hidden: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -65,6 +65,17 @@ def kernel_fn(
         raise ValueError("residual and x must have matching [B, S, D] shapes")
     if not residual.is_contiguous() or not x.is_contiguous():
         raise ValueError("residual and x must be contiguous")
+    if any(
+        tensor.device != residual.device
+        for tensor in (x, gate, weight, bias)
+    ):
+        raise ValueError("all inputs must be on the residual device")
+    if (
+        not gate.is_contiguous()
+        or not weight.is_contiguous()
+        or not bias.is_contiguous()
+    ):
+        raise ValueError("gate, weight, and bias must be contiguous")
 
     batch, tokens, hidden = residual.shape
     if gate.shape != (batch, hidden):

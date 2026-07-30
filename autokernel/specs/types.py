@@ -138,6 +138,8 @@ def _normalize_paths(value: Iterable[str], field: str) -> tuple[str, ...]:
         if path in out:
             raise SpecValidationError(f"{field} contains duplicate path {path!r}")
         out.append(path)
+    if not out:
+        raise SpecValidationError(f"{field} must contain at least one path")
     return tuple(out)
 
 
@@ -187,13 +189,13 @@ class BackwardSpec:
     enabled_by_default: bool = False
 
     def __post_init__(self) -> None:
-        inputs = _normalize_paths(
-            self.differentiable_inputs, "BackwardSpec.differentiable_inputs"
-        )
-        if not inputs:
+        if not self.differentiable_inputs:
             raise SpecValidationError(
                 "BackwardSpec.differentiable_inputs must name at least one input"
             )
+        inputs = _normalize_paths(
+            self.differentiable_inputs, "BackwardSpec.differentiable_inputs"
+        )
         object.__setattr__(self, "differentiable_inputs", inputs)
         if self.output_paths is not None:
             object.__setattr__(
@@ -330,7 +332,11 @@ class KernelSpec:
         # Structural validation happens eagerly. The small/medium/large
         # requirement is a *registration* rule (see KernelRegistry.register) so
         # tools can still build narrower specifications for inspection.
-        validate_spec(self, require_standard_sizes=False)
+        validate_spec(
+            self,
+            require_standard_sizes=False,
+            check_starter_files=False,
+        )
 
     # -- convenience accessors -----------------------------------------
     @property

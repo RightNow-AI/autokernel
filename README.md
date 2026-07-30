@@ -132,7 +132,8 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 
 Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
 
-Every operation is described by one `KernelSpec` in `autokernel/specs/builtins.py`. That
+Every built-in operation is described by one `KernelSpec` in
+`autokernel/specs/builtins.py`. That
 specification is the single source of truth for sizes, dtypes, tolerances, edge cases,
 FLOP/byte accounting, profiler shape aliases and starter kernels -- `bench.py` and
 `extract.py` read it instead of carrying their own per-operation tables.
@@ -211,6 +212,33 @@ A complete, runnable example lives in `examples/custom_ops/add.py` (spec) and
 
 Note that loading a spec executes the Python file you point at, exactly like running
 `python that_file.py`. Only pass locators you trust.
+
+## Model Optimization Campaigns
+
+FastVideo and other runtimes can export a versioned campaign containing only
+operation identities, tensor shape/layout signatures, call counts, aggregate
+timings, and environment identity. Validate and rank a campaign without loading
+PyTorch or executing any referenced Python:
+
+```bash
+uv run campaign.py validate /path/to/campaign.json
+uv run campaign.py rank /path/to/campaign.json
+uv run campaign.py plan /path/to/campaign.json
+```
+
+Once the campaign and its spec locators have been reviewed, prepare all ranked
+starter kernels and the existing orchestration state in one step:
+
+```bash
+uv run campaign.py prepare /path/to/campaign.json --trust-specs
+uv run orchestrate.py plan
+```
+
+Preparation writes `workspace/optimization_plan.json`, one candidate kernel per
+ranked target, and `workspace/campaign_receipt.json`. The explicit trust flag is
+required because a Python spec locator executes code. Continue with `program.md`
+for the autonomous experiment loop; every candidate still passes the fixed
+correctness gates in `bench.py` before a result can be kept.
 
 ## Generalized Verification
 

@@ -279,6 +279,11 @@ def check_backward(
         )
 
     # 1. One canonical input mapping: small size, primary dtype.
+    if not spec.sizes:
+        return _fail_report(
+            f"kernel spec {spec.name!r} declares no sizes; backward "
+            f"verification needs at least one size"
+        )
     size_label = "small" if "small" in spec.sizes else next(iter(spec.sizes))
     size = dict(spec.sizes[size_label])
     dtype_name = spec.primary_dtype

@@ -5,6 +5,10 @@ This package generalizes the benchmark harness beyond single-tensor outputs:
 * :mod:`autokernel.verification.outputs` flattens and compares arbitrary
   output trees (tensors, tuples, lists, dictionaries, named tuples and
   nested combinations) leaf by leaf, with stable diagnostic paths.
+* :mod:`autokernel.verification.backward` compares declared input gradients.
+* :mod:`autokernel.verification.compile` enforces optional full-graph checks.
+* :mod:`autokernel.verification.corpus` validates production shape corpora.
+* :mod:`autokernel.verification.results` writes versioned result artifacts.
 
 Modules here never initialize a GPU at import time; ``torch`` is imported
 lazily inside the functions that need it.
@@ -17,6 +21,7 @@ from .backward import (
     GradientRecord,
     check_backward,
 )
+from .compile import CompileCaseRecord, CompileReport, check_compile
 from .corpus import (
     CORPUS_SCHEMA_VERSION,
     CorpusCase,
@@ -26,7 +31,6 @@ from .corpus import (
     validate_corpus_against_spec,
     weighted_aggregate,
 )
-from .compile import CompileCaseRecord, CompileReport, check_compile
 from .outputs import (
     DEFAULT_TOLERANCE,
     LeafRecord,
@@ -46,17 +50,17 @@ from .results import (
 )
 
 __all__ = [
-    "BackwardReport",
     "CORPUS_SCHEMA_VERSION",
+    "DEFAULT_TOLERANCE",
+    "RESULT_SCHEMA_VERSION",
+    "BackwardReport",
     "CompileCaseRecord",
     "CompileReport",
     "CorpusCase",
     "CorpusError",
-    "DEFAULT_TOLERANCE",
     "GradientRecord",
     "LeafRecord",
     "OutputTreeError",
-    "RESULT_SCHEMA_VERSION",
     "ShapeCorpus",
     "TreeComparison",
     "check_backward",

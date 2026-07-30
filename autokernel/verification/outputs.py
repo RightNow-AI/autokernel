@@ -406,7 +406,9 @@ def compare_output_trees(
         )
 
     records: list[LeafRecord] = []
-    for (path, cand_leaf), (_, exp_leaf) in zip(cand_leaves, exp_leaves):
+    exp_map = dict(exp_leaves)
+    for path, cand_leaf in cand_leaves:
+        exp_leaf = exp_map[path]
         if _is_tensor(cand_leaf):
             tol = _tolerance_for(exp_leaf, tolerances, default_tolerance)
             if relax != 1.0:
