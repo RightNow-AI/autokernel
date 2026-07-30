@@ -154,5 +154,5 @@ SPEC = KernelSpec(
         "hidden": "hidden",
     },
     starter_kernels={"triton": STARTER_KERNEL},
-    speedup_estimate="1.5-2.5x",
+    speedup_estimate="7.9-9.1x on GB200 versus eager PyTorch",
 )

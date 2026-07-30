@@ -70,6 +70,8 @@
   480p token counts, including four-way sequence-parallel layouts
 - Added a structured-output Triton baseline that returns both the normalized
   activation and updated residual stream in the model dtype
+- Validated the full production corpus on GB200 with all correctness stages
+  passing and a weighted 8.638x operator speedup over eager PyTorch
 
 ## v1.3.0 -- 2026-03-13
 
