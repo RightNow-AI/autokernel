@@ -85,12 +85,12 @@ def test_file_loading_does_not_mutate_sys_path(tmp_path: Path):
     assert sys.path == before
 
 
-def test_file_loading_uses_unique_module_names():
+def test_file_loading_does_not_leak_temporary_modules():
     before = set(sys.modules)
     load_spec(f"{FIXTURE_FILE}:SPEC")
     load_spec(f"{FIXTURE_FILE}:SPEC")
     added = [name for name in set(sys.modules) - before if "external_spec" in name]
-    assert len(added) == 2, added
+    assert added == []
 
 
 # ---------------------------------------------------------------------------
