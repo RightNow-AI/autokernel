@@ -273,7 +273,14 @@ def test_extract_synthesizes_a_target_from_a_spec_alone():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "flag", ["--shape-corpus", "--shape-corpus-only", "--check-backward"]
+    "flag",
+    [
+        "--shape-corpus",
+        "--shape-corpus-only",
+        "--check-backward",
+        "--check-compile",
+        "--result-json",
+    ],
 )
 def test_bench_help_lists_verification_flags(flag):
     result = run_script("bench.py", "--help")
@@ -313,3 +320,21 @@ def test_bench_corpus_operation_mismatch_is_actionable(tmp_path: Path):
     assert result.returncode == 1
     assert "does not match the selected spec" in combined
 
+
+def test_profile_cli_does_not_break_standard_cprofile_import():
+    """The top-level profile.py must preserve cProfile's expected API."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import cProfile, profile; "
+            "assert callable(cProfile.run); "
+            "assert callable(profile.run); "
+            "assert hasattr(profile, '_Utils')",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

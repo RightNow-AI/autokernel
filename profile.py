@@ -30,6 +30,59 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+# This command is intentionally named ``profile.py`` for CLI compatibility,
+# but that name also shadows Python's standard-library ``profile`` module when
+# the repository root is on ``sys.path``. ``cProfile`` (and therefore
+# ``torch.compile``) imports the symbols below from ``profile``. Providing the
+# small standard compatibility surface keeps both entry points working.
+class _Utils:
+    """Utility adapter shared with :mod:`cProfile`."""
+
+    def __init__(self, profiler):
+        self.profiler = profiler
+
+    def run(self, statement, filename, sort):
+        profiler = self.profiler()
+        try:
+            profiler.run(statement)
+        except SystemExit:
+            pass
+        finally:
+            self._show(profiler, filename, sort)
+
+    def runctx(self, statement, globals, locals, filename, sort):
+        profiler = self.profiler()
+        try:
+            profiler.runctx(statement, globals, locals)
+        except SystemExit:
+            pass
+        finally:
+            self._show(profiler, filename, sort)
+
+    @staticmethod
+    def _show(profiler, filename, sort):
+        if filename is not None:
+            profiler.dump_stats(filename)
+        else:
+            profiler.print_stats(sort)
+
+
+def run(statement, filename=None, sort=-1):
+    """Run a statement under :mod:`cProfile`."""
+    import cProfile
+
+    return _Utils(cProfile.Profile).run(statement, filename, sort)
+
+
+def runctx(statement, globals, locals, filename=None, sort=-1):
+    """Run a statement under :mod:`cProfile` with explicit namespaces."""
+    import cProfile
+
+    return _Utils(cProfile.Profile).runctx(
+        statement, globals, locals, filename, sort
+    )
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
