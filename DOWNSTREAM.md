@@ -1,7 +1,9 @@
-# Downstream project
+# MotionKernel provenance
 
-This repository is an independently maintained downstream fork of
-[RightNow-AI/autokernel](https://github.com/RightNow-AI/autokernel).
+MotionKernel is an independently maintained, MIT-licensed downstream fork of
+[RightNow-AI/AutoKernel](https://github.com/RightNow-AI/autokernel). Its focus
+is GPU kernel discovery, optimization, verification, and packaging for video
+generation models.
 
 ## Provenance
 
@@ -13,22 +15,35 @@ This repository is an independently maintained downstream fork of
 The upstream `LICENSE` file is preserved. Source files substantially derived
 from upstream remain covered by that notice.
 
-## Downstream direction
+## MotionKernel direction
 
-This fork is intended to become a general platform for discovering, testing,
-tuning, and exporting production GPU kernels. Its first major additions will
-focus on:
+MotionKernel is intended to become a video-first, framework-agnostic platform
+for discovering, testing, tuning, and exporting production GPU kernels. Its
+initial work focuses on:
 
 - external custom-operation specifications;
 - multi-output, backward, determinism, and compile verification;
 - production shape corpora captured from real models;
-- modulated normalization and gated-residual fusion;
+- modulated normalization, gated-residual, attention, and layout fusion;
 - architecture-aware tuning and reproducible experiment records; and
-- clean export into runtime kernel packages.
+- clean export into runtime kernel packages for FastVideo, Diffusers, and other
+  PyTorch video runtimes.
 
 The optimization platform and shipped runtime kernels are separate products:
 the platform searches and validates candidates, while downstream applications
 consume only promoted kernel implementations.
+
+The initial model families are Wan, LTX-Video, Cosmos, and Kandinsky. Listing a
+model as a target does not imply complete support: support is earned through a
+published integration, representative workload corpus, correctness results,
+and an end-to-end benchmark.
+
+## Compatibility identity
+
+The distribution is named `motionkernel`. The Python import namespace remains
+`autokernel` temporarily so existing specifications, scripts, and downstream
+users do not break during the project transition. A future namespace migration
+will include a compatibility release and explicit upgrade instructions.
 
 ## Upstream relationship
 
@@ -41,5 +56,5 @@ git switch main
 git merge upstream/main
 ```
 
-Downstream features do not require upstream approval. Contributions may still
+MotionKernel features do not require upstream approval. Improvements may still
 be offered upstream when doing so benefits both projects.

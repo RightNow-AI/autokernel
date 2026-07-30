@@ -219,7 +219,8 @@ these responsibilities.
 - a missing `small`, `medium`, or `large` size for built-ins;
 - unknown dtype strings;
 - missing tolerances for a declared dtype;
-- negative tolerances;
+- negative, NaN, or infinite tolerances (a non-finite value would make every
+  comparison pass and silently disable the correctness gate);
 - missing starter-kernel files;
 - duplicate shape aliases that resolve inconsistently;
 - a reference or input generator that is not callable.
@@ -624,6 +625,20 @@ Add merge behavior:
 - `--shape-corpus`: append validated corpus cases;
 - `--shape-corpus-only`: use only corpus cases.
 
+Implementation decisions (recorded by the Week 2 agent):
+
+- `--shape-corpus-only` is a flag companion to `--shape-corpus PATH`
+  (argparse rejects it without a path); corpus cases join the stage-2
+  correctness sweep and are each benchmarked once in the performance loop,
+  with weighted aggregates reported per dtype.
+- Corpus loading and validation run before the candidate module is imported
+  whenever the operation is explicitly selected (`--spec`/`--kernel`), and
+  always before GPU detection: malformed metadata must fail without
+  executing candidate code.
+- Two cases resolving to the same `(size, dtype)` configuration are
+  rejected with an actionable "merge their weights" message (the plan's
+  "deduplicated or rejected" choice, made explicit).
+
 Use `weight` for aggregate reporting, not to repeat allocations or benchmark
 loops unnecessarily.
 
@@ -700,6 +715,17 @@ side effects.
 If `torch.compile` is not available in the installed PyTorch version, emit a
 clear unsupported result. Do not mark the check as passed.
 
+Implementation decisions (recorded by the Week 2 agent):
+
+- Compile checks run before the performance section and use one stable wrapper
+  around the candidate. Each selected shape is called twice through the
+  compiled callable.
+- Static checks use the small declared shape. Dynamic checks use small and
+  medium (or the first two available compatible shapes) through the same
+  callable.
+- `PASS`, `FAIL`, and `UNSUPPORTED` are distinct structured statuses, and
+  PyTorch, Triton, CUDA, device, GPU and compile-mode metadata are recorded.
+
 ## Step 7: add a structured-output fixture
 
 Add an example operation under `examples/custom_ops/` that returns:
@@ -751,6 +777,17 @@ COMPILE_CORRECTNESS: PASS
 ```
 
 Only print `PASS` after the complete requested stage succeeds.
+
+Implementation decisions (recorded by the Week 2 agent):
+
+- Normal runs write schema version 1 to
+  `workspace/bench_result.json`; `--result-json PATH` overrides the location.
+- The record contains the request, environment and GPU metadata, corpus
+  identity, forward leaf details, optional backward and compile reports,
+  performance results and elapsed time.
+- The writer creates and fsyncs a temporary file in the destination directory,
+  then replaces the destination atomically. Non-finite diagnostic values are
+  encoded as strings so the artifact remains strict JSON.
 
 ## Week 2 tests
 

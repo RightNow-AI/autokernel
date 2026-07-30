@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased (downstream)
+
+### MotionKernel identity
+
+- Renamed the downstream distribution to MotionKernel and reset its independent
+  package version to `0.1.0`
+- Repositioned the project around verified GPU kernel optimization for video
+  generation models, with FastVideo as the first target integration
+- Preserved the `autokernel` Python import namespace as a temporary
+  compatibility boundary and retained the upstream MIT license and attribution
+
+### Custom operation registry
+
+- Added the `autokernel` package with `autokernel/specs/`: a typed `KernelSpec`
+  that owns one operation's reference, deterministic inputs, sizes, dtypes,
+  tolerances, edge cases, FLOP/byte accounting, profiler shape aliases and
+  starter kernels
+- Added `KernelRegistry` with deterministic ordering, duplicate detection and
+  per-command isolation (`create_builtin_registry()`); registry discovery imports
+  no `torch` and initializes no GPU, so it works on CPU-only machines
+- Migrated all nine built-in operations (`matmul`, `softmax`, `layernorm`,
+  `flash_attention`, `fused_mlp`, `cross_entropy`, `rotary_embedding`,
+  `rmsnorm`, `reduce`) to specifications; `bench.py` and `extract.py` now read
+  metadata only from those specs
+- Removed the duplicated metadata maps from `extract.py` (`SHAPE_KEYS`,
+  `SHAPE_ALIAS_MAP`, `TOLERANCES_MAP`, `FLOPS_FN_SRC`, `BYTES_FN_SRC`,
+  `SPEEDUP_ESTIMATES`, hard-coded default shapes). FLOP/byte accounting is a
+  serializable expression tree instead of stored Python source strings
+- Added `--spec LOCATOR` and `--spec-override` to `bench.py` and `extract.py`.
+  Precedence is `--spec`, then `--kernel`, then `kernel.py::KERNEL_TYPE`, so
+  existing invocations are unchanged. `--help` never imports an external spec
+- Added `examples/custom_ops/add.py` (external spec) and
+  `examples/custom_ops/add_kernel.py` (its starter kernel)
+- Added a CPU test suite (`uv run pytest -m "not gpu"`) that freezes the
+  built-in metadata against its pre-refactor values, plus a `dev` extra and a
+  CI job to run it. GPU tests are marked `gpu`
+- `bench.py` keeps a deprecated `KERNEL_CONFIGS` view derived from the registry
+  for out-of-tree callers
+- `Tolerance` rejects negative, NaN, and infinite `atol`/`rtol` values, so a
+  malformed specification cannot silently disable the correctness gate
+- All declared built-in, edge-case and default-shape dimensions must be
+  positive integers; empty starter-kernel mappings are explicitly supported
+  for benchmark-only external specifications
+
+### Generalized verification
+
+- Added deterministic comparison for tensor, tuple, list, dictionary,
+  named-tuple and nested output trees, including exact metadata comparison and
+  per-leaf NaN, infinity and error diagnostics
+- Added versioned production shape corpora, append and corpus-only benchmark
+  modes, and weighted aggregates that remain separated by dtype
+- Added optional `BackwardSpec` gradient verification with deterministic
+  upstream gradients and per-input diagnostics
+- Added optional `CompileSpec` verification and `--check-compile`; candidates
+  compile with full-graph mode by default, run at least twice, reuse one
+  compiled callable for dynamic shapes and compare through the normal output
+  tree gate outside performance timing
+- Added `FORWARD_CORRECTNESS`, `BACKWARD_CORRECTNESS` and
+  `COMPILE_CORRECTNESS` console verdicts
+- Added schema-versioned, atomic JSON results under
+  `workspace/bench_result.json`, configurable with `--result-json`
+- Added `examples/custom_ops/affine.py`, its candidate and a metadata-only
+  shape corpus as a structured-output, backward and compile fixture
+- Made the float32 matmul starter request IEEE dot inputs instead of Triton's
+  TF32 default, kept strict BF16 LayerNorm parity through an explicit PyTorch
+  fallback pending a Welford Triton implementation, and made the affine
+  fixture's residual rounding stable under Inductor fusion
+- Kept the top-level `profile.py` CLI compatible with the standard-library
+  `profile` API so importing `cProfile` and initializing `torch.compile` from
+  the repository root no longer fails
+
+### Wan kernel fusion
+
+- Added the first production video-DiT operation specification: Wan's
+  post-self-attention gated residual update plus FP32 affine LayerNorm
+- Added a metadata-only shape corpus covering Wan 2.1 1.3B and 14B at common
+  480p token counts, including four-way sequence-parallel layouts
+- Added a structured-output Triton baseline that returns both the normalized
+  activation and updated residual stream in the model dtype
+- Validated the full production corpus on GB200 with all correctness stages
+  passing and a weighted 8.638x operator speedup over eager PyTorch
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)
