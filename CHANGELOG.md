@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased (downstream)
+
+### Custom operation registry
+
+- Added the `autokernel` package with `autokernel/specs/`: a typed `KernelSpec`
+  that owns one operation's reference, deterministic inputs, sizes, dtypes,
+  tolerances, edge cases, FLOP/byte accounting, profiler shape aliases and
+  starter kernels
+- Added `KernelRegistry` with deterministic ordering, duplicate detection and
+  per-command isolation (`create_builtin_registry()`); registry discovery imports
+  no `torch` and initializes no GPU, so it works on CPU-only machines
+- Migrated all nine built-in operations (`matmul`, `softmax`, `layernorm`,
+  `flash_attention`, `fused_mlp`, `cross_entropy`, `rotary_embedding`,
+  `rmsnorm`, `reduce`) to specifications; `bench.py` and `extract.py` now read
+  metadata only from those specs
+- Removed the duplicated metadata maps from `extract.py` (`SHAPE_KEYS`,
+  `SHAPE_ALIAS_MAP`, `TOLERANCES_MAP`, `FLOPS_FN_SRC`, `BYTES_FN_SRC`,
+  `SPEEDUP_ESTIMATES`, hard-coded default shapes). FLOP/byte accounting is a
+  serializable expression tree instead of stored Python source strings
+- Added `--spec LOCATOR` and `--spec-override` to `bench.py` and `extract.py`.
+  Precedence is `--spec`, then `--kernel`, then `kernel.py::KERNEL_TYPE`, so
+  existing invocations are unchanged. `--help` never imports an external spec
+- Added `examples/custom_ops/add.py` (external spec) and
+  `examples/custom_ops/add_kernel.py` (its starter kernel)
+- Added a CPU test suite (`uv run pytest -m "not gpu"`) that freezes the
+  built-in metadata against its pre-refactor values, plus a `dev` extra and a
+  CI job to run it. GPU tests are marked `gpu`
+- `bench.py` keeps a deprecated `KERNEL_CONFIGS` view derived from the registry
+  for out-of-tree callers
+- `Tolerance` rejects negative, NaN, and infinite `atol`/`rtol` values, so a
+  malformed specification cannot silently disable the correctness gate
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)
