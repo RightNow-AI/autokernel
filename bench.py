@@ -30,8 +30,8 @@ import signal
 import sys
 import time
 import traceback
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +52,23 @@ from autokernel.specs import (  # noqa: E402  (path bootstrap must run first)
     dtype_bytes,
     resolve_spec,
     resolve_torch_dtype,
+)
+from autokernel.verification import (  # noqa: E402
+    TreeComparison,
+    check_backward,
+    check_compile,
+    collect_environment_metadata,
+    compare_deterministic,
+    compare_output_trees,
+    result_envelope,
+    tree_has_nan_or_inf,
+    write_result_atomic,
+)
+from autokernel.verification.corpus import (  # noqa: E402
+    CorpusError,
+    load_shape_corpus,
+    validate_corpus_against_spec,
+    weighted_aggregate,
 )
 
 # ---------------------------------------------------------------------------
@@ -318,49 +335,80 @@ def resolve_operation_name(
     return spec_name or kernel_arg or declared_type
 
 
+def _get_spec_or_exit(registry: KernelRegistry, kernel_type: str) -> KernelSpec:
+    """Fetch a spec from the registry, preserving the CLI failure contract."""
+    try:
+        return registry.get(kernel_type)
+    except SpecNotFoundError:
+        print(f"\nERROR: Unknown kernel type '{kernel_type}'")
+        print(f"  Available: {', '.join(registry.list_names())}")
+        print(f"\ncorrectness: FAIL")
+        print(f"throughput_tflops: 0.000")
+        sys.exit(1)
+
+
+def _load_validated_corpus(args: argparse.Namespace, spec: KernelSpec):
+    """Load and validate ``--shape-corpus`` against the selected spec.
+
+    Returns the validated cases, or None when no corpus was requested. Exits
+    with the greppable failure contract on any corpus error. Runs before the
+    candidate module is imported and before any GPU allocation, so a malformed
+    corpus never executes candidate code or touches the device.
+    """
+    if not args.shape_corpus:
+        return None
+    try:
+        corpus = load_shape_corpus(args.shape_corpus)
+        validate_corpus_against_spec(corpus, spec)
+    except CorpusError as e:
+        print(f"\nERROR: {e}")
+        print(f"\ncorrectness: FAIL")
+        print(f"throughput_tflops: 0.000")
+        sys.exit(1)
+    mode = "corpus-only" if args.shape_corpus_only else "append"
+    print(f"shape_corpus: {args.shape_corpus} ({len(corpus.cases)} cases, mode={mode})")
+    return corpus.cases
+
+
 # =========================================================================
 # 3. CORRECTNESS TESTING (5 stages)
 # =========================================================================
 
-def _compare(output: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> dict:
-    """Compare two tensors and return statistics."""
-    if output.shape != expected.shape:
-        return {
-            "match": False,
-            "reason": f"shape mismatch: {output.shape} vs {expected.shape}",
-            "max_abs_error": float("inf"),
-            "mean_abs_error": float("inf"),
-            "pct_within_tol": 0.0,
-        }
+def _compare_outputs(output: Any, expected: Any, spec: KernelSpec, *, relax: float = 1.0) -> TreeComparison:
+    """Compare candidate and reference output trees using the spec's policy.
 
-    # Cast both to float32 for comparison
-    out_f = output.float()
-    exp_f = expected.float()
-
-    abs_diff = (out_f - exp_f).abs()
-    max_abs = abs_diff.max().item()
-    mean_abs = abs_diff.mean().item()
-
-    # Percentage of elements within tolerance
-    within = (abs_diff <= atol + rtol * exp_f.abs()).float().mean().item() * 100.0
-
-    match = torch.allclose(out_f, exp_f, atol=atol, rtol=rtol)
-    return {
-        "match": match,
-        "reason": "" if match else f"max_abs_error={max_abs:.6e} exceeds tol(atol={atol}, rtol={rtol})",
-        "max_abs_error": max_abs,
-        "mean_abs_error": mean_abs,
-        "pct_within_tol": within,
-    }
+    Single-tensor outputs behave exactly as the historical ``_compare`` did:
+    the tolerance declared for the benchmark dtype is applied, and the
+    failure reason is unchanged. Structured outputs are compared leaf by leaf
+    with stable diagnostic paths.
+    """
+    return compare_output_trees(
+        output,
+        expected,
+        spec.tolerances,
+        output_spec=spec.output_spec,
+        relax=relax,
+    )
 
 
-def _has_nan_inf(t: torch.Tensor) -> bool:
-    """Check for NaN or Inf."""
-    return bool(torch.isnan(t).any().item() or torch.isinf(t).any().item())
+def _record_leaves(records: List[Dict[str, Any]], stage: str, case: str, cmp: TreeComparison) -> None:
+    """Collect per-leaf comparison details for the structured result artifact."""
+    for leaf in cmp.leaf_records():
+        records.append({"stage": stage, "case": case, **leaf})
 
 
-def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) -> dict:
-    """Run all correctness stages. Returns dict with results."""
+def run_correctness(
+    kernel_fn: Callable,
+    spec: KernelSpec,
+    quick: bool = False,
+    corpus_cases: Optional[Sequence] = None,
+    corpus_only: bool = False,
+) -> dict:
+    """Run all correctness stages. Returns dict with results.
+
+    ``corpus_cases`` appends validated production shapes to the stage-2 shape
+    sweep; ``corpus_only`` replaces the built-in size/dtype sweep with them.
+    """
     device = BENCH_DEVICE
     results = {
         "smoke_test": "SKIP",
@@ -371,13 +419,13 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
         "correctness": "FAIL",
     }
     details = []
+    leaf_records: List[Dict[str, Any]] = []
     all_pass = True
 
     gen_fn = spec.input_generator
     ref_fn = _spec_reference(spec)
     sizes = _spec_sizes(spec)
     dtypes = _spec_dtypes(spec)
-    tols = _spec_tolerances(spec)
 
     # ------------------------------------------------------------------
     # Stage 1: SMOKE TEST -- tiny input, tight tolerance
@@ -392,22 +440,22 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
         with _Timeout(30):
             output = kernel_fn(**inputs)
 
-        if _has_nan_inf(output):
+        if tree_has_nan_or_inf(output):
             results["smoke_test"] = "FAIL"
             details.append(f"  smoke: NaN/Inf in output")
             all_pass = False
             print(f"  FAIL: NaN/Inf in output")
         else:
-            tol = tols.get(dtype0, {"atol": 1e-2, "rtol": 1e-2})
-            cmp = _compare(output, expected, **tol)
-            if cmp["match"]:
+            cmp = _compare_outputs(output, expected, spec)
+            _record_leaves(leaf_records, "smoke", tiny_label, cmp)
+            if cmp.match:
                 results["smoke_test"] = "PASS"
-                print(f"  PASS (max_abs_error={cmp['max_abs_error']:.6e})")
+                print(f"  PASS (max_abs_error={cmp.worst_abs_error:.6e})")
             else:
                 results["smoke_test"] = "FAIL"
-                details.append(f"  smoke: {cmp['reason']}")
+                details.append(f"  smoke: {cmp.reason}")
                 all_pass = False
-                print(f"  FAIL: {cmp['reason']}")
+                print(f"  FAIL: {cmp.reason}")
     except BenchTimeoutError:
         results["smoke_test"] = "FAIL"
         details.append("  smoke: TIMEOUT")
@@ -428,6 +476,7 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
     if results["smoke_test"] == "FAIL":
         results["correctness"] = "FAIL"
         results["details"] = details
+        results["leaf_details"] = leaf_records
         print(f"\ncorrectness: FAIL (smoke test failed, aborting remaining stages)")
         return results
 
@@ -441,8 +490,17 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
     worst_error = 0.0
     worst_case = ""
 
-    for label, sz in sizes:
-        for dtype in dtypes:
+    sweep_configs: List[Tuple[str, Dict[str, int], torch.dtype]] = []
+    if not corpus_only:
+        for label, sz in sizes:
+            for dtype in dtypes:
+                sweep_configs.append((label, sz, dtype))
+    if corpus_cases:
+        for case in corpus_cases:
+            case_dtype = resolve_torch_dtype(case.dtype) if case.dtype else dtypes[0]
+            sweep_configs.append((case.name, dict(case.size), case_dtype))
+
+    for label, sz, dtype in sweep_configs:
             sweep_count += 1
             try:
                 inputs = gen_fn(sz, dtype, device, seed=42)
@@ -450,27 +508,27 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
                 with _Timeout(30):
                     output = kernel_fn(**inputs)
 
-                if _has_nan_inf(output):
+                if tree_has_nan_or_inf(output):
                     sweep_pass = False
                     sweep_fail_count += 1
                     details.append(f"  sweep {label}/{dtype}: NaN/Inf")
                     print(f"  FAIL: {label} {dtype} -> NaN/Inf")
                     continue
 
-                tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                cmp = _compare(output, expected, **tol)
+                cmp = _compare_outputs(output, expected, spec)
+                _record_leaves(leaf_records, "sweep", f"{label}/{dtype}", cmp)
 
-                if cmp["max_abs_error"] > worst_error:
-                    worst_error = cmp["max_abs_error"]
+                if cmp.worst_abs_error > worst_error:
+                    worst_error = cmp.worst_abs_error
                     worst_case = f"{label}/{dtype}"
 
-                if not cmp["match"]:
+                if not cmp.match:
                     sweep_pass = False
                     sweep_fail_count += 1
-                    details.append(f"  sweep {label}/{dtype}: {cmp['reason']}")
-                    print(f"  FAIL: {label} {dtype} -> {cmp['reason']}")
+                    details.append(f"  sweep {label}/{dtype}: {cmp.reason}")
+                    print(f"  FAIL: {label} {dtype} -> {cmp.reason}")
                 else:
-                    print(f"  PASS: {label} {dtype} (max_err={cmp['max_abs_error']:.2e}, within_tol={cmp['pct_within_tol']:.1f}%)")
+                    print(f"  PASS: {label} {dtype} (max_err={cmp.worst_abs_error:.2e}, within_tol={cmp.worst_pct_within_tol:.1f}%)")
 
             except torch.cuda.OutOfMemoryError:
                 # OOM on larger sizes is acceptable -- just skip
@@ -507,6 +565,7 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
         results["edge_cases"] = "SKIP (quick mode)"
         results["correctness"] = "PASS" if all_pass else "FAIL"
         results["details"] = details
+        results["leaf_details"] = leaf_records
         print(f"\ncorrectness: {results['correctness']} (quick mode: stages 3-5 skipped)")
         return results
 
@@ -551,25 +610,23 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
             with _Timeout(30):
                 output = kernel_fn(**transformed)
 
-            if _has_nan_inf(output) and not _has_nan_inf(expected):
+            if tree_has_nan_or_inf(output) and not tree_has_nan_or_inf(expected):
                 stability_pass = False
                 details.append(f"  stability {case_name}: NaN/Inf (reference is clean)")
                 print(f"  FAIL: {case_name} -> NaN/Inf (reference is clean)")
-            elif _has_nan_inf(output) and _has_nan_inf(expected):
+            elif tree_has_nan_or_inf(output) and tree_has_nan_or_inf(expected):
                 # Both have NaN/Inf -- acceptable (e.g. overflow in near_max)
                 print(f"  PASS: {case_name} -> both have NaN/Inf (expected overflow)")
             else:
-                tol = tols.get(stab_dtype, {"atol": 1e-2, "rtol": 1e-2})
                 # Relax tolerances for adversarial inputs
-                relaxed_atol = tol["atol"] * 10
-                relaxed_rtol = tol["rtol"] * 10
-                cmp = _compare(output, expected, atol=relaxed_atol, rtol=relaxed_rtol)
-                if cmp["match"]:
-                    print(f"  PASS: {case_name} (max_err={cmp['max_abs_error']:.2e})")
+                cmp = _compare_outputs(output, expected, spec, relax=10.0)
+                _record_leaves(leaf_records, "stability", case_name, cmp)
+                if cmp.match:
+                    print(f"  PASS: {case_name} (max_err={cmp.worst_abs_error:.2e})")
                 else:
                     stability_pass = False
-                    details.append(f"  stability {case_name}: {cmp['reason']}")
-                    print(f"  FAIL: {case_name} -> {cmp['reason']}")
+                    details.append(f"  stability {case_name}: {cmp.reason}")
+                    print(f"  FAIL: {case_name} -> {cmp.reason}")
 
         except torch.cuda.OutOfMemoryError:
             print(f"  SKIP: {case_name} -> OOM")
@@ -609,11 +666,18 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
             outputs.append(out_i)
 
         for i in range(1, 3):
-            if not torch.equal(outputs[0], outputs[i]):
+            cmp = compare_deterministic(outputs[0], outputs[i], output_spec=spec.output_spec)
+            _record_leaves(leaf_records, "determinism", f"run_0_vs_{i}", cmp)
+            if not cmp.match:
                 determinism_pass = False
-                diff = (outputs[0].float() - outputs[i].float()).abs()
-                details.append(f"  determinism: run 0 vs run {i} differ (max_diff={diff.max().item():.6e})")
-                print(f"  FAIL: run 0 vs run {i} differ (max_diff={diff.max().item():.6e})")
+                failure = cmp.first_failure()
+                if failure is not None and failure.max_abs_error is not None:
+                    where = "" if failure.path == "output" else f" at {failure.path}"
+                    message = f"run 0 vs run {i} differ{where} (max_diff={failure.max_abs_error:.6e})"
+                else:
+                    message = f"run 0 vs run {i} differ ({cmp.reason})"
+                details.append(f"  determinism: {message}")
+                print(f"  FAIL: {message}")
 
         if determinism_pass:
             print("  PASS: 3 runs are bitwise identical")
@@ -653,19 +717,19 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
                 with _Timeout(30):
                     output = kernel_fn(**inputs)
 
-                if _has_nan_inf(output) and not _has_nan_inf(expected):
+                if tree_has_nan_or_inf(output) and not tree_has_nan_or_inf(expected):
                     edge_pass = False
                     details.append(f"  edge {label}: NaN/Inf")
                     print(f"  FAIL: {label} -> NaN/Inf")
                 else:
-                    tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                    cmp = _compare(output, expected, **tol)
-                    if cmp["match"]:
-                        print(f"  PASS: {label} (max_err={cmp['max_abs_error']:.2e})")
+                    cmp = _compare_outputs(output, expected, spec)
+                    _record_leaves(leaf_records, "edge", label, cmp)
+                    if cmp.match:
+                        print(f"  PASS: {label} (max_err={cmp.worst_abs_error:.2e})")
                     else:
                         edge_pass = False
-                        details.append(f"  edge {label}: {cmp['reason']}")
-                        print(f"  FAIL: {label} -> {cmp['reason']}")
+                        details.append(f"  edge {label}: {cmp.reason}")
+                        print(f"  FAIL: {label} -> {cmp.reason}")
 
             except torch.cuda.OutOfMemoryError:
                 print(f"  SKIP: {label} -> OOM")
@@ -689,8 +753,41 @@ def run_correctness(kernel_fn: Callable, spec: KernelSpec, quick: bool = False) 
     # Final verdict
     results["correctness"] = "PASS" if all_pass else "FAIL"
     results["details"] = details
+    results["leaf_details"] = leaf_records
     print(f"\ncorrectness: {results['correctness']}")
     return results
+
+
+def run_backward_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
+    """Opt-in gradient verification. Prints the greppable verdict line and
+    returns the structured report."""
+    print(f"\n=== BACKWARD CORRECTNESS ===")
+    report = check_backward(kernel_fn, spec, device=BENCH_DEVICE)
+    if report.status == "PASS":
+        print(f"  upstream outputs: {', '.join(report.output_paths)}")
+        for record in report.gradients:
+            print(f"  grad[{record.input_name}]: match "
+                  f"(max_err={record.max_abs_error:.2e}, mean_err={record.mean_abs_error:.2e})")
+    else:
+        print(f"  FAIL: {report.reason}")
+        for record in report.gradients:
+            if record.status != "match":
+                print(f"  grad[{record.input_name}]: {record.status}: {record.reason}")
+    print(f"BACKWARD_CORRECTNESS: {report.status}")
+    return report.as_dict()
+
+
+def run_compile_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
+    """Run compile verification outside all timed performance regions."""
+    print(f"\n=== COMPILE CORRECTNESS ===")
+    report = check_compile(kernel_fn, spec, device=BENCH_DEVICE)
+    for case in report.cases:
+        detail = f": {case.reason}" if case.reason else ""
+        print(f"  {case.label}: {case.status}{detail}")
+    if report.reason and report.status != "PASS":
+        print(f"  {report.reason}")
+    print(f"COMPILE_CORRECTNESS: {report.status}")
+    return report.as_dict()
 
 
 # =========================================================================
@@ -728,8 +825,15 @@ def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
 
 
 def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
-                    sizes_filter: str = "all") -> dict:
-    """Run performance benchmarks. Returns dict with metrics."""
+                    sizes_filter: str = "all",
+                    corpus_cases: Optional[Sequence] = None,
+                    corpus_only: bool = False) -> dict:
+    """Run performance benchmarks. Returns dict with metrics.
+
+    ``corpus_cases`` appends production shapes (each benchmarked once; their
+    weights feed aggregate reporting, not repetition). ``corpus_only``
+    benchmarks only those shapes.
+    """
     device = BENCH_DEVICE
     gen_fn = spec.input_generator
     ref_fn = _spec_reference(spec)
@@ -740,7 +844,9 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
     # Select benchmark size
     sizes = _spec_sizes(spec)
     bench_sizes = []
-    if sizes_filter == "all":
+    if corpus_only:
+        bench_sizes = []
+    elif sizes_filter == "all":
         bench_sizes = sizes
     else:
         for label, sz in sizes:
@@ -769,10 +875,21 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
 
     dtype = dtypes[0]  # primary dtype for benchmarking
 
+    # (label, size, dtype, weight, source) benchmark configurations. Built-in
+    # sizes carry weight 1; corpus cases carry their declared weight, which is
+    # used only for aggregate reporting, never to repeat benchmark loops.
+    bench_configs: List[Tuple[str, Dict[str, int], torch.dtype, int, str]] = [
+        (label, sz, dtype, 1, "builtin") for label, sz in bench_sizes
+    ]
+    if corpus_cases:
+        for case in corpus_cases:
+            case_dtype = resolve_torch_dtype(case.dtype) if case.dtype else dtype
+            bench_configs.append((case.name, dict(case.size), case_dtype, case.weight, "corpus"))
+
     all_results = []
     primary_result = None
 
-    for label, sz in bench_sizes:
+    for label, sz, dtype, weight, source in bench_configs:
         print(f"\n  Benchmarking: {label} ...")
         try:
             flops = flops_fn(sz)
@@ -814,6 +931,8 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
                 "label": label,
                 "size": sz,
                 "dtype": str(dtype),
+                "weight": weight,
+                "source": source,
                 "flops": flops,
                 "bytes": nbytes,
                 "kernel_latency_us": kernel_us,
@@ -852,9 +971,34 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
     if primary_result is None and all_results:
         primary_result = all_results[-1]
 
+    # Weighted aggregate reporting for corpus cases, grouped per dtype so
+    # results from different dtypes are never mixed into one aggregate.
+    corpus_summary = None
+    corpus_entries = [entry for entry in all_results if entry["source"] == "corpus"]
+    if corpus_entries:
+        weighted = weighted_aggregate(
+            [
+                {
+                    "dtype": entry["dtype"],
+                    "weight": entry["weight"],
+                    "kernel_ms": entry["kernel_latency_us"] / 1000.0,
+                    "ref_ms": entry["pytorch_latency_us"] / 1000.0,
+                }
+                for entry in corpus_entries
+            ]
+        )
+        corpus_summary = {"cases": corpus_entries, "weighted": weighted}
+        print(f"\n  === SHAPE CORPUS: weighted aggregates ===")
+        for dtype_name, agg in weighted.items():
+            print(f"  dtype={dtype_name}: cases={agg['cases']}, total_weight={agg['weight']}")
+            print(f"    weighted_kernel_latency_us: {agg['kernel_ms'] * 1000.0:.2f}")
+            print(f"    weighted_pytorch_latency_us: {agg['ref_ms'] * 1000.0:.2f}")
+            print(f"    weighted_speedup_vs_pytorch: {agg['speedup']:.3f}x")
+
     return {
         "primary": primary_result,
         "all": all_results,
+        "corpus": corpus_summary,
     }
 
 
@@ -936,7 +1080,27 @@ def main():
                         help="Quick mode: skip correctness stages 3-5, bench only large size")
     parser.add_argument("--profile", action="store_true",
                         help="Enable torch profiler trace")
+    parser.add_argument("--shape-corpus", type=str, default=None, metavar="PATH",
+                        help="Versioned JSON shape corpus; validated cases are "
+                             "appended to the built-in sweep and benchmarked once each")
+    parser.add_argument("--shape-corpus-only", action="store_true",
+                        help="Benchmark only the --shape-corpus cases, skipping the "
+                             "built-in size sweep (requires --shape-corpus)")
+    parser.add_argument("--check-backward", action="store_true",
+                        help="Also verify gradients against the reference "
+                             "(requires the spec to declare a backward_spec; "
+                             "correctness-only, no performance claims)")
+    parser.add_argument("--check-compile", action="store_true",
+                        help="Verify torch.compile parity using the spec's compile settings "
+                             "(correctness-only; compilation is never timed)")
+    parser.add_argument("--result-json", type=str,
+                        default=os.path.join(_SCRIPT_DIR, "workspace", "bench_result.json"),
+                        metavar="PATH",
+                        help="Atomic machine-readable result path "
+                             "(default: workspace/bench_result.json)")
     args = parser.parse_args()
+    if args.shape_corpus_only and not args.shape_corpus:
+        parser.error("--shape-corpus-only requires --shape-corpus PATH")
 
     # ------------------------------------------------------------------
     # Import the kernel module
@@ -972,6 +1136,18 @@ def main():
         kernel_type = spec.name
         print(f"kernel_spec: {args.spec}")
 
+    # When the operation is already determined (--spec or --kernel), fetch its
+    # spec and validate the shape corpus *before* importing the candidate
+    # module: malformed metadata must fail without executing candidate code
+    # and before any GPU allocation.
+    kernel_type = spec.name if spec is not None else args.kernel
+    spec_locked = kernel_type is not None
+    corpus_cases = None
+    if spec_locked:
+        if spec is None:
+            spec = _get_spec_or_exit(registry, kernel_type)
+        corpus_cases = _load_validated_corpus(args, spec)
+
     try:
         # Add cwd to path so 'import kernel' works
         if os.getcwd() not in sys.path:
@@ -985,9 +1161,10 @@ def main():
         kernel_fn = kernel_module.kernel_fn
 
         declared_type = getattr(kernel_module, "KERNEL_TYPE", None)
-        resolved = resolve_operation_name(
-            spec.name if spec is not None else None, args.kernel, declared_type
-        )
+        if spec_locked:
+            resolved = kernel_type
+        else:
+            resolved = resolve_operation_name(None, args.kernel, declared_type)
         if resolved is None:
             print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
             sys.exit(1)
@@ -1015,16 +1192,11 @@ def main():
         print(f"throughput_tflops: 0.000")
         sys.exit(1)
 
-    # Validate kernel type against the registry
-    if spec is None:
-        try:
-            spec = registry.get(kernel_type)
-        except SpecNotFoundError:
-            print(f"\nERROR: Unknown kernel type '{kernel_type}'")
-            print(f"  Available: {', '.join(registry.list_names())}")
-            print(f"\ncorrectness: FAIL")
-            print(f"throughput_tflops: 0.000")
-            sys.exit(1)
+    # The default selection path (kernel.py::KERNEL_TYPE) resolves the spec
+    # and validates the corpus only after the candidate import.
+    if not spec_locked:
+        spec = _get_spec_or_exit(registry, kernel_type)
+        corpus_cases = _load_validated_corpus(args, spec)
 
     # ------------------------------------------------------------------
     # GPU Detection
@@ -1047,7 +1219,10 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n=== CORRECTNESS ===")
     try:
-        correctness_results = run_correctness(kernel_fn, spec, quick=args.quick)
+        correctness_results = run_correctness(
+            kernel_fn, spec, quick=args.quick,
+            corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
+        )
     except Exception as e:
         print(f"\nFATAL: Correctness testing crashed: {type(e).__name__}: {e}")
         traceback.print_exc()
@@ -1061,6 +1236,42 @@ def main():
     print(f"determinism: {correctness_results.get('determinism', 'N/A')}")
     print(f"edge_cases: {correctness_results.get('edge_cases', 'N/A')}")
     print(f"correctness: {correctness_results['correctness']}")
+    print(f"FORWARD_CORRECTNESS: {correctness_results['correctness']}")
+
+    # ------------------------------------------------------------------
+    # Backward verification (opt-in; correctness-only, never timed)
+    # ------------------------------------------------------------------
+    backward_result = None
+    backward_requested = args.check_backward or (
+        spec.backward_spec is not None and spec.backward_spec.enabled_by_default
+    )
+    if backward_requested:
+        try:
+            backward_result = run_backward_check(kernel_fn, spec)
+        except Exception as e:
+            print(f"\nFATAL: Backward verification crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            backward_result = {"status": "FAIL", "reason": f"crash: {type(e).__name__}: {e}"}
+            print(f"BACKWARD_CORRECTNESS: FAIL")
+
+    # ------------------------------------------------------------------
+    # Compile verification (opt-in; correctness-only, never timed)
+    # ------------------------------------------------------------------
+    compile_result = None
+    compile_requested = args.check_compile or (
+        spec.compile_spec is not None and spec.compile_spec.enabled
+    )
+    if compile_requested:
+        try:
+            compile_result = run_compile_check(kernel_fn, spec)
+        except Exception as e:
+            print(f"\nFATAL: Compile verification crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            compile_result = {
+                "status": "FAIL",
+                "reason": f"crash: {type(e).__name__}: {e}",
+            }
+            print(f"COMPILE_CORRECTNESS: FAIL")
 
     # ------------------------------------------------------------------
     # Performance
@@ -1087,7 +1298,10 @@ def main():
         if args.quick:
             sizes_filter = "large"
         torch.cuda.reset_peak_memory_stats()
-        perf_results = run_performance(kernel_fn, spec, gpu, sizes_filter=sizes_filter)
+        perf_results = run_performance(
+            kernel_fn, spec, gpu, sizes_filter=sizes_filter,
+            corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
+        )
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")
@@ -1159,6 +1373,50 @@ def main():
     # ------------------------------------------------------------------
     t_elapsed = time.time() - t_start
     throughput = primary["throughput_tflops"] if primary else 0.0
+
+    corpus_identity = None
+    if args.shape_corpus:
+        corpus_identity = {
+            "source": os.path.abspath(args.shape_corpus),
+            "mode": "only" if args.shape_corpus_only else "append",
+            "cases": [
+                {
+                    "name": case.name,
+                    "size": dict(case.size),
+                    "dtype": case.dtype,
+                    "weight": case.weight,
+                    "tags": list(case.tags),
+                }
+                for case in (corpus_cases or ())
+            ],
+        }
+    result_payload = result_envelope(
+        kernel_type,
+        environment=collect_environment_metadata(BENCH_DEVICE),
+        request={
+            "spec": args.spec,
+            "sizes": args.sizes,
+            "quick": args.quick,
+            "profile": args.profile,
+            "check_backward": backward_requested,
+            "check_compile": compile_requested,
+        },
+        gpu=asdict(gpu),
+        shape_corpus=corpus_identity,
+        forward=correctness_results,
+        backward=backward_result,
+        compile=compile_result,
+        performance={
+            **perf_results,
+            "peak_vram_mb": peak_vram_mb,
+        },
+        bench_time_seconds=t_elapsed,
+    )
+    try:
+        result_path = write_result_atomic(args.result_json, result_payload)
+        print(f"result_json: {result_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to write result JSON: {type(e).__name__}: {e}")
 
     print(f"\n=== FINAL ===")
     print(f"kernel_type: {kernel_type}")

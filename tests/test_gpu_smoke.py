@@ -14,6 +14,7 @@ import pytest
 from conftest import REPO_ROOT, requires_gpu
 
 from autokernel.specs import create_builtin_registry, load_spec
+from autokernel.verification import check_backward, check_compile
 
 pytestmark = [pytest.mark.gpu, requires_gpu]
 
@@ -63,3 +64,18 @@ def test_external_spec_performance_path():
     assert primary is not None
     assert primary["kernel_latency_us"] > 0
     assert primary["bytes"] == 3 * 4096 * 4096 * 2  # float16 primary dtype
+
+
+def test_structured_external_spec_forward_backward_and_compile():
+    bench = pytest.importorskip("bench")
+    example = REPO_ROOT / "examples" / "custom_ops" / "affine.py"
+    spec = load_spec(f"{example}:SPEC")
+    kernel_fn = _load_kernel_fn(spec.starter_kernel("pytorch"))
+
+    forward = bench.run_correctness(kernel_fn, spec, quick=True)
+    backward = check_backward(kernel_fn, spec, device="cuda")
+    compiled = check_compile(kernel_fn, spec, device="cuda")
+
+    assert forward["correctness"] == "PASS", forward.get("details")
+    assert backward.status == "PASS", backward.reason
+    assert compiled.status == "PASS", compiled.reason

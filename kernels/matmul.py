@@ -48,7 +48,11 @@ def matmul_kernel(
     for k in range(0, K, BLOCK_SIZE_K):
         a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
         b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
+        # Triton defaults float32 dot products to TF32 on NVIDIA GPUs. The
+        # specification declares true float32 semantics with a 1e-4
+        # correctness gate, so request IEEE inputs explicitly. FP16/BF16
+        # tensor-core paths are unaffected.
+        acc += tl.dot(a, b, input_precision="ieee")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         offs_k += BLOCK_SIZE_K

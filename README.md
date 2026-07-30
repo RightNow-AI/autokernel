@@ -176,13 +176,44 @@ zero-argument callable returning one.
 Requirements the harness validates before allocating anything on the GPU: an
 identifier-like name, `small`/`medium`/`large` sizes, canonical dtype names
 (`float16`, `bfloat16`, `float32`), a tolerance for every declared dtype, size keys that
-match `shape_keys`, and starter-kernel files that exist.
+match `shape_keys`, positive integer dimensions in every built-in, edge and default
+shape, and starter-kernel files that exist. `starter_kernels={}` is valid for a
+benchmark-only specification; extraction skips a backend whose starter is not declared.
 
 A complete, runnable example lives in `examples/custom_ops/add.py` (spec) and
 `examples/custom_ops/add_kernel.py` (starter kernel).
 
 Note that loading a spec executes the Python file you point at, exactly like running
 `python that_file.py`. Only pass locators you trust.
+
+## Generalized Verification
+
+The harness compares complete output trees, including nested tensors and metadata. An
+external spec may also declare `BackwardSpec` and `CompileSpec` policies. The structured
+affine example exercises both:
+
+```bash
+cp examples/custom_ops/affine_kernel.py kernel.py
+
+# forward output-tree comparison plus production-shape corpus
+uv run bench.py --spec examples/custom_ops/affine.py:SPEC \
+  --shape-corpus examples/custom_ops/affine_corpus.json --quick
+
+# optional gradient and full-graph compile gates
+uv run bench.py --spec examples/custom_ops/affine.py:SPEC \
+  --check-backward --check-compile --quick
+```
+
+Compile verification calls `torch.compile` with `fullgraph=True` by default and runs
+before performance timing. A dynamic `CompileSpec` exercises two declared shapes through
+the same compiled callable. If `torch.compile` is unavailable, the result is
+`UNSUPPORTED`, never `PASS`.
+
+Every normal benchmark run atomically writes a schema-versioned JSON record to
+`workspace/bench_result.json`; override it with `--result-json PATH`. It includes
+forward leaf errors, optional gradient and compile results, shape-corpus identity,
+environment metadata and performance results. Stable console verdicts are
+`FORWARD_CORRECTNESS`, `BACKWARD_CORRECTNESS` and `COMPILE_CORRECTNESS`.
 
 ## Example Models
 
