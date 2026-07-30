@@ -62,6 +62,15 @@
   `profile` API so importing `cProfile` and initializing `torch.compile` from
   the repository root no longer fails
 
+### Wan kernel fusion
+
+- Added the first production video-DiT operation specification: Wan's
+  post-self-attention gated residual update plus FP32 affine LayerNorm
+- Added a metadata-only shape corpus covering Wan 2.1 1.3B and 14B at common
+  480p token counts, including four-way sequence-parallel layouts
+- Added a structured-output Triton baseline that returns both the normalized
+  activation and updated residual stream in the model dtype
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)
