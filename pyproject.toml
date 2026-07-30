@@ -1,7 +1,7 @@
 [project]
-name = "autokernel"
-version = "1.0.0"
-description = "Autonomous AI agents optimizing GPU kernels overnight -- for any PyTorch model"
+name = "motionkernel"
+version = "0.1.0"
+description = "Verified GPU kernel optimization for video generation models"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -1,29 +1,55 @@
-# AutoKernel
+# MotionKernel
+
+**Verified GPU kernel optimization for video generation models.**
 
 > [!NOTE]
-> This repository is an independently maintained downstream fork of
-> [RightNow-AI/autokernel](https://github.com/RightNow-AI/autokernel). It keeps
-> the upstream MIT license and attribution while developing a broader,
-> plugin-oriented kernel optimization platform. See
+> MotionKernel is an independently maintained, MIT-licensed fork of
+> [RightNow-AI/AutoKernel](https://github.com/RightNow-AI/autokernel), focused
+> on GPU kernel optimization for video diffusion transformers, video VAEs, and
+> production video-generation workloads. It preserves the upstream license and
+> attribution. See
 > [DOWNSTREAM.md](DOWNSTREAM.md) for provenance and [ROADMAP.md](ROADMAP.md)
-> for the downstream plan.
+> for the video-first project plan.
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/UfEyc72t)
+MotionKernel profiles real model executions, captures production tensor shapes,
+develops and tunes Triton or CUDA C++ kernels, and verifies numerical
+correctness, gradients, `torch.compile` compatibility, performance, and
+end-to-end integration behavior.
 
-**Autoresearch for GPU kernels.** Give it any PyTorch model, go to sleep, wake up to optimized Triton or CUDA C++ kernels.
+The first target integration is
+[FastVideo](https://github.com/hao-ai-lab/FastVideo), beginning with Wan and
+expanding to LTX-Video, Cosmos, and Kandinsky. The optimization platform remains
+framework-agnostic: promoted kernels can be consumed by FastVideo, Diffusers,
+or other PyTorch video runtimes without requiring the research harness at
+inference time.
 
-![AutoKernel Progress](progress.png)
+## Project Status
 
-Inspired by [@karpathy/autoresearch](https://github.com/karpathy/autoresearch) -- which demonstrated autonomous AI agents for LLM training research. AutoKernel applies the same philosophy to GPU kernel optimization: agent modifies one file, runs a fixed evaluation, keeps or reverts, repeats forever.
+The reusable kernel specification registry, production shape corpora,
+structured-output comparison, backward verification, `torch.compile`
+verification, and reproducible JSON result artifacts are implemented.
+
+The first video-specific operation is a Wan post-attention gated residual and
+LayerNorm fusion. It has been validated across its production shape corpus on
+an NVIDIA GB200. Model-wide graph discovery, automatic replacement, and
+complete model kernel packs remain roadmap work; support for a model is not
+claimed until its integration and end-to-end benchmark are published.
+
+MotionKernel currently retains the `autokernel` Python import namespace for
+compatibility with the upstream project. The import namespace will only move
+after a documented migration path exists.
 
 ## How It Works
 
-Give AutoKernel any PyTorch model. It will:
+Give MotionKernel a PyTorch model or an external operation specification. It
+will:
 
 1. **Profile** the model to find which GPU kernels are bottlenecks
-2. **Extract** each bottleneck as a standalone Triton or CUDA C++ kernel
-3. **Optimize** each kernel autonomously (edit, benchmark, keep/revert -- forever)
-4. **Verify** end-to-end correctness and report the total speedup
+2. **Capture** representative shapes, dtypes, layouts, and environment metadata
+3. **Extract** each bottleneck as a standalone Triton or CUDA C++ kernel
+4. **Optimize** candidates through an iterative edit, benchmark, and keep/revert loop
+5. **Verify** outputs, optional gradients, compilation, and end-to-end behavior
+6. **Promote** reproducible kernels into runtime integration packages
 
 The agent reads `program.md` -- the "research org code" -- which contains comprehensive instructions for autonomous operation. It edits `kernel.py` one kernel at a time, runs `bench.py` (fixed benchmark with 5-stage correctness checks + roofline analysis), and either keeps or reverts the change. The orchestrator decides when to move to the next kernel using Amdahl's law.
 
@@ -38,8 +64,8 @@ Each experiment takes ~90 seconds. That's ~40 experiments/hour, ~320 overnight, 
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and setup
-git clone https://github.com/aryan5v/autokernel.git
-cd autokernel
+git clone https://github.com/aryan5v/motionkernel.git
+cd motionkernel
 uv sync
 
 # One-time setup: test data + baselines
@@ -66,7 +92,7 @@ Read program.md and let's kick off a new experiment. Start with setup.
 
 The agent will:
 1. Profile your model and present the optimization plan
-2. Create a branch (e.g., `autokernel/mar10-llama7b`)
+2. Create a branch (e.g., `motionkernel/wan-gated-residual`)
 3. Optimize each bottleneck kernel in priority order
 4. Verify end-to-end correctness and report total speedup
 
@@ -217,7 +243,8 @@ environment metadata and performance results. Stable console verdicts are
 
 ## Example Models
 
-Self-contained model definitions ship with AutoKernel (no `transformers` library needed):
+Self-contained model definitions inherited by MotionKernel require no
+`transformers` library:
 
 | Model | File | Params | Usage |
 |-------|------|--------|-------|
@@ -236,9 +263,9 @@ uv run profile.py --module transformers --class-name AutoModelForCausalLM \
 
 ## KernelBench Integration
 
-AutoKernel integrates with [KernelBench](https://github.com/ScalingIntelligence/KernelBench),
+MotionKernel retains integration with [KernelBench](https://github.com/ScalingIntelligence/KernelBench),
 the standard benchmark for evaluating AI-generated GPU kernels (250+ problems across 4 difficulty
-levels). While most KernelBench evaluations use one-shot LLM generation, AutoKernel runs
+levels). While most KernelBench evaluations use one-shot LLM generation, MotionKernel runs
 **50-300+ iterative refinement experiments per problem** -- systematically exploring the
 optimization space instead of guessing.
 
@@ -292,7 +319,7 @@ kernels upload . --repo_id your-username/my_matmul
 ## Project Structure
 
 ```
-autokernel/
+motionkernel/
   kernel.py             the file the agent modifies (one kernel at a time)
   program.md            agent instructions -- the "research org code"
 
@@ -350,11 +377,18 @@ Every experiment is logged to `results.tsv` (tab-separated):
 
 ## Credits
 
-This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton and native CUDA C++.
+MotionKernel builds on AutoKernel's **autoresearch for GPU kernels** approach,
+which was directly inspired by Andrej Karpathy's
+[autoresearch](https://github.com/karpathy/autoresearch). MotionKernel retains
+the iterative agent loop while extending the platform toward production video
+workloads, explicit operation specifications, representative shape corpora,
+and stronger verification.
 
-**KernelBench** integration is based on the work of Simon Guo, Sean Resta, et al. at Stanford's Scaling Intelligence Lab. Their paper ["KernelBench: Can LLMs Write GPU Kernels?"](https://arxiv.org/abs/2502.10517) (2025) established the standard benchmark for evaluating AI-generated GPU kernels. AutoKernel extends this by applying iterative optimization (300+ experiments per problem) instead of one-shot generation. KernelBench dataset and evaluation protocol: [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench).
+**KernelBench** integration is based on the work of Simon Guo, Sean Resta, et al. at Stanford's Scaling Intelligence Lab. Their paper ["KernelBench: Can LLMs Write GPU Kernels?"](https://arxiv.org/abs/2502.10517) (2025) established the standard benchmark for evaluating AI-generated GPU kernels. The inherited AutoKernel integration applies iterative optimization instead of one-shot generation. KernelBench dataset and evaluation protocol: [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench).
 
-Built by [RightNow AI](https://www.rightnowai.co). For enterprise GPU optimization, check out [RightNow Enterprise](https://www.rightnowai.co/forge).
+MotionKernel is independently maintained. The original AutoKernel project was
+built by [RightNow AI](https://www.rightnowai.co); see
+[DOWNSTREAM.md](DOWNSTREAM.md) for the exact fork provenance.
 
 ## Changelog
 
@@ -382,5 +416,5 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## License
 
-MIT. This downstream fork retains the original copyright and permission
+MIT. MotionKernel retains the original AutoKernel copyright and permission
 notice. See [LICENSE](LICENSE) and [DOWNSTREAM.md](DOWNSTREAM.md).

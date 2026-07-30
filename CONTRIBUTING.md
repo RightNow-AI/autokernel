@@ -1,4 +1,4 @@
-# Contributing
+# Contributing to MotionKernel
 
 ## Development workflow
 

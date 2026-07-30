@@ -2,6 +2,15 @@
 
 ## Unreleased (downstream)
 
+### MotionKernel identity
+
+- Renamed the downstream distribution to MotionKernel and reset its independent
+  package version to `0.1.0`
+- Repositioned the project around verified GPU kernel optimization for video
+  generation models, with FastVideo as the first target integration
+- Preserved the `autokernel` Python import namespace as a temporary
+  compatibility boundary and retained the upstream MIT license and attribution
+
 ### Custom operation registry
 
 - Added the `autokernel` package with `autokernel/specs/`: a typed `KernelSpec`
