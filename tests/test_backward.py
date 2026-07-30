@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import pytest
 
+import autokernel.verification.backward as backward_module
 from autokernel.specs import (
     DT_BYTES,
     BackwardSpec,
@@ -71,6 +73,53 @@ def test_gradient_parity_for_reference_candidate():
         assert record.max_abs_error == 0.0
     # every floating tensor leaf received an upstream gradient
     assert set(report.output_paths) == {'output["aux"][0]', 'output["output"]'}
+
+
+def test_upstream_generator_fallback_generates_on_cpu_then_moves(monkeypatch):
+    original_generator = torch.Generator
+    moves = []
+    randn_devices = []
+
+    def generator(*args, **kwargs):
+        if kwargs.get("device") == "mps":
+            raise RuntimeError("device-local generators unsupported")
+        return original_generator()
+
+    class Generated:
+        def to(self, device):
+            moves.append(device)
+            return self
+
+    def randn(*shape, **kwargs):
+        randn_devices.append(kwargs["device"])
+        return Generated()
+
+    monkeypatch.setattr(torch, "Generator", generator)
+    monkeypatch.setattr(torch, "randn", randn)
+    leaf = SimpleNamespace(
+        shape=(2, 3),
+        dtype=torch.float32,
+        device=torch.device("mps"),
+    )
+
+    upstreams = backward_module._upstream_gradients(
+        [("output", leaf)], "mps", seed=123
+    )
+
+    assert len(upstreams) == 1
+    assert randn_devices == ["cpu"]
+    assert moves == [torch.device("mps")]
+
+
+def test_upstream_generation_failure_returns_structured_report(monkeypatch):
+    monkeypatch.setattr(
+        backward_module,
+        "_upstream_gradients",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rng failed")),
+    )
+    report = check_backward(_affine_ref, _spec(), device="cpu")
+    assert report.status == "FAIL"
+    assert "upstream gradient generation failed: RuntimeError: rng failed" in report.reason
 
 
 def test_affine_example_fixture_passes_backward(repo_root):

@@ -217,19 +217,28 @@ def _upstream_gradients(
 
     try:
         generator = torch.Generator(device=device)
+        generator_is_device_local = True
     except Exception:
         generator = torch.Generator()
+        generator_is_device_local = False
     generator.manual_seed(seed)
     upstreams = []
     for _, leaf in leaves:
-        upstreams.append(
-            torch.randn(
+        if generator_is_device_local:
+            upstream = torch.randn(
                 tuple(leaf.shape),
                 dtype=leaf.dtype,
                 device=leaf.device,
                 generator=generator,
             )
-        )
+        else:
+            upstream = torch.randn(
+                tuple(leaf.shape),
+                dtype=leaf.dtype,
+                device="cpu",
+                generator=generator,
+            ).to(leaf.device)
+        upstreams.append(upstream)
     return upstreams
 
 
@@ -306,7 +315,12 @@ def check_backward(
         return _fail_report(failure)
 
     # 6. Deterministic upstream gradients (identical for both paths).
-    upstreams = _upstream_gradients(ref_leaves, device, seed)
+    try:
+        upstreams = _upstream_gradients(ref_leaves, device, seed)
+    except Exception as exc:
+        return _fail_report(
+            f"upstream gradient generation failed: {type(exc).__name__}: {exc}"
+        )
 
     # 7. Independent autograd.grad calls; allow_unused surfaces missing grads.
     grad_inputs_ref = [ref_inputs[name] for name in backward.differentiable_inputs]
@@ -404,4 +418,3 @@ def check_backward(
         gradients=tuple(records),
         output_paths=output_paths,
     )
-
