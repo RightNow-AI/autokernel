@@ -1,5 +1,13 @@
 # AutoKernel
 
+> [!NOTE]
+> This repository is an independently maintained downstream fork of
+> [RightNow-AI/autokernel](https://github.com/RightNow-AI/autokernel). It keeps
+> the upstream MIT license and attribution while developing a broader,
+> plugin-oriented kernel optimization platform. See
+> [DOWNSTREAM.md](DOWNSTREAM.md) for provenance and [ROADMAP.md](ROADMAP.md)
+> for the downstream plan.
+
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/UfEyc72t)
 
 **Autoresearch for GPU kernels.** Give it any PyTorch model, go to sleep, wake up to optimized Triton or CUDA C++ kernels.
@@ -30,7 +38,7 @@ Each experiment takes ~90 seconds. That's ~40 experiments/hour, ~320 overnight, 
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and setup
-git clone https://github.com/RightNow-AI/autokernel.git
+git clone https://github.com/aryan5v/autokernel.git
 cd autokernel
 uv sync
 
@@ -260,4 +268,5 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## License
 
-MIT
+MIT. This downstream fork retains the original copyright and permission
+notice. See [LICENSE](LICENSE) and [DOWNSTREAM.md](DOWNSTREAM.md).
