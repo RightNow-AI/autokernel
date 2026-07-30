@@ -272,8 +272,10 @@ def test_extract_synthesizes_a_target_from_a_spec_alone():
 # bench.py shape-corpus command line
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("flag", ["--shape-corpus", "--shape-corpus-only"])
-def test_bench_help_lists_corpus_flags(flag):
+@pytest.mark.parametrize(
+    "flag", ["--shape-corpus", "--shape-corpus-only", "--check-backward"]
+)
+def test_bench_help_lists_verification_flags(flag):
     result = run_script("bench.py", "--help")
     assert result.returncode == 0, result.stderr
     assert flag in result.stdout

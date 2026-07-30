@@ -41,6 +41,7 @@ __all__ = [
     "TreeComparison",
     "compare_deterministic",
     "compare_output_trees",
+    "compare_tensor_leaf",
     "flatten_output_tree",
     "tree_has_nan_or_inf",
 ]
@@ -263,12 +264,17 @@ def _metadata_equal(candidate: Any, expected: Any) -> bool:
         return False
 
 
-def _compare_tensor_leaf(
+def compare_tensor_leaf(
     path: str,
     candidate: Any,
     expected: Any,
     tolerance: Tolerance,
 ) -> LeafRecord:
+    """Compare two tensor leaves with statistics, NaN/Inf flags and a reason.
+
+    Public so other verifiers (e.g. gradient comparison) can reuse the exact
+    forward-comparison semantics.
+    """
     torch = _torch()
     is_float = candidate.is_floating_point()
     has_nan = bool(torch.isnan(candidate).any().item()) if is_float else False
@@ -405,7 +411,7 @@ def compare_output_trees(
             tol = _tolerance_for(exp_leaf, tolerances, default_tolerance)
             if relax != 1.0:
                 tol = Tolerance(atol=tol.atol * relax, rtol=tol.rtol * relax)
-            records.append(_compare_tensor_leaf(path, cand_leaf, exp_leaf, tol))
+            records.append(compare_tensor_leaf(path, cand_leaf, exp_leaf, tol))
             continue
         if not compare_meta:
             records.append(

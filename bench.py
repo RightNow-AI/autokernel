@@ -55,6 +55,7 @@ from autokernel.specs import (  # noqa: E402  (path bootstrap must run first)
 )
 from autokernel.verification import (  # noqa: E402
     TreeComparison,
+    check_backward,
     compare_deterministic,
     compare_output_trees,
     tree_has_nan_or_inf,
@@ -753,6 +754,25 @@ def run_correctness(
     return results
 
 
+def run_backward_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
+    """Opt-in gradient verification. Prints the greppable verdict line and
+    returns the structured report."""
+    print(f"\n=== BACKWARD CORRECTNESS ===")
+    report = check_backward(kernel_fn, spec, device=BENCH_DEVICE)
+    if report.status == "PASS":
+        print(f"  upstream outputs: {', '.join(report.output_paths)}")
+        for record in report.gradients:
+            print(f"  grad[{record.input_name}]: match "
+                  f"(max_err={record.max_abs_error:.2e}, mean_err={record.mean_abs_error:.2e})")
+    else:
+        print(f"  FAIL: {report.reason}")
+        for record in report.gradients:
+            if record.status != "match":
+                print(f"  grad[{record.input_name}]: {record.status}: {record.reason}")
+    print(f"BACKWARD_CORRECTNESS: {report.status}")
+    return report.as_dict()
+
+
 # =========================================================================
 # 4. PERFORMANCE BENCHMARKING
 # =========================================================================
@@ -1047,6 +1067,10 @@ def main():
     parser.add_argument("--shape-corpus-only", action="store_true",
                         help="Benchmark only the --shape-corpus cases, skipping the "
                              "built-in size sweep (requires --shape-corpus)")
+    parser.add_argument("--check-backward", action="store_true",
+                        help="Also verify gradients against the reference "
+                             "(requires the spec to declare a backward_spec; "
+                             "correctness-only, no performance claims)")
     args = parser.parse_args()
     if args.shape_corpus_only and not args.shape_corpus:
         parser.error("--shape-corpus-only requires --shape-corpus PATH")
@@ -1185,6 +1209,22 @@ def main():
     print(f"determinism: {correctness_results.get('determinism', 'N/A')}")
     print(f"edge_cases: {correctness_results.get('edge_cases', 'N/A')}")
     print(f"correctness: {correctness_results['correctness']}")
+
+    # ------------------------------------------------------------------
+    # Backward verification (opt-in; correctness-only, never timed)
+    # ------------------------------------------------------------------
+    backward_result = None
+    backward_requested = args.check_backward or (
+        spec.backward_spec is not None and spec.backward_spec.enabled_by_default
+    )
+    if backward_requested:
+        try:
+            backward_result = run_backward_check(kernel_fn, spec)
+        except Exception as e:
+            print(f"\nFATAL: Backward verification crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            backward_result = {"status": "FAIL", "reason": f"crash: {type(e).__name__}: {e}"}
+            print(f"BACKWARD_CORRECTNESS: FAIL")
 
     # ------------------------------------------------------------------
     # Performance
