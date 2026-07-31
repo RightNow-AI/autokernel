@@ -14,8 +14,10 @@ from autokernel.discovery import (
     TensorMeta,
     capture_callable_region,
     capture_module_region,
+    load_discovery_report,
     optimistic_e2e_improvement,
     parse_key_averages_rows,
+    profiler_export_to_report,
     rank_regions,
 )
 
@@ -180,3 +182,70 @@ def test_discovery_cli_rank_entry_point(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
     assert discovery_main(["validate", str(path)]) == 0
     assert discovery_main(["rank", str(path)]) == 0
+
+
+def test_profiler_export_ingestion_and_cli(tmp_path):
+    from discovery import main as discovery_main
+
+    export = {
+        "schema_version": 1,
+        "producer": {"name": "fastvideo", "version": "1"},
+        "workload": {"workload_id": "ltx-unit", "model_id": "ltx"},
+        "environment": {"torch": "2.x", "gpu_name": "unit"},
+        "total_cuda_time_us": 100.0,
+        "rows": [
+            {
+                "name": "ProfilerStep*",
+                "calls": 1,
+                "cuda_time_us": 100.0,
+                "self_cuda_time_us": 10.0,
+                "cpu_time_us": 20.0,
+            },
+            {
+                "name": "aten::mul",
+                "calls": 4,
+                "cuda_time_us": 90.0,
+                "self_cuda_time_us": 90.0,
+                "cpu_time_us": 5.0,
+                "input_shapes": [[1, 8], [1, 8]],
+            },
+        ],
+    }
+    report = profiler_export_to_report(export)
+    assert report.total_cuda_time_us == 100.0
+    assert [op.op_key for op in report.operators] == [
+        "ProfilerStep",
+        "aten::mul",
+    ]
+
+    source = tmp_path / "profile.json"
+    output = tmp_path / "discovery.json"
+    source.write_text(json.dumps(export), encoding="utf-8")
+    assert (
+        discovery_main(
+            ["ingest-profiler", str(source), "--output", str(output)]
+        )
+        == 0
+    )
+    loaded = load_discovery_report(output)
+    assert len(loaded.operators) == 2
+
+
+def test_profiler_export_rejects_nested_secret_metadata():
+    export = {
+        "schema_version": 1,
+        "producer": {"name": "fastvideo", "version": "1"},
+        "workload": {"workload_id": "unit", "model_id": "model"},
+        "environment": {"runtime": {"token": "do-not-store"}},
+        "total_cuda_time_us": 1.0,
+        "rows": [
+            {
+                "name": "aten::add",
+                "calls": 1,
+                "cuda_time_us": 1.0,
+                "self_cuda_time_us": 1.0,
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="forbidden"):
+        profiler_export_to_report(export)

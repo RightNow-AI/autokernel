@@ -4,6 +4,7 @@ from .result import (
     RESULT_SCHEMA_VERSION,
     GenerationRunResult,
     classify_end_to_end,
+    compare_frame_outputs,
     load_generation_result,
     write_generation_result,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "WorkloadError",
     "WorkloadManifest",
     "classify_end_to_end",
+    "compare_frame_outputs",
     "dump_workload",
     "load_generation_result",
     "load_workload",

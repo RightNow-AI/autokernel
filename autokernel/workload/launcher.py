@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 from .result import (
     GenerationRunResult,
     classify_end_to_end,
+    compare_frame_outputs,
     load_generation_result,
 )
 from .types import WorkloadError, WorkloadManifest, load_workload
@@ -39,7 +40,7 @@ class LauncherPaths:
 
 
 def _paths(output_dir: str | Path) -> LauncherPaths:
-    root = Path(output_dir)
+    root = Path(output_dir).expanduser().resolve()
     return LauncherPaths(
         output_dir=root,
         state_path=root / STATE_NAME,
@@ -290,9 +291,35 @@ def run_ab(
                     else 0.05
                 ),
             )
-            paths.comparison_path.write_text(
+            parity_policy = manifest.parity
+            parity = compare_frame_outputs(
+                results["native"].frames_path,
+                results["optimized"].frames_path,
+                policy=parity_policy.policy if parity_policy else "byte_equal",
+                atol=(
+                    parity_policy.atol
+                    if parity_policy and parity_policy.atol is not None
+                    else 0.0
+                ),
+                rtol=(
+                    parity_policy.rtol
+                    if parity_policy and parity_policy.rtol is not None
+                    else 0.0
+                ),
+            )
+            comparison["parity"] = parity
+            if not parity["passed"]:
+                comparison["classification"] = "failed"
+                comparison["reason"] = (
+                    f"output parity failed: {parity['reason']}"
+                )
+            temporary = paths.comparison_path.with_suffix(
+                paths.comparison_path.suffix + ".tmp"
+            )
+            temporary.write_text(
                 json.dumps(comparison, indent=2) + "\n", encoding="utf-8"
             )
+            temporary.replace(paths.comparison_path)
             completed.add("compare")
             state["completed_stages"] = sorted(completed)
             _write_state(paths.state_path, state)

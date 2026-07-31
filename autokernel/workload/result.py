@@ -40,6 +40,7 @@ _TOP_LEVEL_FIELDS = {
     "peak_memory_mb",
     "environment",
     "frames_path",
+    "profiler_path",
     "log_path",
     "failure_reason",
     "stage",
@@ -174,6 +175,7 @@ class GenerationRunResult:
     peak_memory_mb: tuple[float | None, ...]
     environment: Mapping[str, Any]
     frames_path: str | None = None
+    profiler_path: str | None = None
     log_path: str | None = None
     failure_reason: str | None = None
     stage: str = "generate"
@@ -266,6 +268,9 @@ class GenerationRunResult:
             frames_path=_optional_text(
                 raw.get("frames_path"), source, "frames_path"
             ),
+            profiler_path=_optional_text(
+                raw.get("profiler_path"), source, "profiler_path"
+            ),
             log_path=_optional_text(raw.get("log_path"), source, "log_path"),
             failure_reason=_optional_text(
                 raw.get("failure_reason"), source, "failure_reason"
@@ -294,6 +299,8 @@ class GenerationRunResult:
         }
         if self.frames_path is not None:
             payload["frames_path"] = self.frames_path
+        if self.profiler_path is not None:
+            payload["profiler_path"] = self.profiler_path
         if self.log_path is not None:
             payload["log_path"] = self.log_path
         if self.failure_reason is not None:
@@ -326,6 +333,102 @@ def write_generation_result(
         json.dumps(result.as_dict(), indent=2) + "\n", encoding="utf-8"
     )
     temporary.replace(output)
+
+
+def compare_frame_outputs(
+    native_path: str | Path | None,
+    optimized_path: str | Path | None,
+    *,
+    policy: str = "byte_equal",
+    atol: float = 0.0,
+    rtol: float = 0.0,
+) -> dict[str, Any]:
+    """Compare saved full-generation frame arrays under the workload policy."""
+    if native_path is None or optimized_path is None:
+        return {
+            "passed": False,
+            "policy": policy,
+            "reason": "one or both frame artifacts are missing",
+        }
+    native_file = Path(native_path)
+    optimized_file = Path(optimized_path)
+    if not native_file.is_file() or not optimized_file.is_file():
+        return {
+            "passed": False,
+            "policy": policy,
+            "reason": "one or both frame artifact paths do not exist",
+        }
+
+    import numpy as np
+
+    native = np.load(native_file, allow_pickle=False)
+    optimized = np.load(optimized_file, allow_pickle=False)
+    same_shape = native.shape == optimized.shape
+    result: dict[str, Any] = {
+        "policy": policy,
+        "native_shape": list(native.shape),
+        "optimized_shape": list(optimized.shape),
+        "native_dtype": str(native.dtype),
+        "optimized_dtype": str(optimized.dtype),
+        "same_shape": same_shape,
+    }
+    if policy == "frames_only":
+        result["passed"] = same_shape
+        result["reason"] = (
+            "frame shapes match" if same_shape else "frame shapes differ"
+        )
+        return result
+    if not same_shape:
+        result["passed"] = False
+        result["reason"] = "frame shapes differ"
+        return result
+
+    difference = np.abs(
+        native.astype(np.float64) - optimized.astype(np.float64)
+    )
+    result["max_abs_diff"] = float(difference.max()) if difference.size else 0.0
+    result["mean_abs_diff"] = (
+        float(difference.mean()) if difference.size else 0.0
+    )
+    if policy == "byte_equal":
+        passed = bool(
+            native.dtype == optimized.dtype and np.array_equal(native, optimized)
+        )
+        result["passed"] = passed
+        result["reason"] = (
+            "frame arrays are byte equal"
+            if passed
+            else "frame arrays are not byte equal"
+        )
+        return result
+    if policy == "tolerance":
+        passed = bool(
+            np.allclose(
+                native,
+                optimized,
+                atol=atol,
+                rtol=rtol,
+                equal_nan=False,
+            )
+        )
+        result.update(
+            {
+                "passed": passed,
+                "atol": atol,
+                "rtol": rtol,
+                "reason": (
+                    "frame arrays are within tolerance"
+                    if passed
+                    else "frame arrays exceed tolerance"
+                ),
+            }
+        )
+        return result
+    return {
+        **result,
+        "passed": False,
+        "reason": f"unsupported parity policy {policy!r}",
+    }
 
 
 def classify_end_to_end(

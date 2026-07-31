@@ -21,6 +21,7 @@ from autokernel.workload.launcher import (
 from autokernel.workload.result import (
     GenerationRunResult,
     classify_end_to_end,
+    compare_frame_outputs,
     load_generation_result,
     write_generation_result,
 )
@@ -75,7 +76,7 @@ def test_generation_request_matches_wan_ab_shape():
 
 def test_rejects_secret_fields():
     payload = load_workload(WORKLOADS / "ltx_480p.yaml").as_dict()
-    payload["runtime"]["password"] = "nope"
+    payload["runtime"]["password"] = "nope"  # noqa: S105 - rejection fixture
     with pytest.raises(WorkloadError, match="secret fields"):
         WorkloadManifest.from_dict(payload)
 
@@ -205,8 +206,12 @@ def test_run_ab_resume(tmp_path, monkeypatch):
     calls: list[str] = []
 
     def fake_run_mode(**kwargs):
+        import numpy as np
+
         mode = kwargs["mode"]
         calls.append(mode)
+        frames_path = out / f"{mode}_frames.npy"
+        np.save(frames_path, np.zeros((2, 4, 4, 3), dtype=np.uint8))
         result = GenerationRunResult.from_dict(
             {
                 "schema_version": 1,
@@ -222,6 +227,7 @@ def test_run_ab_resume(tmp_path, monkeypatch):
                 "generation_seconds": [8.0],
                 "peak_memory_mb": [1000.0],
                 "environment": {},
+                "frames_path": str(frames_path),
             }
         )
         write_generation_result(result, out / f"{mode}_result.json")
@@ -253,6 +259,30 @@ def test_run_ab_resume(tmp_path, monkeypatch):
     )
     assert calls == ["native", "optimized"]  # no re-run
     assert second["comparison"] is not None
+    assert second["comparison"]["parity"]["passed"] is True
+
+
+def test_compare_frame_outputs_policies(tmp_path):
+    import numpy as np
+
+    native = tmp_path / "native.npy"
+    same = tmp_path / "same.npy"
+    close = tmp_path / "close.npy"
+    np.save(native, np.array([[[[10, 20, 30]]]], dtype=np.uint8))
+    np.save(same, np.array([[[[10, 20, 30]]]], dtype=np.uint8))
+    np.save(close, np.array([[[[11, 20, 30]]]], dtype=np.uint8))
+
+    exact = compare_frame_outputs(native, same, policy="byte_equal")
+    assert exact["passed"] is True
+    mismatch = compare_frame_outputs(native, close, policy="byte_equal")
+    assert mismatch["passed"] is False
+    tolerant = compare_frame_outputs(
+        native,
+        close,
+        policy="tolerance",
+        atol=1.0,
+    )
+    assert tolerant["passed"] is True
 
 
 def test_cli_validate(monkeypatch):

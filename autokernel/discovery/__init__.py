@@ -2,6 +2,7 @@
 
 from .fingerprint import fingerprint_payload, graph_fingerprint
 from .fx_capture import CaptureResult, capture_callable_region, capture_module_region
+from .profiler_export import load_profiler_export, profiler_export_to_report
 from .profiler_parse import parse_key_averages_rows
 from .ranking import (
     DEFAULT_IMPACT_FLOOR,
@@ -52,9 +53,11 @@ __all__ = [
     "graph_fingerprint",
     "is_region_safe",
     "load_discovery_report",
+    "load_profiler_export",
     "normalize_op_name",
     "optimistic_e2e_improvement",
     "parse_key_averages_rows",
+    "profiler_export_to_report",
     "rank_operators",
     "rank_regions",
     "reject_region",

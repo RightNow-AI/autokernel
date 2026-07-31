@@ -698,17 +698,29 @@ class DiscoveryReport:
                 f"unsupported version {version}; expected {DISCOVERY_SCHEMA_VERSION}",
             )
         producer = dict(
-            _mapping(raw.get("producer"), source, "producer", non_empty=True)
+            _metadata_value(
+                _mapping(raw.get("producer"), source, "producer", non_empty=True),
+                source,
+                "producer",
+            )
         )
         workload = dict(
-            _mapping(raw.get("workload"), source, "workload", non_empty=True)
+            _metadata_value(
+                _mapping(raw.get("workload"), source, "workload", non_empty=True),
+                source,
+                "workload",
+            )
         )
         environment = dict(
-            _mapping(
-                raw.get("environment"),
+            _metadata_value(
+                _mapping(
+                    raw.get("environment"),
+                    source,
+                    "environment",
+                    non_empty=True,
+                ),
                 source,
                 "environment",
-                non_empty=True,
             )
         )
         for field in ("name", "version"):
