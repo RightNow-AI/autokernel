@@ -7,6 +7,9 @@
 - Added a versioned, metadata-only campaign contract with strict validation,
   impact ranking, legacy orchestration-plan generation, and trusted
   starter-kernel preparation through `campaign.py`
+- Added a one-command, time-bounded and resumable overnight campaign runner
+  with per-target benchmark instructions, durable logs, terminal receipts, and
+  a consolidated morning report
 
 ### MotionKernel identity
 
@@ -81,6 +84,12 @@
 
 - Added the first production video-DiT operation specification: Wan's
   post-self-attention gated residual update plus FP32 affine LayerNorm
+- Added specifications, production corpora, and Triton starters for Wan's
+  modulated pre-attention LayerNorm and post-MLP gated residual, completing the
+  first three-target Wan optimization pack
+- Validated both new starters across their complete production corpora on
+  GB200, with all correctness stages passing and weighted isolated speedups of
+  10.449x and 10.628x respectively
 - Added a metadata-only shape corpus covering Wan 2.1 1.3B and 14B at common
   480p token counts, including four-way sequence-parallel layouts
 - Added a structured-output Triton baseline that returns both the normalized
