@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "operation": "custom_affine",
+  "cases": [
+    {
+      "name": "prod-prefill",
+      "size": {"rows": 4096, "cols": 1024},
+      "dtype": "float16",
+      "weight": 7,
+      "tags": ["production", "forward"]
+    },
+    {
+      "name": "prod-decode",
+      "size": {"rows": 64, "cols": 1024},
+      "dtype": "float16",
+      "weight": 93,
+      "tags": ["production", "forward"]
+    },
+    {
+      "name": "prod-fp32-fallback",
+      "size": {"rows": 512, "cols": 512},
+      "dtype": "float32",
+      "weight": 1,
+      "tags": ["fallback"]
+    }
+  ]
+}

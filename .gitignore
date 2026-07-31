@@ -31,3 +31,4 @@ traces/
 
 # Workspace (runtime artifacts)
 workspace/
+uv.lock

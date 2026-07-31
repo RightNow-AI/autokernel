@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "producer": {
+    "name": "fastvideo",
+    "version": "0.2.0"
+  },
+  "workload": {
+    "workload_id": "wan-t2v-1.3b",
+    "model_id": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "task": "inference",
+    "variant_id": "canonical"
+  },
+  "environment": {
+    "hardware_profile_id": "gb200-1",
+    "software_profile_id": "torch2.11-cuda12.8-triton3.6"
+  },
+  "total_profiled_device_time_us": 10000.0,
+  "targets": [
+    {
+      "name": "wan.self_attn_residual_norm",
+      "operation": "wan_gated_residual_norm",
+      "kind": "fusion",
+      "spec_locator": "models/wan_gated_residual_norm.py:SPEC",
+      "total_device_time_us": 3200.0,
+      "self_device_time_us": 2400.0,
+      "calls": 40,
+      "requires_backward": false,
+      "observations": [
+        {
+          "name": "b1-s20280-d1536",
+          "count": 40,
+          "total_device_time_us": 3200.0,
+          "inputs": [
+            {
+              "name": "residual",
+              "shape": [1, 20280, 1536],
+              "stride": [31150080, 1536, 1],
+              "dtype": "bfloat16",
+              "device_type": "cuda",
+              "requires_grad": false
+            },
+            {
+              "name": "gate",
+              "shape": [1, 1, 1536],
+              "stride": [9216, 1536, 1],
+              "dtype": "float32",
+              "device_type": "cuda",
+              "requires_grad": false
+            }
+          ],
+          "tags": ["wan2.1", "480p"]
+        }
+      ],
+      "attributes": {
+        "model_family": "wan"
+      }
+    },
+    {
+      "name": "wan.rope",
+      "operation": "rotary_embedding",
+      "kind": "operator",
+      "spec_locator": null,
+      "total_device_time_us": 800.0,
+      "self_device_time_us": 700.0,
+      "calls": 80,
+      "requires_backward": false,
+      "observations": [
+        {
+          "name": "wan-rope",
+          "count": 80,
+          "total_device_time_us": 800.0,
+          "inputs": [
+            {
+              "name": "query",
+              "shape": [1, 20280, 12, 128],
+              "stride": [31150080, 1536, 128, 1],
+              "dtype": "bfloat16",
+              "device_type": "cuda",
+              "requires_grad": false
+            }
+          ],
+          "tags": ["wan2.1"]
+        }
+      ],
+      "attributes": {}
+    }
+  ]
+}

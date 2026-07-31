@@ -11,9 +11,13 @@ Handles:
 Usage:
   uv run bench.py                        # benchmark kernel.py using its KERNEL_TYPE
   uv run bench.py --kernel matmul        # force kernel type
+  uv run bench.py --spec path/spec.py:SPEC   # benchmark an external KernelSpec
   uv run bench.py --quick                # skip stages 3-5, bench only large size
   uv run bench.py --profile              # emit torch profiler trace
   uv run bench.py --sizes large          # benchmark only 'large' size
+
+Operation metadata (sizes, dtypes, tolerances, edge cases, FLOP/byte accounting)
+lives in autokernel/specs/, not in this file.
 """
 
 from __future__ import annotations
@@ -26,11 +30,46 @@ import signal
 import sys
 import time
 import traceback
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+
+# The package lives next to this script; make sure it is importable when bench.py
+# is invoked from another working directory.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from autokernel.specs import (  # noqa: E402  (path bootstrap must run first)
+    KernelRegistry,
+    KernelSpec,
+    SpecLoadError,
+    SpecNotFoundError,
+    SpecValidationError,
+    create_builtin_registry,
+    dtype_bytes,
+    resolve_spec,
+    resolve_torch_dtype,
+)
+from autokernel.verification import (  # noqa: E402
+    TreeComparison,
+    check_backward,
+    check_compile,
+    collect_environment_metadata,
+    compare_deterministic,
+    compare_output_trees,
+    result_envelope,
+    tree_has_nan_or_inf,
+    write_result_atomic,
+)
+from autokernel.verification.corpus import (  # noqa: E402
+    CorpusError,
+    load_shape_corpus,
+    validate_corpus_against_spec,
+    weighted_aggregate,
+)
 
 # ---------------------------------------------------------------------------
 # Timeout helper (cross-platform)
@@ -197,450 +236,180 @@ def detect_gpu() -> GPUSpec:
 
 
 # =========================================================================
-# 2. INPUT GENERATORS (deterministic via manual_seed)
+# 2. OPERATION METADATA (from the KernelSpec registry)
 # =========================================================================
+# Input generators, reference wiring, sizes, dtypes, tolerances, edge cases and
+# FLOP/byte accounting are owned by autokernel/specs/. This file only translates
+# canonical dtype names into torch dtypes at the runtime boundary.
 
-def gen_matmul_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N, K = size["M"], size["N"], size["K"]
-    A = torch.randn(M, K, device=device, dtype=dtype)
-    B = torch.randn(K, N, device=device, dtype=dtype)
-    return {"A": A, "B": B}
-
-
-def gen_softmax_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    rows, cols = size["rows"], size["cols"]
-    x = torch.randn(rows, cols, device=device, dtype=dtype)
-    return {"x": x}
-
-
-def gen_layernorm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, dim = size["batch"], size["dim"]
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    weight = torch.ones(dim, device=device, dtype=dtype)
-    bias = torch.zeros(dim, device=device, dtype=dtype)
-    return {"x": x, "weight": weight, "bias": bias}
-
-
-def gen_flash_attention_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
-    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    return {"Q": Q, "K": K, "V": V}
-
-
-def gen_fused_mlp_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, dim, hidden = size["batch"], size["dim"], size["hidden"]
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    w_gate = torch.randn(hidden, dim, device=device, dtype=dtype) * 0.02
-    w_up = torch.randn(hidden, dim, device=device, dtype=dtype) * 0.02
-    w_down = torch.randn(dim, hidden, device=device, dtype=dtype) * 0.02
-    return {"x": x, "w_gate": w_gate, "w_up": w_up, "w_down": w_down}
-
-
-def gen_cross_entropy_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, vocab = size["batch"], size["vocab"]
-    logits = torch.randn(batch, vocab, device=device, dtype=dtype)
-    targets = torch.randint(0, vocab, (batch,), device=device, dtype=torch.long)
-    return {"logits": logits, "targets": targets}
-
-
-def gen_rotary_embedding_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
-    x = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    half_dim = head_dim // 2
-    cos = torch.randn(seq_len, half_dim, device=device, dtype=dtype)
-    sin = torch.randn(seq_len, half_dim, device=device, dtype=dtype)
-    return {"x": x, "cos": cos, "sin": sin}
-
-
-def gen_rmsnorm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N = size["M"], size["N"]
-    x = torch.randn(M, N, device=device, dtype=dtype)
-    weight = torch.randn(N, device=device, dtype=dtype)
-    return {"x": x, "weight": weight}
-
-
-def gen_reduce_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N = size["M"], size["N"]
-    x = torch.randn(M, N, device=device, dtype=dtype)
-    return {"x": x}
-
-
-# =========================================================================
-# 3. REFERENCE WRAPPERS
-# =========================================================================
-# Thin wrappers that call reference.py functions with the right dict keys.
-
-def _ref_matmul(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.matmul_ref(inputs["A"], inputs["B"])
-
-def _ref_softmax(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.softmax_ref(inputs["x"])
-
-def _ref_layernorm(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.layernorm_ref(inputs["x"], inputs["weight"], inputs["bias"])
-
-def _ref_flash_attention(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.flash_attention_ref(inputs["Q"], inputs["K"], inputs["V"])
-
-def _ref_fused_mlp(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.fused_mlp_ref(inputs["x"], inputs["w_gate"], inputs["w_up"], inputs["w_down"])
-
-def _ref_cross_entropy(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.cross_entropy_ref(inputs["logits"], inputs["targets"])
-
-def _ref_rotary_embedding(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.rotary_embedding_ref(inputs["x"], inputs["cos"], inputs["sin"])
-
-def _ref_rmsnorm(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.rmsnorm_ref(inputs["x"], inputs["weight"])
-
-def _ref_reduce(inputs: dict) -> torch.Tensor:
-    import reference
-    return reference.reduce_sum_ref(inputs["x"], dim=-1)
-
-
-# =========================================================================
-# 4. KERNEL CONFIGS
-# =========================================================================
 
 def _dtype_bytes(dtype: torch.dtype) -> int:
     """Return byte-width for a dtype."""
     return torch.tensor([], dtype=dtype).element_size()
 
 
-KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
-    # -----------------------------------------------------------------
-    # MATMUL
-    # -----------------------------------------------------------------
-    "matmul": {
-        "test_sizes": [
-            ("tiny",    {"M": 128,  "N": 128,  "K": 128}),
-            ("small",   {"M": 512,  "N": 512,  "K": 512}),
-            ("medium",  {"M": 1024, "N": 1024, "K": 1024}),
-            ("large",   {"M": 2048, "N": 2048, "K": 2048}),
-            ("xlarge",  {"M": 4096, "N": 4096, "K": 4096}),
-            ("tall",    {"M": 8192, "N": 1024, "K": 1024}),
-            ("wide",    {"M": 1024, "N": 8192, "K": 1024}),
-            ("deep_k",  {"M": 1024, "N": 1024, "K": 8192}),
-            ("llm_qkv", {"M": 4096, "N": 4096, "K": 512}),
-            ("llm_mlp", {"M": 4096, "N": 11008, "K": 4096}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        "flops_fn": lambda s: 2 * s["M"] * s["N"] * s["K"],
-        "bytes_fn": lambda s, dt: (s["M"] * s["K"] + s["K"] * s["N"] + s["M"] * s["N"]) * _dtype_bytes(dt),
-        "input_generator": gen_matmul_inputs,
-        "reference_fn": _ref_matmul,
-        "edge_sizes": [
-            ("edge_1023",  {"M": 1023, "N": 1023, "K": 1023}),
-            ("edge_4097",  {"M": 4097, "N": 4097, "K": 512}),
-            ("edge_1537",  {"M": 1537, "N": 1537, "K": 1537}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # SOFTMAX
-    # -----------------------------------------------------------------
-    "softmax": {
-        "test_sizes": [
-            ("tiny",    {"rows": 32,    "cols": 128}),
-            ("small",   {"rows": 256,   "cols": 512}),
-            ("medium",  {"rows": 1024,  "cols": 1024}),
-            ("large",   {"rows": 4096,  "cols": 4096}),
-            ("xlarge",  {"rows": 8192,  "cols": 8192}),
-            ("wide",    {"rows": 1024,  "cols": 32768}),
-            ("narrow",  {"rows": 32768, "cols": 128}),
-            ("vocab",   {"rows": 4096,  "cols": 50257}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        "flops_fn": lambda s: 5 * s["rows"] * s["cols"],  # exp + sub + sum + div + max
-        "bytes_fn": lambda s, dt: 2 * s["rows"] * s["cols"] * _dtype_bytes(dt),  # read + write
-        "input_generator": gen_softmax_inputs,
-        "reference_fn": _ref_softmax,
-        "edge_sizes": [
-            ("edge_1023",  {"rows": 1023, "cols": 1023}),
-            ("edge_4097",  {"rows": 4097, "cols": 4097}),
-            ("edge_50257", {"rows": 1024, "cols": 50257}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # LAYERNORM
-    # -----------------------------------------------------------------
-    "layernorm": {
-        "test_sizes": [
-            ("tiny",    {"batch": 32,    "dim": 128}),
-            ("small",   {"batch": 256,   "dim": 512}),
-            ("medium",  {"batch": 1024,  "dim": 1024}),
-            ("large",   {"batch": 4096,  "dim": 2048}),
-            ("xlarge",  {"batch": 8192,  "dim": 4096}),
-            ("wide",    {"batch": 1024,  "dim": 8192}),
-            ("llm_7b",  {"batch": 4096,  "dim": 4096}),
-            ("llm_13b", {"batch": 4096,  "dim": 5120}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        "flops_fn": lambda s: 8 * s["batch"] * s["dim"],  # mean, var, norm, scale, shift
-        "bytes_fn": lambda s, dt: (2 * s["batch"] * s["dim"] + 2 * s["dim"]) * _dtype_bytes(dt),
-        "input_generator": gen_layernorm_inputs,
-        "reference_fn": _ref_layernorm,
-        "edge_sizes": [
-            ("edge_1023",  {"batch": 1023, "dim": 1023}),
-            ("edge_4097",  {"batch": 4097, "dim": 4097}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # FLASH ATTENTION
-    # -----------------------------------------------------------------
-    "flash_attention": {
-        "test_sizes": [
-            ("tiny",    {"batch": 1, "heads": 4,  "seq_len": 64,   "head_dim": 64}),
-            ("small",   {"batch": 2, "heads": 8,  "seq_len": 256,  "head_dim": 64}),
-            ("medium",  {"batch": 2, "heads": 16, "seq_len": 512,  "head_dim": 64}),
-            ("large",   {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 64}),
-            ("xlarge",  {"batch": 2, "heads": 32, "seq_len": 2048, "head_dim": 64}),
-            ("long",    {"batch": 1, "heads": 32, "seq_len": 4096, "head_dim": 64}),
-            ("gqa",     {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128}),
-            ("llm_7b",  {"batch": 1, "heads": 32, "seq_len": 2048, "head_dim": 128}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        # 4*N*S^2*D FLOPs (Q@K^T + softmax + attn@V)
-        "flops_fn": lambda s: 4 * s["batch"] * s["heads"] * (s["seq_len"] ** 2) * s["head_dim"],
-        "bytes_fn": lambda s, dt: 3 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * _dtype_bytes(dt) + \
-                                   s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * _dtype_bytes(dt),
-        "input_generator": gen_flash_attention_inputs,
-        "reference_fn": _ref_flash_attention,
-        "edge_sizes": [
-            ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
-            ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 64}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # FUSED MLP (SwiGLU)
-    # -----------------------------------------------------------------
-    "fused_mlp": {
-        "test_sizes": [
-            ("tiny",    {"batch": 32,   "dim": 128,  "hidden": 256}),
-            ("small",   {"batch": 256,  "dim": 512,  "hidden": 1024}),
-            ("medium",  {"batch": 1024, "dim": 1024, "hidden": 2048}),
-            ("large",   {"batch": 2048, "dim": 2048, "hidden": 5504}),
-            ("xlarge",  {"batch": 4096, "dim": 4096, "hidden": 11008}),
-            ("llm_7b",  {"batch": 2048, "dim": 4096, "hidden": 11008}),
-            ("llm_13b", {"batch": 2048, "dim": 5120, "hidden": 13824}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        # gate_proj + up_proj + silu + mul + down_proj
-        "flops_fn": lambda s: 2 * s["batch"] * s["dim"] * s["hidden"] * 3,
-        "bytes_fn": lambda s, dt: (s["batch"] * s["dim"] + s["hidden"] * s["dim"] * 3 + s["batch"] * s["dim"]) * _dtype_bytes(dt),
-        "input_generator": gen_fused_mlp_inputs,
-        "reference_fn": _ref_fused_mlp,
-        "edge_sizes": [
-            ("edge_1023", {"batch": 1023, "dim": 1024, "hidden": 2048}),
-            ("edge_4097", {"batch": 4097, "dim": 512,  "hidden": 1024}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # CROSS ENTROPY
-    # -----------------------------------------------------------------
-    "cross_entropy": {
-        "test_sizes": [
-            ("tiny",    {"batch": 32,    "vocab": 256}),
-            ("small",   {"batch": 256,   "vocab": 1024}),
-            ("medium",  {"batch": 1024,  "vocab": 4096}),
-            ("large",   {"batch": 4096,  "vocab": 32000}),
-            ("xlarge",  {"batch": 8192,  "vocab": 50257}),
-            ("llama",   {"batch": 4096,  "vocab": 32000}),
-            ("gpt2",    {"batch": 4096,  "vocab": 50257}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        # log_softmax + nll
-        "flops_fn": lambda s: 4 * s["batch"] * s["vocab"],
-        "bytes_fn": lambda s, dt: (s["batch"] * s["vocab"] + s["batch"]) * _dtype_bytes(dt),
-        "input_generator": gen_cross_entropy_inputs,
-        "reference_fn": _ref_cross_entropy,
-        "edge_sizes": [
-            ("edge_1023",  {"batch": 1023, "vocab": 32000}),
-            ("edge_50257", {"batch": 4096, "vocab": 50257}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # ROTARY EMBEDDING
-    # -----------------------------------------------------------------
-    "rotary_embedding": {
-        "test_sizes": [
-            ("tiny",    {"batch": 1, "heads": 4,  "seq_len": 64,   "head_dim": 64}),
-            ("small",   {"batch": 2, "heads": 8,  "seq_len": 256,  "head_dim": 64}),
-            ("medium",  {"batch": 2, "heads": 16, "seq_len": 512,  "head_dim": 64}),
-            ("large",   {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128}),
-            ("xlarge",  {"batch": 2, "heads": 32, "seq_len": 2048, "head_dim": 128}),
-            ("llm_7b",  {"batch": 1, "heads": 32, "seq_len": 2048, "head_dim": 128}),
-            ("llm_13b", {"batch": 1, "heads": 40, "seq_len": 2048, "head_dim": 128}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
-            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
-            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
-        },
-        # mul + add per element, x2 (cos and sin parts)
-        "flops_fn": lambda s: 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"],
-        "bytes_fn": lambda s, dt: (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 +
-                                    s["seq_len"] * s["head_dim"]) * _dtype_bytes(dt),
-        "input_generator": gen_rotary_embedding_inputs,
-        "reference_fn": _ref_rotary_embedding,
-        "edge_sizes": [
-            ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
-            ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 128}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # RMSNORM
-    # -----------------------------------------------------------------
-    "rmsnorm": {
-        "test_sizes": [
-            ("small",   {"M": 1024, "N": 768}),
-            ("medium",  {"M": 4096, "N": 1024}),
-            ("large",   {"M": 4096, "N": 4096}),
-            ("llama",   {"M": 2048, "N": 4096}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
-        },
-        "flops_fn": lambda s: 6 * s["M"] * s["N"],  # square, mean, sqrt, div, mul
-        "bytes_fn": lambda s, dt: (2 * s["M"] * s["N"] + s["N"]) * torch.tensor([], dtype=dt).element_size(),
-        "input_generator": gen_rmsnorm_inputs,
-        "reference_fn": _ref_rmsnorm,
-        "edge_sizes": [
-            ("edge_1023", {"M": 1023, "N": 768}),
-            ("edge_4097", {"M": 4097, "N": 1024}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # REDUCE (sum along last dim)
-    # -----------------------------------------------------------------
-    "reduce": {
-        "test_sizes": [
-            ("small",   {"M": 1024, "N": 1024}),
-            ("medium",  {"M": 4096, "N": 4096}),
-            ("large",   {"M": 8192, "N": 8192}),
-            ("wide",    {"M": 1024, "N": 32768}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
-        },
-        "flops_fn": lambda s: s["M"] * s["N"],  # N additions per row
-        "bytes_fn": lambda s, dt: (s["M"] * s["N"] + s["M"]) * torch.tensor([], dtype=dt).element_size(),
-        "input_generator": gen_reduce_inputs,
-        "reference_fn": _ref_reduce,
-        "edge_sizes": [
-            ("edge_1023", {"M": 1023, "N": 1024}),
-            ("edge_4097", {"M": 4096, "N": 4097}),
-        ],
-    },
-}
+def _spec_sizes(spec: KernelSpec) -> List[Tuple[str, Dict[str, int]]]:
+    """Ordered ``(label, size)`` pairs, as the harness has always consumed them."""
+    return list(spec.size_items())
 
 
-# =========================================================================
-# 5. CORRECTNESS TESTING (5 stages)
-# =========================================================================
+def _spec_dtypes(spec: KernelSpec) -> List[torch.dtype]:
+    """Declared dtypes as torch dtypes, in benchmark order."""
+    return [resolve_torch_dtype(name) for name in spec.dtypes]
 
-def _compare(output: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> dict:
-    """Compare two tensors and return statistics."""
-    if output.shape != expected.shape:
-        return {
-            "match": False,
-            "reason": f"shape mismatch: {output.shape} vs {expected.shape}",
-            "max_abs_error": float("inf"),
-            "mean_abs_error": float("inf"),
-            "pct_within_tol": 0.0,
-        }
 
-    # Cast both to float32 for comparison
-    out_f = output.float()
-    exp_f = expected.float()
-
-    abs_diff = (out_f - exp_f).abs()
-    max_abs = abs_diff.max().item()
-    mean_abs = abs_diff.mean().item()
-
-    # Percentage of elements within tolerance
-    within = (abs_diff <= atol + rtol * exp_f.abs()).float().mean().item() * 100.0
-
-    match = torch.allclose(out_f, exp_f, atol=atol, rtol=rtol)
+def _spec_tolerances(spec: KernelSpec) -> Dict[torch.dtype, Dict[str, float]]:
+    """Tolerances keyed by torch dtype."""
     return {
-        "match": match,
-        "reason": "" if match else f"max_abs_error={max_abs:.6e} exceeds tol(atol={atol}, rtol={rtol})",
-        "max_abs_error": max_abs,
-        "mean_abs_error": mean_abs,
-        "pct_within_tol": within,
+        resolve_torch_dtype(name): tol.as_dict()
+        for name, tol in spec.tolerances.items()
     }
 
 
-def _has_nan_inf(t: torch.Tensor) -> bool:
-    """Check for NaN or Inf."""
-    return bool(torch.isnan(t).any().item() or torch.isinf(t).any().item())
+def _spec_reference(spec: KernelSpec) -> Callable[[Dict[str, Any]], Any]:
+    """Adapt ``reference_fn(**inputs)`` to the harness' ``ref_fn(inputs)`` shape."""
+
+    def ref_fn(inputs: Dict[str, Any]) -> Any:
+        return spec.reference_fn(**inputs)
+
+    return ref_fn
 
 
-def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> dict:
-    """Run all correctness stages. Returns dict with results."""
-    device = "cuda"
+def _spec_bytes_fn(spec: KernelSpec) -> Callable[[Dict[str, int], torch.dtype], Any]:
+    """Adapt ``bytes_fn(size, dt_bytes)`` to a torch-dtype call site."""
+
+    def bytes_fn(size: Dict[str, int], dtype: torch.dtype) -> Any:
+        return spec.bytes_fn(size, _dtype_bytes(dtype))
+
+    return bytes_fn
+
+
+def _spec_edge_cases(spec: KernelSpec) -> List[Tuple[str, Dict[str, int]]]:
+    """Edge-case ``(label, size)`` pairs for the shape-robustness stage."""
+    return [(edge.name, dict(edge.size)) for edge in spec.edge_cases]
+
+
+def _legacy_config(spec: KernelSpec) -> Dict[str, Any]:
+    """Build the pre-registry ``KERNEL_CONFIGS`` entry for one specification."""
+    return {
+        "test_sizes": _spec_sizes(spec),
+        "test_dtypes": _spec_dtypes(spec),
+        "tolerances": _spec_tolerances(spec),
+        "flops_fn": spec.flops_fn,
+        "bytes_fn": _spec_bytes_fn(spec),
+        "input_generator": spec.input_generator,
+        "reference_fn": _spec_reference(spec),
+        "edge_sizes": _spec_edge_cases(spec),
+        "spec": spec,
+    }
+
+
+def _build_legacy_configs() -> Dict[str, Dict[str, Any]]:
+    return {spec.name: _legacy_config(spec) for spec in create_builtin_registry()}
+
+
+#: DEPRECATED compatibility view of the old hard-coded configuration table.
+#: Derived from the built-in registry; edit autokernel/specs/builtins.py instead.
+#: New code should use ``autokernel.specs.create_builtin_registry()``.
+KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = _build_legacy_configs()
+
+
+#: Device the harness allocates on. Overridden only by CPU tests; the
+#: benchmark itself always measures on the GPU.
+BENCH_DEVICE = "cuda"
+
+
+def resolve_operation_name(
+    spec_name: Optional[str],
+    kernel_arg: Optional[str],
+    declared_type: Optional[str],
+) -> Optional[str]:
+    """Apply the operation-selection precedence.
+
+    1. the name declared by an explicit ``--spec``;
+    2. an explicit ``--kernel``;
+    3. ``kernel.py::KERNEL_TYPE`` (the historical default).
+
+    Returns None when nothing selects an operation.
+    """
+    return spec_name or kernel_arg or declared_type
+
+
+def _get_spec_or_exit(registry: KernelRegistry, kernel_type: str) -> KernelSpec:
+    """Fetch a spec from the registry, preserving the CLI failure contract."""
+    try:
+        return registry.get(kernel_type)
+    except SpecNotFoundError:
+        print(f"\nERROR: Unknown kernel type '{kernel_type}'")
+        print(f"  Available: {', '.join(registry.list_names())}")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
+        sys.exit(1)
+
+
+def _load_validated_corpus(args: argparse.Namespace, spec: KernelSpec):
+    """Load and validate ``--shape-corpus`` against the selected spec.
+
+    Returns the validated cases, or None when no corpus was requested. Exits
+    with the greppable failure contract on any corpus error. Runs before the
+    candidate module is imported and before any GPU allocation, so a malformed
+    corpus never executes candidate code or touches the device.
+    """
+    if not args.shape_corpus:
+        return None
+    try:
+        corpus = load_shape_corpus(args.shape_corpus)
+        validate_corpus_against_spec(corpus, spec)
+    except CorpusError as e:
+        print(f"\nERROR: {e}")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
+        sys.exit(1)
+    mode = "corpus-only" if args.shape_corpus_only else "append"
+    print(f"shape_corpus: {args.shape_corpus} ({len(corpus.cases)} cases, mode={mode})")
+    return corpus.cases
+
+
+# =========================================================================
+# 3. CORRECTNESS TESTING (5 stages)
+# =========================================================================
+
+def _compare_outputs(output: Any, expected: Any, spec: KernelSpec, *, relax: float = 1.0) -> TreeComparison:
+    """Compare candidate and reference output trees using the spec's policy.
+
+    Single-tensor outputs behave exactly as the historical ``_compare`` did:
+    the tolerance declared for the benchmark dtype is applied, and the
+    failure reason is unchanged. Structured outputs are compared leaf by leaf
+    with stable diagnostic paths.
+    """
+    return compare_output_trees(
+        output,
+        expected,
+        spec.tolerances,
+        output_spec=spec.output_spec,
+        relax=relax,
+    )
+
+
+def _record_leaves(records: List[Dict[str, Any]], stage: str, case: str, cmp: TreeComparison) -> None:
+    """Collect per-leaf comparison details for the structured result artifact."""
+    for leaf in cmp.leaf_records():
+        records.append({"stage": stage, "case": case, **leaf})
+
+
+def run_correctness(
+    kernel_fn: Callable,
+    spec: KernelSpec,
+    quick: bool = False,
+    corpus_cases: Optional[Sequence] = None,
+    corpus_only: bool = False,
+) -> dict:
+    """Run all correctness stages. Returns dict with results.
+
+    ``corpus_cases`` appends validated production shapes to the stage-2 shape
+    sweep; ``corpus_only`` replaces the built-in size/dtype sweep with them.
+    """
+    device = BENCH_DEVICE
     results = {
         "smoke_test": "SKIP",
         "shape_sweep": "SKIP",
@@ -650,13 +419,13 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
         "correctness": "FAIL",
     }
     details = []
+    leaf_records: List[Dict[str, Any]] = []
     all_pass = True
 
-    gen_fn = config["input_generator"]
-    ref_fn = config["reference_fn"]
-    sizes = config["test_sizes"]
-    dtypes = config["test_dtypes"]
-    tols = config["tolerances"]
+    gen_fn = spec.input_generator
+    ref_fn = _spec_reference(spec)
+    sizes = _spec_sizes(spec)
+    dtypes = _spec_dtypes(spec)
 
     # ------------------------------------------------------------------
     # Stage 1: SMOKE TEST -- tiny input, tight tolerance
@@ -671,22 +440,22 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
         with _Timeout(30):
             output = kernel_fn(**inputs)
 
-        if _has_nan_inf(output):
+        if tree_has_nan_or_inf(output):
             results["smoke_test"] = "FAIL"
-            details.append(f"  smoke: NaN/Inf in output")
+            details.append("  smoke: NaN/Inf in output")
             all_pass = False
-            print(f"  FAIL: NaN/Inf in output")
+            print("  FAIL: NaN/Inf in output")
         else:
-            tol = tols.get(dtype0, {"atol": 1e-2, "rtol": 1e-2})
-            cmp = _compare(output, expected, **tol)
-            if cmp["match"]:
+            cmp = _compare_outputs(output, expected, spec)
+            _record_leaves(leaf_records, "smoke", tiny_label, cmp)
+            if cmp.match:
                 results["smoke_test"] = "PASS"
-                print(f"  PASS (max_abs_error={cmp['max_abs_error']:.6e})")
+                print(f"  PASS (max_abs_error={cmp.worst_abs_error:.6e})")
             else:
                 results["smoke_test"] = "FAIL"
-                details.append(f"  smoke: {cmp['reason']}")
+                details.append(f"  smoke: {cmp.reason}")
                 all_pass = False
-                print(f"  FAIL: {cmp['reason']}")
+                print(f"  FAIL: {cmp.reason}")
     except BenchTimeoutError:
         results["smoke_test"] = "FAIL"
         details.append("  smoke: TIMEOUT")
@@ -707,7 +476,8 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     if results["smoke_test"] == "FAIL":
         results["correctness"] = "FAIL"
         results["details"] = details
-        print(f"\ncorrectness: FAIL (smoke test failed, aborting remaining stages)")
+        results["leaf_details"] = leaf_records
+        print("\ncorrectness: FAIL (smoke test failed, aborting remaining stages)")
         return results
 
     # ------------------------------------------------------------------
@@ -720,54 +490,69 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     worst_error = 0.0
     worst_case = ""
 
-    for label, sz in sizes:
-        for dtype in dtypes:
-            sweep_count += 1
-            try:
-                inputs = gen_fn(sz, dtype, device, seed=42)
-                expected = ref_fn(inputs)
-                with _Timeout(30):
-                    output = kernel_fn(**inputs)
+    sweep_configs: List[Tuple[str, Dict[str, int], torch.dtype]] = []
+    if not corpus_only:
+        for label, sz in sizes:
+            for dtype in dtypes:
+                sweep_configs.append((label, sz, dtype))
+    if corpus_cases:
+        for case in corpus_cases:
+            case_dtype = resolve_torch_dtype(case.dtype) if case.dtype else dtypes[0]
+            sweep_configs.append((case.name, dict(case.size), case_dtype))
 
-                if _has_nan_inf(output):
-                    sweep_pass = False
-                    sweep_fail_count += 1
-                    details.append(f"  sweep {label}/{dtype}: NaN/Inf")
-                    print(f"  FAIL: {label} {dtype} -> NaN/Inf")
-                    continue
+    for label, sz, dtype in sweep_configs:
+        sweep_count += 1
+        try:
+            inputs = gen_fn(sz, dtype, device, seed=42)
+            expected = ref_fn(inputs)
+            with _Timeout(30):
+                output = kernel_fn(**inputs)
 
-                tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                cmp = _compare(output, expected, **tol)
-
-                if cmp["max_abs_error"] > worst_error:
-                    worst_error = cmp["max_abs_error"]
-                    worst_case = f"{label}/{dtype}"
-
-                if not cmp["match"]:
-                    sweep_pass = False
-                    sweep_fail_count += 1
-                    details.append(f"  sweep {label}/{dtype}: {cmp['reason']}")
-                    print(f"  FAIL: {label} {dtype} -> {cmp['reason']}")
-                else:
-                    print(f"  PASS: {label} {dtype} (max_err={cmp['max_abs_error']:.2e}, within_tol={cmp['pct_within_tol']:.1f}%)")
-
-            except torch.cuda.OutOfMemoryError:
-                # OOM on larger sizes is acceptable -- just skip
-                print(f"  SKIP: {label} {dtype} -> OOM")
-                torch.cuda.empty_cache()
+            if tree_has_nan_or_inf(output):
+                sweep_pass = False
+                sweep_fail_count += 1
+                details.append(f"  sweep {label}/{dtype}: NaN/Inf")
+                print(f"  FAIL: {label} {dtype} -> NaN/Inf")
                 continue
-            except BenchTimeoutError:
+
+            cmp = _compare_outputs(output, expected, spec)
+            _record_leaves(leaf_records, "sweep", f"{label}/{dtype}", cmp)
+
+            if cmp.worst_abs_error > worst_error:
+                worst_error = cmp.worst_abs_error
+                worst_case = f"{label}/{dtype}"
+
+            if not cmp.match:
                 sweep_pass = False
                 sweep_fail_count += 1
-                details.append(f"  sweep {label}/{dtype}: TIMEOUT")
-                print(f"  FAIL: {label} {dtype} -> TIMEOUT")
-            except Exception as e:
-                sweep_pass = False
-                sweep_fail_count += 1
-                details.append(f"  sweep {label}/{dtype}: {type(e).__name__}: {e}")
-                print(f"  FAIL: {label} {dtype} -> {type(e).__name__}: {e}")
-            finally:
-                torch.cuda.empty_cache()
+                details.append(f"  sweep {label}/{dtype}: {cmp.reason}")
+                print(f"  FAIL: {label} {dtype} -> {cmp.reason}")
+            else:
+                print(
+                    f"  PASS: {label} {dtype} "
+                    f"(max_err={cmp.worst_abs_error:.2e}, "
+                    f"within_tol={cmp.worst_pct_within_tol:.1f}%)"
+                )
+
+        except torch.cuda.OutOfMemoryError:
+            # OOM on larger sizes is acceptable -- just skip
+            print(f"  SKIP: {label} {dtype} -> OOM")
+            torch.cuda.empty_cache()
+            continue
+        except BenchTimeoutError:
+            sweep_pass = False
+            sweep_fail_count += 1
+            details.append(f"  sweep {label}/{dtype}: TIMEOUT")
+            print(f"  FAIL: {label} {dtype} -> TIMEOUT")
+        except Exception as e:
+            sweep_pass = False
+            sweep_fail_count += 1
+            details.append(
+                f"  sweep {label}/{dtype}: {type(e).__name__}: {e}"
+            )
+            print(f"  FAIL: {label} {dtype} -> {type(e).__name__}: {e}")
+        finally:
+            torch.cuda.empty_cache()
 
     if sweep_pass:
         results["shape_sweep"] = f"PASS ({sweep_count} configs, worst_err={worst_error:.2e} at {worst_case})"
@@ -786,6 +571,7 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
         results["edge_cases"] = "SKIP (quick mode)"
         results["correctness"] = "PASS" if all_pass else "FAIL"
         results["details"] = details
+        results["leaf_details"] = leaf_records
         print(f"\ncorrectness: {results['correctness']} (quick mode: stages 3-5 skipped)")
         return results
 
@@ -830,25 +616,23 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
             with _Timeout(30):
                 output = kernel_fn(**transformed)
 
-            if _has_nan_inf(output) and not _has_nan_inf(expected):
+            if tree_has_nan_or_inf(output) and not tree_has_nan_or_inf(expected):
                 stability_pass = False
                 details.append(f"  stability {case_name}: NaN/Inf (reference is clean)")
                 print(f"  FAIL: {case_name} -> NaN/Inf (reference is clean)")
-            elif _has_nan_inf(output) and _has_nan_inf(expected):
+            elif tree_has_nan_or_inf(output) and tree_has_nan_or_inf(expected):
                 # Both have NaN/Inf -- acceptable (e.g. overflow in near_max)
                 print(f"  PASS: {case_name} -> both have NaN/Inf (expected overflow)")
             else:
-                tol = tols.get(stab_dtype, {"atol": 1e-2, "rtol": 1e-2})
                 # Relax tolerances for adversarial inputs
-                relaxed_atol = tol["atol"] * 10
-                relaxed_rtol = tol["rtol"] * 10
-                cmp = _compare(output, expected, atol=relaxed_atol, rtol=relaxed_rtol)
-                if cmp["match"]:
-                    print(f"  PASS: {case_name} (max_err={cmp['max_abs_error']:.2e})")
+                cmp = _compare_outputs(output, expected, spec, relax=10.0)
+                _record_leaves(leaf_records, "stability", case_name, cmp)
+                if cmp.match:
+                    print(f"  PASS: {case_name} (max_err={cmp.worst_abs_error:.2e})")
                 else:
                     stability_pass = False
-                    details.append(f"  stability {case_name}: {cmp['reason']}")
-                    print(f"  FAIL: {case_name} -> {cmp['reason']}")
+                    details.append(f"  stability {case_name}: {cmp.reason}")
+                    print(f"  FAIL: {case_name} -> {cmp.reason}")
 
         except torch.cuda.OutOfMemoryError:
             print(f"  SKIP: {case_name} -> OOM")
@@ -888,11 +672,18 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
             outputs.append(out_i)
 
         for i in range(1, 3):
-            if not torch.equal(outputs[0], outputs[i]):
+            cmp = compare_deterministic(outputs[0], outputs[i], output_spec=spec.output_spec)
+            _record_leaves(leaf_records, "determinism", f"run_0_vs_{i}", cmp)
+            if not cmp.match:
                 determinism_pass = False
-                diff = (outputs[0].float() - outputs[i].float()).abs()
-                details.append(f"  determinism: run 0 vs run {i} differ (max_diff={diff.max().item():.6e})")
-                print(f"  FAIL: run 0 vs run {i} differ (max_diff={diff.max().item():.6e})")
+                failure = cmp.first_failure()
+                if failure is not None and failure.max_abs_error is not None:
+                    where = "" if failure.path == "output" else f" at {failure.path}"
+                    message = f"run 0 vs run {i} differ{where} (max_diff={failure.max_abs_error:.6e})"
+                else:
+                    message = f"run 0 vs run {i} differ ({cmp.reason})"
+                details.append(f"  determinism: {message}")
+                print(f"  FAIL: {message}")
 
         if determinism_pass:
             print("  PASS: 3 runs are bitwise identical")
@@ -913,46 +704,52 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     # ------------------------------------------------------------------
     print("\n--- Stage 5: Edge Cases ---")
     edge_pass = True
-    edge_sizes = config.get("edge_sizes", [])
-    if not edge_sizes:
+    edge_cases = spec.edge_cases
+    if not edge_cases:
         results["edge_cases"] = "SKIP (no edge sizes defined)"
         print("  SKIP: no edge sizes defined")
     else:
-        for label, sz in edge_sizes:
-            for dtype in dtypes[:1]:  # test with first dtype only for speed
-                try:
-                    inputs = gen_fn(sz, dtype, device, seed=42)
-                    expected = ref_fn(inputs)
-                    with _Timeout(30):
-                        output = kernel_fn(**inputs)
+        for edge in edge_cases:
+            label = edge.name
+            sz = dict(edge.size)
+            # An edge case may pin its own dtype; otherwise use the primary
+            # dtype only, for speed.
+            dtype = resolve_torch_dtype(edge.dtype) if edge.dtype else dtypes[0]
+            try:
+                inputs = gen_fn(sz, dtype, device, seed=edge.seed)
+                if edge.input_transform is not None:
+                    inputs = edge.input_transform(inputs)
+                expected = ref_fn(inputs)
+                with _Timeout(30):
+                    output = kernel_fn(**inputs)
 
-                    if _has_nan_inf(output) and not _has_nan_inf(expected):
-                        edge_pass = False
-                        details.append(f"  edge {label}: NaN/Inf")
-                        print(f"  FAIL: {label} -> NaN/Inf")
+                if tree_has_nan_or_inf(output) and not tree_has_nan_or_inf(expected):
+                    edge_pass = False
+                    details.append(f"  edge {label}: NaN/Inf")
+                    print(f"  FAIL: {label} -> NaN/Inf")
+                else:
+                    cmp = _compare_outputs(output, expected, spec)
+                    _record_leaves(leaf_records, "edge", label, cmp)
+                    if cmp.match:
+                        print(f"  PASS: {label} (max_err={cmp.worst_abs_error:.2e})")
                     else:
-                        tol = tols.get(dtype, {"atol": 1e-2, "rtol": 1e-2})
-                        cmp = _compare(output, expected, **tol)
-                        if cmp["match"]:
-                            print(f"  PASS: {label} (max_err={cmp['max_abs_error']:.2e})")
-                        else:
-                            edge_pass = False
-                            details.append(f"  edge {label}: {cmp['reason']}")
-                            print(f"  FAIL: {label} -> {cmp['reason']}")
+                        edge_pass = False
+                        details.append(f"  edge {label}: {cmp.reason}")
+                        print(f"  FAIL: {label} -> {cmp.reason}")
 
-                except torch.cuda.OutOfMemoryError:
-                    print(f"  SKIP: {label} -> OOM")
-                    torch.cuda.empty_cache()
-                except BenchTimeoutError:
-                    edge_pass = False
-                    details.append(f"  edge {label}: TIMEOUT")
-                    print(f"  FAIL: {label} -> TIMEOUT")
-                except Exception as e:
-                    edge_pass = False
-                    details.append(f"  edge {label}: {type(e).__name__}: {e}")
-                    print(f"  FAIL: {label} -> {type(e).__name__}: {e}")
-                finally:
-                    torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError:
+                print(f"  SKIP: {label} -> OOM")
+                torch.cuda.empty_cache()
+            except BenchTimeoutError:
+                edge_pass = False
+                details.append(f"  edge {label}: TIMEOUT")
+                print(f"  FAIL: {label} -> TIMEOUT")
+            except Exception as e:
+                edge_pass = False
+                details.append(f"  edge {label}: {type(e).__name__}: {e}")
+                print(f"  FAIL: {label} -> {type(e).__name__}: {e}")
+            finally:
+                torch.cuda.empty_cache()
 
         results["edge_cases"] = "PASS" if edge_pass else "FAIL"
         if not edge_pass:
@@ -962,12 +759,45 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     # Final verdict
     results["correctness"] = "PASS" if all_pass else "FAIL"
     results["details"] = details
+    results["leaf_details"] = leaf_records
     print(f"\ncorrectness: {results['correctness']}")
     return results
 
 
+def run_backward_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
+    """Opt-in gradient verification. Prints the greppable verdict line and
+    returns the structured report."""
+    print("\n=== BACKWARD CORRECTNESS ===")
+    report = check_backward(kernel_fn, spec, device=BENCH_DEVICE)
+    if report.status == "PASS":
+        print(f"  upstream outputs: {', '.join(report.output_paths)}")
+        for record in report.gradients:
+            print(f"  grad[{record.input_name}]: match "
+                  f"(max_err={record.max_abs_error:.2e}, mean_err={record.mean_abs_error:.2e})")
+    else:
+        print(f"  FAIL: {report.reason}")
+        for record in report.gradients:
+            if record.status != "match":
+                print(f"  grad[{record.input_name}]: {record.status}: {record.reason}")
+    print(f"BACKWARD_CORRECTNESS: {report.status}")
+    return report.as_dict()
+
+
+def run_compile_check(kernel_fn: Callable, spec: KernelSpec) -> dict:
+    """Run compile verification outside all timed performance regions."""
+    print("\n=== COMPILE CORRECTNESS ===")
+    report = check_compile(kernel_fn, spec, device=BENCH_DEVICE)
+    for case in report.cases:
+        detail = f": {case.reason}" if case.reason else ""
+        print(f"  {case.label}: {case.status}{detail}")
+    if report.reason and report.status != "PASS":
+        print(f"  {report.reason}")
+    print(f"COMPILE_CORRECTNESS: {report.status}")
+    return report.as_dict()
+
+
 # =========================================================================
-# 6. PERFORMANCE BENCHMARKING
+# 4. PERFORMANCE BENCHMARKING
 # =========================================================================
 
 def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
@@ -1000,20 +830,29 @@ def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
     return times[len(times) // 2]  # median
 
 
-def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
-                    sizes_filter: str = "all") -> dict:
-    """Run performance benchmarks. Returns dict with metrics."""
-    device = "cuda"
-    gen_fn = config["input_generator"]
-    ref_fn = config["reference_fn"]
-    flops_fn = config["flops_fn"]
-    bytes_fn = config["bytes_fn"]
-    dtypes = config["test_dtypes"]
+def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
+                    sizes_filter: str = "all",
+                    corpus_cases: Optional[Sequence] = None,
+                    corpus_only: bool = False) -> dict:
+    """Run performance benchmarks. Returns dict with metrics.
+
+    ``corpus_cases`` appends production shapes (each benchmarked once; their
+    weights feed aggregate reporting, not repetition). ``corpus_only``
+    benchmarks only those shapes.
+    """
+    device = BENCH_DEVICE
+    gen_fn = spec.input_generator
+    ref_fn = _spec_reference(spec)
+    flops_fn = spec.flops_fn
+    bytes_fn = _spec_bytes_fn(spec)
+    dtypes = _spec_dtypes(spec)
 
     # Select benchmark size
-    sizes = config["test_sizes"]
+    sizes = _spec_sizes(spec)
     bench_sizes = []
-    if sizes_filter == "all":
+    if corpus_only:
+        bench_sizes = []
+    elif sizes_filter == "all":
         bench_sizes = sizes
     else:
         for label, sz in sizes:
@@ -1042,10 +881,21 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
     dtype = dtypes[0]  # primary dtype for benchmarking
 
+    # (label, size, dtype, weight, source) benchmark configurations. Built-in
+    # sizes carry weight 1; corpus cases carry their declared weight, which is
+    # used only for aggregate reporting, never to repeat benchmark loops.
+    bench_configs: List[Tuple[str, Dict[str, int], torch.dtype, int, str]] = [
+        (label, sz, dtype, 1, "builtin") for label, sz in bench_sizes
+    ]
+    if corpus_cases:
+        for case in corpus_cases:
+            case_dtype = resolve_torch_dtype(case.dtype) if case.dtype else dtype
+            bench_configs.append((case.name, dict(case.size), case_dtype, case.weight, "corpus"))
+
     all_results = []
     primary_result = None
 
-    for label, sz in bench_sizes:
+    for label, sz, dtype, weight, source in bench_configs:
         print(f"\n  Benchmarking: {label} ...")
         try:
             flops = flops_fn(sz)
@@ -1087,6 +937,8 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 "label": label,
                 "size": sz,
                 "dtype": str(dtype),
+                "weight": weight,
+                "source": source,
                 "flops": flops,
                 "bytes": nbytes,
                 "kernel_latency_us": kernel_us,
@@ -1125,21 +977,46 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
     if primary_result is None and all_results:
         primary_result = all_results[-1]
 
+    # Weighted aggregate reporting for corpus cases, grouped per dtype so
+    # results from different dtypes are never mixed into one aggregate.
+    corpus_summary = None
+    corpus_entries = [entry for entry in all_results if entry["source"] == "corpus"]
+    if corpus_entries:
+        weighted = weighted_aggregate(
+            [
+                {
+                    "dtype": entry["dtype"],
+                    "weight": entry["weight"],
+                    "kernel_ms": entry["kernel_latency_us"] / 1000.0,
+                    "ref_ms": entry["pytorch_latency_us"] / 1000.0,
+                }
+                for entry in corpus_entries
+            ]
+        )
+        corpus_summary = {"cases": corpus_entries, "weighted": weighted}
+        print("\n  === SHAPE CORPUS: weighted aggregates ===")
+        for dtype_name, agg in weighted.items():
+            print(f"  dtype={dtype_name}: cases={agg['cases']}, total_weight={agg['weight']}")
+            print(f"    weighted_kernel_latency_us: {agg['kernel_ms'] * 1000.0:.2f}")
+            print(f"    weighted_pytorch_latency_us: {agg['ref_ms'] * 1000.0:.2f}")
+            print(f"    weighted_speedup_vs_pytorch: {agg['speedup']:.3f}x")
+
     return {
         "primary": primary_result,
         "all": all_results,
+        "corpus": corpus_summary,
     }
 
 
 # =========================================================================
-# 7. PROFILER (optional)
+# 5. PROFILER (optional)
 # =========================================================================
 
-def run_profile(kernel_fn: Callable, config: dict):
+def run_profile(kernel_fn: Callable, spec: KernelSpec):
     """Run torch profiler and save a trace."""
-    device = "cuda"
-    gen_fn = config["input_generator"]
-    sizes = config["test_sizes"]
+    device = BENCH_DEVICE
+    gen_fn = spec.input_generator
+    sizes = _spec_sizes(spec)
 
     # Use 'medium' or first size
     prof_size = None
@@ -1150,7 +1027,7 @@ def run_profile(kernel_fn: Callable, config: dict):
     if prof_size is None:
         prof_size = sizes[0][1]
 
-    dtype = config["test_dtypes"][0]
+    dtype = _spec_dtypes(spec)[0]
     inputs = gen_fn(prof_size, dtype, device, seed=42)
 
     trace_dir = "./traces"
@@ -1188,7 +1065,7 @@ def run_profile(kernel_fn: Callable, config: dict):
 
 
 # =========================================================================
-# 8. MAIN -- orchestrate everything and produce structured output
+# 6. MAIN -- orchestrate everything and produce structured output
 # =========================================================================
 
 def main():
@@ -1197,13 +1074,39 @@ def main():
     parser = argparse.ArgumentParser(description="AutoKernel benchmark harness")
     parser.add_argument("--kernel", type=str, default=None,
                         help="Kernel type to benchmark (default: read from kernel.py)")
+    parser.add_argument("--spec", type=str, default=None,
+                        help="External KernelSpec locator, e.g. "
+                             "'path/to/spec.py:SPEC' or 'package.module:SPEC'. "
+                             "Takes precedence over --kernel.")
+    parser.add_argument("--spec-override", action="store_true",
+                        help="Allow --spec to replace a built-in operation of the same name")
     parser.add_argument("--sizes", type=str, default="all",
                         help="Which sizes to benchmark: small|medium|large|all (default: all)")
     parser.add_argument("--quick", action="store_true",
                         help="Quick mode: skip correctness stages 3-5, bench only large size")
     parser.add_argument("--profile", action="store_true",
                         help="Enable torch profiler trace")
+    parser.add_argument("--shape-corpus", type=str, default=None, metavar="PATH",
+                        help="Versioned JSON shape corpus; validated cases are "
+                             "appended to the built-in sweep and benchmarked once each")
+    parser.add_argument("--shape-corpus-only", action="store_true",
+                        help="Benchmark only the --shape-corpus cases, skipping the "
+                             "built-in size sweep (requires --shape-corpus)")
+    parser.add_argument("--check-backward", action="store_true",
+                        help="Also verify gradients against the reference "
+                             "(requires the spec to declare a backward_spec; "
+                             "correctness-only, no performance claims)")
+    parser.add_argument("--check-compile", action="store_true",
+                        help="Verify torch.compile parity using the spec's compile settings "
+                             "(correctness-only; compilation is never timed)")
+    parser.add_argument("--result-json", type=str,
+                        default=os.path.join(_SCRIPT_DIR, "workspace", "bench_result.json"),
+                        metavar="PATH",
+                        help="Atomic machine-readable result path "
+                             "(default: workspace/bench_result.json)")
     args = parser.parse_args()
+    if args.shape_corpus_only and not args.shape_corpus:
+        parser.error("--shape-corpus-only requires --shape-corpus PATH")
 
     # ------------------------------------------------------------------
     # Import the kernel module
@@ -1215,6 +1118,41 @@ def main():
     kernel_module = None
     kernel_fn = None
     kernel_type = args.kernel
+
+    # ------------------------------------------------------------------
+    # Resolve the operation specification.
+    # Precedence: --spec, then --kernel, then kernel.py::KERNEL_TYPE.
+    # Loading happens after argument parsing, so `bench.py --help` never
+    # imports an external specification.
+    # ------------------------------------------------------------------
+    registry: KernelRegistry = create_builtin_registry()
+    spec: Optional[KernelSpec] = None
+    if args.spec:
+        try:
+            spec, registry = resolve_spec(
+                spec_locator=args.spec,
+                registry=registry,
+                override=args.spec_override,
+            )
+        except (SpecLoadError, SpecValidationError) as e:
+            print(f"\nERROR: {e}")
+            print("\ncorrectness: FAIL")
+            print("throughput_tflops: 0.000")
+            sys.exit(1)
+        kernel_type = spec.name
+        print(f"kernel_spec: {args.spec}")
+
+    # When the operation is already determined (--spec or --kernel), fetch its
+    # spec and validate the shape corpus *before* importing the candidate
+    # module: malformed metadata must fail without executing candidate code
+    # and before any GPU allocation.
+    kernel_type = spec.name if spec is not None else args.kernel
+    spec_locked = kernel_type is not None
+    corpus_cases = None
+    if spec_locked:
+        if spec is None:
+            spec = _get_spec_or_exit(registry, kernel_type)
+        corpus_cases = _load_validated_corpus(args, spec)
 
     try:
         # Add cwd to path so 'import kernel' works
@@ -1228,46 +1166,50 @@ def main():
         kernel_module = importlib.import_module("kernel")
         kernel_fn = kernel_module.kernel_fn
 
-        if kernel_type is None:
-            kernel_type = getattr(kernel_module, "KERNEL_TYPE", None)
-            if kernel_type is None:
-                print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
-                sys.exit(1)
+        declared_type = getattr(kernel_module, "KERNEL_TYPE", None)
+        if spec_locked:
+            resolved = kernel_type
+        else:
+            resolved = resolve_operation_name(None, args.kernel, declared_type)
+        if resolved is None:
+            print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
+            sys.exit(1)
+        if declared_type is not None and declared_type != resolved:
+            print(f"WARNING: kernel.py declares KERNEL_TYPE '{declared_type}' but "
+                  f"'{resolved}' was requested; benchmarking kernel_fn against "
+                  f"'{resolved}'")
+        kernel_type = resolved
 
         print(f"kernel_type: {kernel_type}")
-        print(f"kernel_module: kernel.py loaded successfully")
+        print("kernel_module: kernel.py loaded successfully")
 
     except SyntaxError as e:
-        print(f"\nERROR: kernel.py has a syntax error:")
+        print("\nERROR: kernel.py has a syntax error:")
         print(f"  {e}")
         traceback.print_exc()
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
         sys.exit(1)
     except Exception as e:
-        print(f"\nERROR: Failed to import kernel.py:")
+        print("\nERROR: Failed to import kernel.py:")
         print(f"  {type(e).__name__}: {e}")
         traceback.print_exc()
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
+        print("\ncorrectness: FAIL")
+        print("throughput_tflops: 0.000")
         sys.exit(1)
 
-    # Validate kernel type
-    if kernel_type not in KERNEL_CONFIGS:
-        print(f"\nERROR: Unknown kernel type '{kernel_type}'")
-        print(f"  Available: {', '.join(KERNEL_CONFIGS.keys())}")
-        print(f"\ncorrectness: FAIL")
-        print(f"throughput_tflops: 0.000")
-        sys.exit(1)
-
-    config = KERNEL_CONFIGS[kernel_type]
+    # The default selection path (kernel.py::KERNEL_TYPE) resolves the spec
+    # and validates the corpus only after the candidate import.
+    if not spec_locked:
+        spec = _get_spec_or_exit(registry, kernel_type)
+        corpus_cases = _load_validated_corpus(args, spec)
 
     # ------------------------------------------------------------------
     # GPU Detection
     # ------------------------------------------------------------------
     gpu = detect_gpu()
 
-    print(f"\n=== GPU INFO ===")
+    print("\n=== GPU INFO ===")
     print(f"gpu_name: {gpu.name}")
     print(f"gpu_sm_count: {gpu.sm_count}")
     print(f"gpu_memory_gb: {gpu.memory_gb}")
@@ -1281,28 +1223,67 @@ def main():
     # ------------------------------------------------------------------
     # Correctness
     # ------------------------------------------------------------------
-    print(f"\n=== CORRECTNESS ===")
+    print("\n=== CORRECTNESS ===")
     try:
-        correctness_results = run_correctness(kernel_fn, config, quick=args.quick)
+        correctness_results = run_correctness(
+            kernel_fn, spec, quick=args.quick,
+            corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
+        )
     except Exception as e:
         print(f"\nFATAL: Correctness testing crashed: {type(e).__name__}: {e}")
         traceback.print_exc()
         correctness_results = {"correctness": "FAIL", "smoke_test": "CRASH", "shape_sweep": "CRASH",
                                "numerical_stability": "CRASH", "determinism": "CRASH", "edge_cases": "CRASH"}
 
-    print(f"\n--- Correctness Summary ---")
+    print("\n--- Correctness Summary ---")
     print(f"smoke_test: {correctness_results.get('smoke_test', 'N/A')}")
     print(f"shape_sweep: {correctness_results.get('shape_sweep', 'N/A')}")
     print(f"numerical_stability: {correctness_results.get('numerical_stability', 'N/A')}")
     print(f"determinism: {correctness_results.get('determinism', 'N/A')}")
     print(f"edge_cases: {correctness_results.get('edge_cases', 'N/A')}")
     print(f"correctness: {correctness_results['correctness']}")
+    print(f"FORWARD_CORRECTNESS: {correctness_results['correctness']}")
+
+    # ------------------------------------------------------------------
+    # Backward verification (opt-in; correctness-only, never timed)
+    # ------------------------------------------------------------------
+    backward_result = None
+    backward_requested = args.check_backward or (
+        spec.backward_spec is not None and spec.backward_spec.enabled_by_default
+    )
+    if backward_requested:
+        try:
+            backward_result = run_backward_check(kernel_fn, spec)
+        except Exception as e:
+            print(f"\nFATAL: Backward verification crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            backward_result = {"status": "FAIL", "reason": f"crash: {type(e).__name__}: {e}"}
+            print("BACKWARD_CORRECTNESS: FAIL")
+
+    # ------------------------------------------------------------------
+    # Compile verification (opt-in; correctness-only, never timed)
+    # ------------------------------------------------------------------
+    compile_result = None
+    compile_requested = args.check_compile or (
+        spec.compile_spec is not None and spec.compile_spec.enabled
+    )
+    if compile_requested:
+        try:
+            compile_result = run_compile_check(kernel_fn, spec)
+        except Exception as e:
+            print(f"\nFATAL: Compile verification crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            compile_result = {
+                "status": "FAIL",
+                "reason": f"crash: {type(e).__name__}: {e}",
+            }
+            print("COMPILE_CORRECTNESS: FAIL")
 
     # ------------------------------------------------------------------
     # Performance
     # ------------------------------------------------------------------
     # Determine primary size info for the header
-    _perf_sizes = config["test_sizes"]
+    _perf_sizes = _spec_sizes(spec)
     _perf_primary_label = None
     _perf_primary_size = None
     for _pl, _ps in _perf_sizes:
@@ -1312,7 +1293,7 @@ def main():
             break
     if _perf_primary_size is None:
         _perf_primary_label, _perf_primary_size = _perf_sizes[-1]
-    _perf_dtype = config["test_dtypes"][0]
+    _perf_dtype = _spec_dtypes(spec)[0]
     _size_params = ", ".join(f"{k}={v}" for k, v in _perf_primary_size.items())
     print(f"\n=== PERFORMANCE ({_perf_primary_label}: {_size_params}, dtype={_perf_dtype}) ===")
 
@@ -1323,7 +1304,10 @@ def main():
         if args.quick:
             sizes_filter = "large"
         torch.cuda.reset_peak_memory_stats()
-        perf_results = run_performance(kernel_fn, config, gpu, sizes_filter=sizes_filter)
+        perf_results = run_performance(
+            kernel_fn, spec, gpu, sizes_filter=sizes_filter,
+            corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
+        )
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")
@@ -1345,7 +1329,7 @@ def main():
         print(f"bytes: {primary['bytes']}")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
 
-        print(f"\n=== COMPARISON VS PYTORCH ===")
+        print("\n=== COMPARISON VS PYTORCH ===")
         print(f"pytorch_latency_us: {primary['pytorch_latency_us']:.2f}")
         print(f"pytorch_latency_ms: {primary['pytorch_latency_us'] / 1000.0:.4f}")
         print(f"kernel_latency_us: {primary['kernel_latency_us']:.2f}")
@@ -1354,26 +1338,26 @@ def main():
         print(f"pytorch_tflops: {primary['ref_throughput_tflops']:.3f}")
         print(f"kernel_tflops: {primary['throughput_tflops']:.3f}")
     else:
-        print(f"\nlatency_us: 0.00")
-        print(f"latency_ms: 0.0000")
-        print(f"throughput_tflops: 0.000")
-        print(f"bandwidth_gb_s: 0.0")
-        print(f"pct_peak_compute: 0.0%")
-        print(f"pct_peak_bandwidth: 0.0%")
+        print("\nlatency_us: 0.00")
+        print("latency_ms: 0.0000")
+        print("throughput_tflops: 0.000")
+        print("bandwidth_gb_s: 0.0")
+        print("pct_peak_compute: 0.0%")
+        print("pct_peak_bandwidth: 0.0%")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
-        print(f"\n=== COMPARISON VS PYTORCH ===")
-        print(f"pytorch_latency_us: 0.00")
-        print(f"pytorch_latency_ms: 0.0000")
-        print(f"kernel_latency_us: 0.00")
-        print(f"kernel_latency_ms: 0.0000")
-        print(f"speedup_vs_pytorch: 0.000x")
+        print("\n=== COMPARISON VS PYTORCH ===")
+        print("pytorch_latency_us: 0.00")
+        print("pytorch_latency_ms: 0.0000")
+        print("kernel_latency_us: 0.00")
+        print("kernel_latency_ms: 0.0000")
+        print("speedup_vs_pytorch: 0.000x")
 
     # ------------------------------------------------------------------
     # All sizes summary table
     # ------------------------------------------------------------------
     all_perf = perf_results.get("all", [])
     if len(all_perf) > 1:
-        print(f"\n=== SIZE SWEEP ===")
+        print("\n=== SIZE SWEEP ===")
         print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8}")
         print("-" * 66)
         for entry in all_perf:
@@ -1386,7 +1370,7 @@ def main():
     # ------------------------------------------------------------------
     if args.profile:
         try:
-            run_profile(kernel_fn, config)
+            run_profile(kernel_fn, spec)
         except Exception as e:
             print(f"\nWARNING: Profiling failed: {type(e).__name__}: {e}")
 
@@ -1396,7 +1380,51 @@ def main():
     t_elapsed = time.time() - t_start
     throughput = primary["throughput_tflops"] if primary else 0.0
 
-    print(f"\n=== FINAL ===")
+    corpus_identity = None
+    if args.shape_corpus:
+        corpus_identity = {
+            "source": os.path.abspath(args.shape_corpus),
+            "mode": "only" if args.shape_corpus_only else "append",
+            "cases": [
+                {
+                    "name": case.name,
+                    "size": dict(case.size),
+                    "dtype": case.dtype,
+                    "weight": case.weight,
+                    "tags": list(case.tags),
+                }
+                for case in (corpus_cases or ())
+            ],
+        }
+    result_payload = result_envelope(
+        kernel_type,
+        environment=collect_environment_metadata(BENCH_DEVICE),
+        request={
+            "spec": args.spec,
+            "sizes": args.sizes,
+            "quick": args.quick,
+            "profile": args.profile,
+            "check_backward": backward_requested,
+            "check_compile": compile_requested,
+        },
+        gpu=asdict(gpu),
+        shape_corpus=corpus_identity,
+        forward=correctness_results,
+        backward=backward_result,
+        compile=compile_result,
+        performance={
+            **perf_results,
+            "peak_vram_mb": peak_vram_mb,
+        },
+        bench_time_seconds=t_elapsed,
+    )
+    try:
+        result_path = write_result_atomic(args.result_json, result_payload)
+        print(f"result_json: {result_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to write result JSON: {type(e).__name__}: {e}")
+
+    print("\n=== FINAL ===")
     print(f"kernel_type: {kernel_type}")
     print(f"correctness: {correctness_results['correctness']}")
     print(f"throughput_tflops: {throughput:.3f}")
@@ -1404,8 +1432,8 @@ def main():
         print(f"speedup_vs_pytorch: {primary['speedup_vs_pytorch']:.3f}x")
         print(f"pct_peak_compute: {primary['pct_peak_compute']:.1f}%")
     else:
-        print(f"speedup_vs_pytorch: 0.000x")
-        print(f"pct_peak_compute: 0.0%")
+        print("speedup_vs_pytorch: 0.000x")
+        print("pct_peak_compute: 0.0%")
     print(f"bench_time_seconds: {t_elapsed:.1f}")
 
     if t_elapsed > 90:

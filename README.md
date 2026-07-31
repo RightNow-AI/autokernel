@@ -1,21 +1,63 @@
-# AutoKernel
+# MotionKernel
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/UfEyc72t)
+**Verified GPU kernel optimization for video generation models.**
 
-**Autoresearch for GPU kernels.** Give it any PyTorch model, go to sleep, wake up to optimized Triton or CUDA C++ kernels.
+> [!NOTE]
+> MotionKernel is an independently maintained, MIT-licensed fork of
+> [RightNow-AI/AutoKernel](https://github.com/RightNow-AI/autokernel), focused
+> on GPU kernel optimization for video diffusion transformers, video VAEs, and
+> production video-generation workloads. It preserves the upstream license and
+> attribution. See
+> [DOWNSTREAM.md](DOWNSTREAM.md) for provenance and [ROADMAP.md](ROADMAP.md)
+> for the video-first project plan.
 
-![AutoKernel Progress](progress.png)
+MotionKernel profiles real model executions, captures production tensor shapes,
+develops and tunes Triton or CUDA C++ kernels, and verifies numerical
+correctness, gradients, `torch.compile` compatibility, performance, and
+end-to-end integration behavior.
 
-Inspired by [@karpathy/autoresearch](https://github.com/karpathy/autoresearch) -- which demonstrated autonomous AI agents for LLM training research. AutoKernel applies the same philosophy to GPU kernel optimization: agent modifies one file, runs a fixed evaluation, keeps or reverts, repeats forever.
+The first target integration is
+[FastVideo](https://github.com/hao-ai-lab/FastVideo), beginning with Wan and
+expanding to LTX-Video, Cosmos, and Kandinsky. The optimization platform remains
+framework-agnostic: promoted kernels can be consumed by FastVideo, Diffusers,
+or other PyTorch video runtimes without requiring the research harness at
+inference time.
+
+## Project Status
+
+The reusable kernel specification registry, production shape corpora,
+structured-output comparison, backward verification, `torch.compile`
+verification, and reproducible JSON result artifacts are implemented.
+
+The first video-specific pack covers three Wan boundaries: modulated
+pre-attention LayerNorm, post-attention gated residual plus LayerNorm, and the
+post-MLP gated residual. All three have been validated across their
+production shape corpora on an NVIDIA GB200 (see
+[docs/WAN_KERNEL_RESULTS.md](docs/WAN_KERNEL_RESULTS.md)). These are isolated
+operator results; complete model packs still require end-to-end benchmark
+publication before support is claimed.
+
+A model-independent discovery foundation is also in place: declarative
+FastVideo workload manifests, a resumable native-versus-optimized launcher
+bridge, metadata-only profiler ingestion, CPU FX graph capture with stable
+fingerprints, and impact ranking with an end-to-end floor. Graph-derived
+spec generation and generic artifact dispatch are the next stages.
+
+MotionKernel currently retains the `autokernel` Python import namespace for
+compatibility with the upstream project. The import namespace will only move
+after a documented migration path exists.
 
 ## How It Works
 
-Give AutoKernel any PyTorch model. It will:
+Give MotionKernel a PyTorch model or an external operation specification. It
+will:
 
 1. **Profile** the model to find which GPU kernels are bottlenecks
-2. **Extract** each bottleneck as a standalone Triton or CUDA C++ kernel
-3. **Optimize** each kernel autonomously (edit, benchmark, keep/revert -- forever)
-4. **Verify** end-to-end correctness and report the total speedup
+2. **Capture** representative shapes, dtypes, layouts, and environment metadata
+3. **Extract** each bottleneck as a standalone Triton or CUDA C++ kernel
+4. **Optimize** candidates through an iterative edit, benchmark, and keep/revert loop
+5. **Verify** outputs, optional gradients, compilation, and end-to-end behavior
+6. **Promote** reproducible kernels into runtime integration packages
 
 The agent reads `program.md` -- the "research org code" -- which contains comprehensive instructions for autonomous operation. It edits `kernel.py` one kernel at a time, runs `bench.py` (fixed benchmark with 5-stage correctness checks + roofline analysis), and either keeps or reverts the change. The orchestrator decides when to move to the next kernel using Amdahl's law.
 
@@ -30,8 +72,8 @@ Each experiment takes ~90 seconds. That's ~40 experiments/hour, ~320 overnight, 
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and setup
-git clone https://github.com/RightNow-AI/autokernel.git
-cd autokernel
+git clone https://github.com/aryan5v/motionkernel.git
+cd motionkernel
 uv sync
 
 # One-time setup: test data + baselines
@@ -58,7 +100,7 @@ Read program.md and let's kick off a new experiment. Start with setup.
 
 The agent will:
 1. Profile your model and present the optimization plan
-2. Create a branch (e.g., `autokernel/mar10-llama7b`)
+2. Create a branch (e.g., `motionkernel/wan-gated-residual`)
 3. Optimize each bottleneck kernel in priority order
 4. Verify end-to-end correctness and report total speedup
 
@@ -98,9 +140,208 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 
 Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
 
+Every built-in operation is described by one `KernelSpec` in
+`autokernel/specs/builtins.py`. That
+specification is the single source of truth for sizes, dtypes, tolerances, edge cases,
+FLOP/byte accounting, profiler shape aliases and starter kernels -- `bench.py` and
+`extract.py` read it instead of carrying their own per-operation tables.
+
+## Custom Operations
+
+Any operation can be added from outside the repository, without editing `bench.py`,
+`extract.py`, `reference.py` or any central map. Write a `KernelSpec` and export it:
+
+```python
+# my_ops/gelu_tanh.py
+from autokernel.specs import DT_BYTES, EdgeCase, KernelSpec, Tolerance, resolve_torch_dtype, size
+
+
+def gelu_tanh_ref(x):
+    import torch
+    return 0.5 * x * (1 + torch.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
+
+
+def gen_inputs(size_map, dtype, device, seed=42):
+    import torch
+    torch.manual_seed(seed)
+    rows, cols = size_map["rows"], size_map["cols"]
+    return {"x": torch.randn(rows, cols, device=device, dtype=resolve_torch_dtype(dtype))}
+
+
+SPEC = KernelSpec(
+    name="gelu_tanh",
+    reference_fn=gelu_tanh_ref,
+    input_generator=gen_inputs,
+    sizes={
+        "small": {"rows": 256, "cols": 512},
+        "medium": {"rows": 1024, "cols": 1024},
+        "large": {"rows": 4096, "cols": 4096},
+    },
+    dtypes=("float16", "bfloat16", "float32"),
+    tolerances={
+        "float16": Tolerance(atol=1e-3, rtol=1e-3),
+        "bfloat16": Tolerance(atol=2e-3, rtol=2e-3),
+        "float32": Tolerance(atol=1e-5, rtol=1e-5),
+    },
+    flops_fn=8 * size("rows") * size("cols"),
+    bytes_fn=2 * size("rows") * size("cols") * DT_BYTES,
+    edge_cases=(EdgeCase(name="edge_1023", size={"rows": 1023, "cols": 1023}),),
+    shape_keys=("rows", "cols"),
+    starter_kernels={"triton": "my_ops/gelu_tanh_kernel.py"},
+)
+```
+
+Then point the existing commands at it with `--spec LOCATOR`, where a locator is
+`path/to/spec.py:ATTRIBUTE` or `package.module:ATTRIBUTE`:
+
+```bash
+# benchmark a candidate kernel.py against the external spec
+cp examples/custom_ops/add_kernel.py kernel.py
+uv run bench.py --spec examples/custom_ops/add.py:SPEC --quick
+
+# generate a starter kernel file for it under workspace/
+uv run extract.py --spec examples/custom_ops/add.py:SPEC --top 1
+```
+
+Operation selection precedence is `--spec`, then `--kernel`, then `kernel.py::KERNEL_TYPE`,
+so existing invocations keep working unchanged. A spec whose name collides with a built-in
+is rejected unless `--spec-override` is passed. `ATTRIBUTE` may be a `KernelSpec` or a
+zero-argument callable returning one.
+
+Requirements the harness validates before allocating anything on the GPU: an
+identifier-like name, `small`/`medium`/`large` sizes, canonical dtype names
+(`float16`, `bfloat16`, `float32`), a tolerance for every declared dtype, size keys that
+match `shape_keys`, positive integer dimensions in every built-in, edge and default
+shape, and starter-kernel files that exist. `starter_kernels={}` is valid for a
+benchmark-only specification; extraction skips a backend whose starter is not declared.
+
+A complete, runnable example lives in `examples/custom_ops/add.py` (spec) and
+`examples/custom_ops/add_kernel.py` (starter kernel).
+
+Note that loading a spec executes the Python file you point at, exactly like running
+`python that_file.py`. Only pass locators you trust.
+
+## Model Optimization Campaigns
+
+FastVideo and other runtimes can export a versioned campaign containing only
+operation identities, tensor shape/layout signatures, call counts, aggregate
+timings, and environment identity. Validate and rank a campaign without loading
+PyTorch or executing any referenced Python:
+
+```bash
+uv run campaign.py validate /path/to/campaign.json
+uv run campaign.py rank /path/to/campaign.json
+uv run campaign.py plan /path/to/campaign.json
+```
+
+Once the campaign and its spec locators have been reviewed, prepare all ranked
+starter kernels and the existing orchestration state in one step:
+
+```bash
+uv run campaign.py prepare /path/to/campaign.json --trust-specs
+uv run orchestrate.py plan
+```
+
+Preparation writes `workspace/optimization_plan.json`, one candidate kernel per
+ranked target, and `workspace/campaign_receipt.json`. The explicit trust flag is
+required because a Python spec locator executes code. Continue with
+`program.md` for the autonomous experiment loop; every candidate still passes
+the fixed correctness gates in `bench.py` before a result can be kept.
+
+For an unattended, resumable run, preparation and the agent loop are one
+command:
+
+```bash
+uv run campaign.py run /path/to/wan-campaign.json --trust-specs --budget-hours 10
+```
+
+Like `prepare`, `run` refuses to load a campaign's Python spec locators
+without the explicit `--trust-specs` flag, because loading a spec executes the
+Python file it points at. Use `--dry-run` to inspect
+`workspace/overnight_prompt.md` without launching an agent, and `--resume`
+after an interrupted run. A non-`completed` terminal status is reported as
+`CAMPAIGN_RUN: FAIL` with a non-zero exit code. By default the runner invokes
+the Codex CLI; `--agent-command` supports trusted alternatives with `{repo}`
+and `{prompt_file}` placeholders. The next morning, inspect
+`workspace/morning_report.md`, the terminal receipt, agent log, and verified
+`kernel_<operation>_<rank>_optimized.py` artifacts in the same directory.
+
+## Workloads and Discovery
+
+The universal optimization path starts from a declarative workload manifest
+instead of model-specific scripts. A manifest in `workloads/` describes one
+reproducible FastVideo generation benchmark: model identifier, task and
+prompt reference, resolution, frame count, inference steps, seed, dtype,
+warmup and measured repetitions, and the output-parity policy. Canonical
+manifests exist for Wan 2.1 T2V 1.3B 480p and LTX 480p.
+
+```bash
+# validate and inspect a manifest
+uv run workload.py validate workloads/wan_t2v_1.3b_480p.yaml
+uv run workload.py show workloads/wan_t2v_1.3b_480p.yaml
+
+# run a resumable native-versus-optimized A/B through a FastVideo checkout
+uv run workload.py run-ab --fastvideo-checkout /path/to/FastVideo \
+  --workload workloads/wan_t2v_1.3b_480p.yaml --output workspace/wan_ab
+
+# validate a structured generation result
+uv run workload.py validate-result workspace/wan_ab/native_result.json
+```
+
+Discovery reports are metadata-only records of where a profiled generation
+actually spends time: profiler operator rows, captured FX graph regions with
+stable fingerprints, graph breaks, and unsupported operations. They never
+contain prompts, weights, activations, tensor values, or model outputs.
+
+```bash
+# convert a FastVideo profiler export into a discovery report
+uv run discovery.py ingest-profiler workspace/profiler_export.json \
+  --output workspace/discovery_report.json
+
+# validate and rank candidate regions by optimistic end-to-end impact
+uv run discovery.py validate workspace/discovery_report.json
+uv run discovery.py rank workspace/discovery_report.json --impact-floor 0.005
+```
+
+Ranking uses measured production frequency and an Amdahl-style ceiling: a
+candidate is only worth searching when its optimistic end-to-end improvement
+clears the impact floor (0.5% by default). Regions with mutation, collectives,
+data-dependent control flow, or unknown aliasing are rejected fail-closed
+before they can enter the search pipeline.
+
+## Generalized Verification
+
+The harness compares complete output trees, including nested tensors and metadata. An
+external spec may also declare `BackwardSpec` and `CompileSpec` policies. The structured
+affine example exercises both:
+
+```bash
+cp examples/custom_ops/affine_kernel.py kernel.py
+
+# forward output-tree comparison plus production-shape corpus
+uv run bench.py --spec examples/custom_ops/affine.py:SPEC \
+  --shape-corpus examples/custom_ops/affine_corpus.json --quick
+
+# optional gradient and full-graph compile gates
+uv run bench.py --spec examples/custom_ops/affine.py:SPEC \
+  --check-backward --check-compile --quick
+```
+
+Compile verification calls `torch.compile` with `fullgraph=True` by default and runs
+before performance timing. A dynamic `CompileSpec` exercises two declared shapes through
+the same compiled callable. If `torch.compile` is unavailable, the result is
+`UNSUPPORTED`, never `PASS`.
+
+Every normal benchmark run atomically writes a schema-versioned JSON record to
+`workspace/bench_result.json`; override it with `--result-json PATH`. It includes
+forward leaf errors, optional gradient and compile results, shape-corpus identity,
+environment metadata and performance results. Stable console verdicts are
+`FORWARD_CORRECTNESS`, `BACKWARD_CORRECTNESS` and `COMPILE_CORRECTNESS`.
+
 ## Example Models
 
-Self-contained model definitions ship with AutoKernel (no `transformers` library needed):
+Self-contained model definitions inherited by MotionKernel require no
+`transformers` library:
 
 | Model | File | Params | Usage |
 |-------|------|--------|-------|
@@ -119,9 +360,9 @@ uv run profile.py --module transformers --class-name AutoModelForCausalLM \
 
 ## KernelBench Integration
 
-AutoKernel integrates with [KernelBench](https://github.com/ScalingIntelligence/KernelBench),
+MotionKernel retains integration with [KernelBench](https://github.com/ScalingIntelligence/KernelBench),
 the standard benchmark for evaluating AI-generated GPU kernels (250+ problems across 4 difficulty
-levels). While most KernelBench evaluations use one-shot LLM generation, AutoKernel runs
+levels). While most KernelBench evaluations use one-shot LLM generation, MotionKernel runs
 **50-300+ iterative refinement experiments per problem** -- systematically exploring the
 optimization space instead of guessing.
 
@@ -175,13 +416,26 @@ kernels upload . --repo_id your-username/my_matmul
 ## Project Structure
 
 ```
-autokernel/
+motionkernel/
   kernel.py             the file the agent modifies (one kernel at a time)
   program.md            agent instructions -- the "research org code"
 
   bench.py              fixed benchmark + 5-stage correctness harness
   reference.py          PyTorch reference implementations (ground truth)
   prepare.py            one-time setup: test data, baselines
+
+  autokernel/specs/     KernelSpec types, registry, external spec loader,
+                        built-in operation metadata, input generators
+  autokernel/campaign/  campaign contract, ranking, overnight runner
+  autokernel/workload/  workload manifest schema, FastVideo launcher bridge,
+                        structured generation results and parity checks
+  autokernel/discovery/ discovery report schema, FX capture, profiler
+                        ingestion, timing correlation, impact ranking
+
+  campaign.py           validate, rank, prepare, and run campaigns
+  workload.py           validate and A/B-run FastVideo workload manifests
+  discovery.py          validate, ingest, and rank discovery reports
+  workloads/            canonical workload manifests (Wan, LTX)
 
   profile.py            profile any PyTorch model, rank kernels by GPU time
   extract.py            extract bottleneck kernels into workspace/
@@ -194,6 +448,8 @@ autokernel/
   kernels/cuda/         starter CUDA C++ kernels (9 types, tensor core accelerated)
   kernelbench/          KernelBench integration (bridge, eval harness, scorer)
   models/               self-contained model definitions (GPT-2, LLaMA, BERT)
+  examples/custom_ops/  external KernelSpec example + its starter kernel
+  tests/                CPU test suite (uv run pytest -m "not gpu")
   workspace/            runtime artifacts (gitignored)
 ```
 
@@ -228,11 +484,18 @@ Every experiment is logged to `results.tsv` (tab-separated):
 
 ## Credits
 
-This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton and native CUDA C++.
+MotionKernel builds on AutoKernel's **autoresearch for GPU kernels** approach,
+which was directly inspired by Andrej Karpathy's
+[autoresearch](https://github.com/karpathy/autoresearch). MotionKernel retains
+the iterative agent loop while extending the platform toward production video
+workloads, explicit operation specifications, representative shape corpora,
+and stronger verification.
 
-**KernelBench** integration is based on the work of Simon Guo, Sean Resta, et al. at Stanford's Scaling Intelligence Lab. Their paper ["KernelBench: Can LLMs Write GPU Kernels?"](https://arxiv.org/abs/2502.10517) (2025) established the standard benchmark for evaluating AI-generated GPU kernels. AutoKernel extends this by applying iterative optimization (300+ experiments per problem) instead of one-shot generation. KernelBench dataset and evaluation protocol: [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench).
+**KernelBench** integration is based on the work of Simon Guo, Sean Resta, et al. at Stanford's Scaling Intelligence Lab. Their paper ["KernelBench: Can LLMs Write GPU Kernels?"](https://arxiv.org/abs/2502.10517) (2025) established the standard benchmark for evaluating AI-generated GPU kernels. The inherited AutoKernel integration applies iterative optimization instead of one-shot generation. KernelBench dataset and evaluation protocol: [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench).
 
-Built by [RightNow AI](https://www.rightnowai.co). For enterprise GPU optimization, check out [RightNow Enterprise](https://www.rightnowai.co/forge).
+MotionKernel is independently maintained. The original AutoKernel project was
+built by [RightNow AI](https://www.rightnowai.co); see
+[DOWNSTREAM.md](DOWNSTREAM.md) for the exact fork provenance.
 
 ## Changelog
 
@@ -260,4 +523,5 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## License
 
-MIT
+MIT. MotionKernel retains the original AutoKernel copyright and permission
+notice. See [LICENSE](LICENSE) and [DOWNSTREAM.md](DOWNSTREAM.md).

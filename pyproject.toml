@@ -1,13 +1,14 @@
 [project]
-name = "autokernel"
-version = "1.0.0"
-description = "Autonomous AI agents optimizing GPU kernels overnight -- for any PyTorch model"
+name = "motionkernel"
+version = "0.1.0"
+description = "Verified GPU kernel optimization for video generation models"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "matplotlib>=3.10.0",
     "numpy>=2.2.0",
     "pandas>=2.2.0",
+    "pyyaml>=6.0",
     "torch>=2.4.0",
     "triton>=3.3.0",
 ]
@@ -35,6 +36,16 @@ profiling = [
 hf-kernels = [
     "kernels>=0.4.0",
     "huggingface-hub>=0.20.0",
+]
+# Development: CPU test suite
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: test requires a CUDA GPU (deselect with -m 'not gpu')",
 ]
 
 [tool.uv.sources]
