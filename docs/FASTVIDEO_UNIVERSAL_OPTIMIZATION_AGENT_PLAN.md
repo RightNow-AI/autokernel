@@ -454,6 +454,10 @@ MotionKernel:
   clean median wall time, 67,802.22 MiB peak allocated CUDA memory, and 3,071
   CPU-side operator rows representing 2.771s of exclusive CUDA time. The
   producer excluded all duplicate raw CUDA activity rows.
-- Next framework wall: automatically capture executable module/FX regions and
-  correlate them with measured profiler hotspots. Operator ranking alone does
-  not yet produce a searchable generated `KernelSpec`.
+- `fx_capture.py` now supports model-independent repeated-module FX capture
+  (`RegionCaptureSession` / `capture_model_regions`): operations, dependencies,
+  tensor signatures, safe scalars only, graph breaks, unsupported ops, stable
+  fingerprints, fail-closed mutation/collective/aliasing rejection. Metadata
+  only — no weights, prompts, tensor values, or source.
+- Next framework wall: correlate captured FX regions with measured profiler
+  hotspots and generate searchable `KernelSpec` objects.

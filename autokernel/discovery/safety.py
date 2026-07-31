@@ -63,6 +63,8 @@ REJECT_SUBSTRINGS: tuple[tuple[str, str], ...] = (
     ("aten::sort", "data-dependent ordering"),
     ("aten::randint", "rng / nondeterminism boundary"),
     ("aten::rand", "rng / nondeterminism boundary"),
+    ("aten::copy_", "mutation / aliasing write"),
+    ("unknown aliasing", "unknown aliasing"),
     ("prims::", "unsupported prims op"),
 )
 
