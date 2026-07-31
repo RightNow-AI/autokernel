@@ -416,9 +416,9 @@ worthwhile compatible kernel was found.
 
 ## Implementation progress
 
-### Workstream 1 (in progress)
+### Workstream 1
 
-MotionKernel:
+MotionKernel PR: https://github.com/RightNow-AI/autokernel/pull/15
 
 - `autokernel/workload/` — versioned workload schema (`schema_version: 1`),
   generation-result schema, end-to-end classification, and FastVideo launcher
@@ -428,8 +428,17 @@ MotionKernel:
 - `workload.py` CLI: `validate`, `show`, `validate-result`, `run-ab`.
 - CPU tests in `tests/test_workload.py`.
 
-FastVideo (paired PR):
+FastVideo PR: https://github.com/hao-ai-lab/FastVideo/pull/1668
 
 - `examples/inference/optimizations/generation_launcher.py` — model-agnostic
   launcher that loads a workload manifest, runs one mode per process, and
   writes structured result JSON.
+
+### Workstream 2 (in progress)
+
+MotionKernel:
+
+- `autokernel/discovery/` — metadata-only discovery report schema, stable graph
+  fingerprints, pure-tensor allowlist, collective/data-dependent rejection.
+- CPU tests in `tests/test_discovery.py`.
+- Next: torch.profiler + Dynamo capture adapters and FastVideo producer.
