@@ -245,11 +245,15 @@ For an unattended, resumable run, preparation and the agent loop are one
 command:
 
 ```bash
-uv run campaign.py run /path/to/wan-campaign.json --budget-hours 10
+uv run campaign.py run /path/to/wan-campaign.json --trust-specs --budget-hours 10
 ```
 
-Use `--dry-run` to inspect `workspace/overnight_prompt.md` without launching an
-agent, and `--resume` after an interrupted run. By default the runner invokes
+Like `prepare`, `run` refuses to load a campaign's Python spec locators
+without the explicit `--trust-specs` flag, because loading a spec executes the
+Python file it points at. Use `--dry-run` to inspect
+`workspace/overnight_prompt.md` without launching an agent, and `--resume`
+after an interrupted run. A non-`completed` terminal status is reported as
+`CAMPAIGN_RUN: FAIL` with a non-zero exit code. By default the runner invokes
 the Codex CLI; `--agent-command` supports trusted alternatives with `{repo}`
 and `{prompt_file}` placeholders. The next morning, inspect
 `workspace/morning_report.md`, the terminal receipt, agent log, and verified

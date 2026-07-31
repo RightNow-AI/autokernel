@@ -263,6 +263,7 @@ def run_campaign(
     budget_hours: float = 10.0,
     resume: bool = False,
     dry_run: bool = False,
+    trust_specs: bool = False,
     agent_command: Sequence[str] | None = None,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
@@ -281,7 +282,7 @@ def run_campaign(
         prepare_campaign(
             campaign,
             workspace,
-            trust_specs=True,
+            trust_specs=trust_specs,
             spec_root=root,
         )
 
@@ -334,25 +335,48 @@ def run_campaign(
     env["AUTOKERNEL_BUDGET_HOURS"] = str(budget_hours)
     timed_out = False
     returncode: int | None = None
+    launch_error: str | None = None
     with log_path.open("a", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=root,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
         try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.terminate()
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except OSError as exc:
+            launch_error = str(exc)
+            log.write(f"agent launch failed: {exc}\n")
+        else:
             try:
-                returncode = process.wait(timeout=30)
+                returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                process.kill()
-                returncode = process.wait()
+                timed_out = True
+                process.terminate()
+                try:
+                    returncode = process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    returncode = process.wait()
+
+    if launch_error is not None:
+        receipt.update(
+            {
+                "finished_at": _utc_now(),
+                "status": "agent_launch_failed",
+                "error": launch_error,
+                "agent_returncode": None,
+                "timed_out": False,
+            }
+        )
+        morning_report = _write_morning_report(
+            workspace, receipt, report_stdout=""
+        )
+        receipt["morning_report"] = str(morning_report)
+        _write_json_atomic(receipt_path, receipt)
+        return receipt
 
     report = subprocess.run(
         [sys.executable, "orchestrate.py", "report"],

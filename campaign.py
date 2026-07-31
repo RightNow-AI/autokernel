@@ -58,6 +58,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--resume", action="store_true")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument(
+        "--trust-specs",
+        action="store_true",
+        help="Allow loading Python spec locators from this campaign",
+    )
+    run.add_argument(
         "--agent-command",
         help=(
             "Alternative agent command; supports {repo} and {prompt_file} "
@@ -125,15 +130,19 @@ def main(argv: list[str] | None = None) -> int:
                 budget_hours=args.budget_hours,
                 resume=args.resume,
                 dry_run=args.dry_run,
+                trust_specs=args.trust_specs,
                 agent_command=command,
             )
         except CampaignError as exc:
             print(f"CAMPAIGN_RUN: FAIL\n{exc}", file=sys.stderr)
             return 2
-        print("CAMPAIGN_RUN: PASS")
+        verdict = (
+            "PASS" if receipt["status"] in ("prepared", "completed") else "FAIL"
+        )
+        print(f"CAMPAIGN_RUN: {verdict}")
         print(f"status: {receipt['status']}")
         print(f"receipt: {repo_root / 'workspace' / 'overnight_receipt.json'}")
-        return 0
+        return 0 if verdict == "PASS" else 1
 
     try:
         receipt = prepare_campaign(
