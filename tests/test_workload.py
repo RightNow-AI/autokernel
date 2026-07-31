@@ -260,3 +260,74 @@ def test_cli_validate(monkeypatch):
 
     assert main(["validate", str(WORKLOADS / "ltx_480p.yaml")]) == 0
     assert main(["show", str(WORKLOADS / "wan_t2v_1.3b_480p.yaml")]) == 0
+
+
+def test_read_state_rejects_corrupt_json(tmp_path):
+    from autokernel.workload.launcher import _read_state
+
+    path = tmp_path / "launcher_state.json"
+    path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(WorkloadError, match="invalid JSON"):
+        _read_state(path)
+
+
+def test_run_ab_rejects_unknown_modes(tmp_path, monkeypatch):
+    from autokernel.workload.launcher import run_ab
+
+    checkout = tmp_path / "FastVideo"
+    script = (
+        checkout
+        / "examples"
+        / "inference"
+        / "optimizations"
+        / "generation_launcher.py"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text("# stub\n", encoding="utf-8")
+    with pytest.raises(WorkloadError, match="unsupported launcher mode"):
+        run_ab(
+            fastvideo_checkout=checkout,
+            workload=WORKLOADS / "wan_t2v_1.3b_480p.yaml",
+            output_dir=tmp_path / "out",
+            modes=("native", "candidate"),
+        )
+
+
+def test_classify_end_to_end_zero_optimized_median():
+    from autokernel.workload.result import GenerationRunResult, classify_end_to_end
+
+    native = GenerationRunResult.from_dict(
+        {
+            "schema_version": 1,
+            "mode": "native",
+            "status": "ok",
+            "workload_id": "w",
+            "model_id": "m",
+            "request": {},
+            "warmups": 0,
+            "runs": 1,
+            "wall_seconds": [1.0],
+            "median_wall_seconds": 1.0,
+            "generation_seconds": [1.0],
+            "peak_memory_mb": [1.0],
+            "environment": {},
+        }
+    )
+    optimized = GenerationRunResult.from_dict(
+        {
+            "schema_version": 1,
+            "mode": "optimized",
+            "status": "ok",
+            "workload_id": "w",
+            "model_id": "m",
+            "request": {},
+            "warmups": 0,
+            "runs": 1,
+            "wall_seconds": [0.0],
+            "median_wall_seconds": 0.0,
+            "generation_seconds": [0.0],
+            "peak_memory_mb": [1.0],
+            "environment": {},
+        }
+    )
+    assert classify_end_to_end(native, optimized)["classification"] == "failed"

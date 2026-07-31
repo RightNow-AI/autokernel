@@ -12,7 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .types import WorkloadError, _finite_number, _mapping, _text
+from ._validate import (
+    fail,
+    finite_number,
+    mapping as _mapping_base,
+    non_negative_int as _non_negative_int_base,
+    optional_text as _optional_text_base,
+    positive_int as _positive_int_base,
+    text as _text_base,
+)
+from .types import WorkloadError
 
 RESULT_SCHEMA_VERSION = 1
 
@@ -40,30 +49,62 @@ _STATUSES = {"ok", "failed", "skipped"}
 _MODES = {"native", "optimized", "fused", "candidate"}
 
 
+def _kind() -> str:
+    return "generation result"
+
+
+def _text(value: Any, source: object, location: str) -> str:
+    try:
+        return _text_base(value, source, location, kind=_kind())
+    except Exception as exc:  # SchemaError subclass of ValueError
+        raise WorkloadError(str(exc)) from exc
+
+
 def _optional_text(
     value: Any, source: object, location: str
 ) -> str | None:
-    if value is None:
-        return None
-    return _text(value, source, location)
+    try:
+        return _optional_text_base(value, source, location, kind=_kind())
+    except Exception as exc:
+        raise WorkloadError(str(exc)) from exc
 
 
 def _non_negative_int(value: Any, source: object, location: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise WorkloadError(
-            f"generation result {source!r}: {location}: "
-            "must be a non-negative integer"
-        )
-    return value
+    try:
+        return _non_negative_int_base(value, source, location, kind=_kind())
+    except Exception as exc:
+        raise WorkloadError(str(exc)) from exc
 
 
 def _positive_int(value: Any, source: object, location: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise WorkloadError(
-            f"generation result {source!r}: {location}: "
-            "must be a positive integer"
+    try:
+        return _positive_int_base(value, source, location, kind=_kind())
+    except Exception as exc:
+        raise WorkloadError(str(exc)) from exc
+
+
+def _mapping(value: Any, source: object, location: str, *, non_empty: bool = False):
+    try:
+        return _mapping_base(
+            value, source, location, kind=_kind(), non_empty=non_empty
         )
-    return value
+    except Exception as exc:
+        raise WorkloadError(str(exc)) from exc
+
+
+def _finite_number(
+    value: Any,
+    source: object,
+    location: str,
+    *,
+    minimum: float | None = None,
+) -> float:
+    try:
+        return finite_number(
+            value, source, location, kind=_kind(), minimum=minimum
+        )
+    except Exception as exc:
+        raise WorkloadError(str(exc)) from exc
 
 
 def _number_list(
@@ -76,7 +117,10 @@ def _number_list(
     numbers: list[float] = []
     for index, item in enumerate(value):
         if item is None:
-            continue
+            raise WorkloadError(
+                f"generation result {source!r}: {location}[{index}]: "
+                "must be a finite non-negative number (None not allowed)"
+            )
         numbers.append(
             _finite_number(
                 item,
@@ -303,10 +347,11 @@ def classify_end_to_end(
         native.median_wall_seconds is None
         or optimized.median_wall_seconds is None
         or native.median_wall_seconds <= 0
+        or optimized.median_wall_seconds <= 0
     ):
         return {
             "classification": "failed",
-            "reason": "missing median wall times",
+            "reason": "missing or non-positive median wall times",
         }
 
     speedup = native.median_wall_seconds / optimized.median_wall_seconds

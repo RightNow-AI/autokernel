@@ -14,14 +14,14 @@ without adding LTX-specific fusion calls to its FastVideo implementation.
 
 ## Repositories
 
-- MotionKernel: `/Users/aryank/Fast video1/autokernel`
-- FastVideo: `/Users/aryank/Fast video1/FastVideo-main`
+- MotionKernel: `<motionkernel-checkout>` (this repository)
+- FastVideo: `<fastvideo-checkout>`
 - Existing FastVideo guide:
-  `/Users/aryank/Fast video1/FastVideo-main/docs/contributing/kernel_optimization.md`
+  `<fastvideo-checkout>/docs/contributing/kernel_optimization.md`
 - Existing Wan measurement script:
-  `/Users/aryank/Fast video1/FastVideo-main/examples/inference/optimizations/wan_fusions_ab.py`
+  `<fastvideo-checkout>/examples/inference/optimizations/wan_fusions_ab.py`
 - Existing Wan results:
-  `/Users/aryank/Fast video1/autokernel/docs/WAN_KERNEL_RESULTS.md`
+  `docs/WAN_KERNEL_RESULTS.md`
 
 Before editing either repository, read its `AGENTS.md`, inspect the current
 branches and open PRs, and synchronize with the repository's main branch

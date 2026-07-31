@@ -50,13 +50,34 @@ def _paths(output_dir: str | Path) -> LauncherPaths:
 
 
 def _read_state(path: Path) -> dict[str, Any]:
+    fresh: dict[str, Any] = {
+        "schema_version": 1,
+        "completed_stages": [],
+        "failed_stages": {},
+    }
     if not path.is_file():
-        return {
-            "schema_version": 1,
-            "completed_stages": [],
-            "failed_stages": {},
-        }
-    return json.loads(path.read_text(encoding="utf-8"))
+        return fresh
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise WorkloadError(
+            f"launcher state {path!s}: invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        raise WorkloadError(
+            f"launcher state {path!s}: unsupported or malformed state; "
+            "delete the file or run with resume disabled"
+        )
+    merged = {**fresh, **state}
+    if not isinstance(merged.get("completed_stages"), list):
+        raise WorkloadError(
+            f"launcher state {path!s}: completed_stages must be a list"
+        )
+    if not isinstance(merged.get("failed_stages"), dict):
+        raise WorkloadError(
+            f"launcher state {path!s}: failed_stages must be an object"
+        )
+    return merged
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
@@ -191,6 +212,13 @@ def run_ab(
     """Run native and optimized modes with resume-friendly stage tracking."""
     paths = _paths(output_dir)
     paths.output_dir.mkdir(parents=True, exist_ok=True)
+    allowed_modes = {"native", "optimized"}
+    unknown = [mode for mode in modes if mode not in allowed_modes]
+    if unknown:
+        raise WorkloadError(
+            f"unsupported launcher mode(s) {sorted(unknown)}; "
+            "expected 'native' and/or 'optimized'"
+        )
     manifest = load_workload(workload)
     state = _read_state(paths.state_path) if resume else {
         "schema_version": 1,
@@ -214,6 +242,9 @@ def run_ab(
             results[mode] = load_generation_result(result_path)
             continue
 
+        mode_env = {}
+        if manifest.mode_env is not None:
+            mode_env = manifest.mode_env.for_mode(mode)
         try:
             run_mode(
                 fastvideo_checkout=fastvideo_checkout,
@@ -223,6 +254,7 @@ def run_ab(
                 python=python,
                 launcher_script=launcher_script,
                 model_override=model_override,
+                env=mode_env or None,
                 check=True,
             )
             # Launcher may write mode-specific names.
