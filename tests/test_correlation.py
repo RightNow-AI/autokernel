@@ -576,6 +576,7 @@ def test_exact_region_range_disambiguates_shared_operation():
     target = next(region for region in correlated if region.name == "blocks.89abcdef")
     other = next(region for region in correlated if region.name == "blocks.01234567")
     assert target.cuda_time_us == 800.0
+    assert target.self_cuda_time_us == 800.0
     assert target.attributes["matched_profiler_rows"] == 1
     assert other.cuda_time_us == 0.0
 

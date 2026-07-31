@@ -146,9 +146,18 @@ def _aggregate_region_timing(
     if not profiler_rows:
         return region.cuda_time_us, region.self_cuda_time_us, region.calls
 
-    # Sum exclusive times to avoid double-counting
+    # A shape-specific record_function range names the region itself. PyTorch
+    # reports its useful device attribution as inclusive CUDA time while its
+    # self CUDA time is normally zero (the range launches no kernel directly).
+    # Treat that inclusive duration as the region's attributed duration. This
+    # is safe per candidate; callers must not sum nested candidate shares.
+    attributed_self = [
+        row.cuda_time_us if row.name == region.name else row.self_cuda_time_us
+        for row in profiler_rows
+    ]
+
     total_cuda = sum(row.cuda_time_us for row in profiler_rows)
-    total_self_cuda = sum(row.self_cuda_time_us for row in profiler_rows)
+    total_self_cuda = sum(attributed_self)
     total_calls = sum(row.calls for row in profiler_rows)
 
     # Fall back to region's own timing if no profiler data
