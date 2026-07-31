@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "operation": "wan_modulated_layer_norm",
+  "cases": [
+    {
+      "name": "wan2.1-1.3b-480p-49f",
+      "size": {"batch": 1, "tokens": 20280, "hidden": 1536},
+      "dtype": "bfloat16",
+      "weight": 40,
+      "tags": ["wan2.1", "1.3b", "480p", "single-gpu"]
+    },
+    {
+      "name": "wan2.1-1.3b-480p-81f",
+      "size": {"batch": 1, "tokens": 32760, "hidden": 1536},
+      "dtype": "bfloat16",
+      "weight": 40,
+      "tags": ["wan2.1", "1.3b", "480p", "single-gpu"]
+    },
+    {
+      "name": "wan2.1-14b-480p-49f",
+      "size": {"batch": 1, "tokens": 20280, "hidden": 5120},
+      "dtype": "bfloat16",
+      "weight": 40,
+      "tags": ["wan2.1", "14b", "480p", "single-gpu"]
+    },
+    {
+      "name": "wan2.1-14b-480p-49f-sp4",
+      "size": {"batch": 1, "tokens": 5070, "hidden": 5120},
+      "dtype": "bfloat16",
+      "weight": 40,
+      "tags": ["wan2.1", "14b", "480p", "sequence-parallel-4"]
+    },
+    {
+      "name": "wan2.1-14b-480p-81f-sp4",
+      "size": {"batch": 1, "tokens": 8190, "hidden": 5120},
+      "dtype": "bfloat16",
+      "weight": 40,
+      "tags": ["wan2.1", "14b", "480p", "sequence-parallel-4"]
+    }
+  ]
+}

@@ -12,8 +12,10 @@ from autokernel.campaign import (
     CampaignError,
     OptimizationCampaign,
     load_campaign,
+    parse_agent_command,
     prepare_campaign,
     rank_targets,
+    run_campaign,
     write_optimization_plan,
 )
 
@@ -172,3 +174,146 @@ def test_prepare_materializes_starter_and_receipt(
     assert receipt["status"] == "prepared"
     assert (output / "optimization_plan.json").is_file()
     assert (output / "campaign_receipt.json").is_file()
+
+
+def _single_wan_target(fixtures_dir) -> OptimizationCampaign:
+    payload = json.loads(
+        (fixtures_dir / "wan_campaign.json").read_text(encoding="utf-8")
+    )
+    payload["targets"] = payload["targets"][:1]
+    return OptimizationCampaign.from_dict(payload, source="test-campaign")
+
+
+def test_overnight_dry_run_is_cwd_independent(
+    repo_root, fixtures_dir, tmp_path, monkeypatch
+):
+    campaign = _single_wan_target(fixtures_dir)
+    monkeypatch.chdir(tmp_path)
+    receipt = run_campaign(
+        campaign,
+        repo_root=repo_root,
+        budget_hours=0.25,
+        dry_run=True,
+        trust_specs=True,
+    )
+    assert receipt["status"] == "prepared"
+    prompt = (repo_root / "workspace" / "overnight_prompt.md").read_text(
+        encoding="utf-8"
+    )
+    assert "--spec models/wan_gated_residual_norm.py:SPEC" in prompt
+    assert (
+        "--shape-corpus models/wan_gated_residual_norm_corpus.json"
+        in prompt
+    )
+
+
+def test_parse_agent_command_substitutes_embedded_placeholders(tmp_path):
+    command = parse_agent_command(
+        "agent --repo={repo} --prompt={prompt_file}",
+        repo_root=tmp_path,
+        prompt_path=tmp_path / "prompt.md",
+    )
+    assert command == [
+        "agent",
+        f"--repo={tmp_path}",
+        f"--prompt={tmp_path / 'prompt.md'}",
+    ]
+
+
+def test_overnight_runner_writes_terminal_morning_report(
+    repo_root, fixtures_dir
+):
+    campaign = _single_wan_target(fixtures_dir)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import subprocess,sys;"
+            "subprocess.run([sys.executable,'orchestrate.py','next'],"
+            "check=True)"
+        ),
+    ]
+    receipt = run_campaign(
+        campaign,
+        repo_root=repo_root,
+        budget_hours=0.25,
+        trust_specs=True,
+        agent_command=command,
+        timeout_seconds=10,
+    )
+    assert receipt["status"] == "incomplete"
+    assert receipt["progress"]["completed_targets"] == 0
+    report = repo_root / "workspace" / "morning_report.md"
+    assert report.is_file()
+    assert "wan_gated_residual_norm" in report.read_text(encoding="utf-8")
+
+
+def test_overnight_runner_requires_explicit_spec_trust(
+    repo_root, fixtures_dir
+):
+    campaign = _single_wan_target(fixtures_dir)
+    with pytest.raises(CampaignError, match="trust"):
+        run_campaign(
+            campaign,
+            repo_root=repo_root,
+            budget_hours=0.25,
+            dry_run=True,
+        )
+
+
+def test_overnight_runner_records_agent_launch_failure(
+    repo_root, fixtures_dir, tmp_path
+):
+    campaign = _single_wan_target(fixtures_dir)
+    missing = tmp_path / "no_such_agent_binary"
+    receipt = run_campaign(
+        campaign,
+        repo_root=repo_root,
+        budget_hours=0.25,
+        trust_specs=True,
+        agent_command=[str(missing)],
+        timeout_seconds=10,
+    )
+    assert receipt["status"] == "agent_launch_failed"
+    assert receipt["error"]
+    assert receipt["finished_at"]
+    persisted = json.loads(
+        (repo_root / "workspace" / "overnight_receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted["status"] == "agent_launch_failed"
+    assert (repo_root / "workspace" / "morning_report.md").is_file()
+
+
+def test_run_cli_maps_failure_statuses_to_nonzero_exit(
+    repo_root, fixtures_dir, tmp_path, capsys
+):
+    import campaign as campaign_cli
+
+    source = fixtures_dir / "wan_campaign.json"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["targets"] = payload["targets"][:1]
+    campaign_file = tmp_path / "campaign.json"
+    campaign_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    exit_code = campaign_cli.main(
+        [
+            "run",
+            str(campaign_file),
+            "--trust-specs",
+            "--agent-command",
+            str(tmp_path / "no_such_agent_binary"),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "CAMPAIGN_RUN: FAIL" in captured.out
+    assert "status: agent_launch_failed" in captured.out
+
+    exit_code = campaign_cli.main(
+        ["run", str(campaign_file), "--trust-specs", "--dry-run"]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "CAMPAIGN_RUN: PASS" in captured.out
