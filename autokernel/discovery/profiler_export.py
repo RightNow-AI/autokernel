@@ -21,7 +21,17 @@ _EXPORT_FIELDS = {
     "environment",
     "total_cuda_time_us",
     "rows",
+    # Optional FX capture block, present only when the producer ran graph
+    # capture alongside the timing profile. Older exports omit all four.
+    "capture",
+    "regions",
+    "graph_breaks",
+    "unsupported",
 }
+
+# Capture-block format the loader understands. Independent of the export's
+# schema_version so a capture change does not invalidate timing-only readers.
+SUPPORTED_CAPTURE_SCHEMA_VERSION = 1
 
 
 def _fail(source: object, location: str, message: str) -> DiscoveryError:
@@ -75,6 +85,33 @@ def profiler_export_to_report(
     if total is None:
         total = sum(max(item.self_cuda_time_us, 0.0) for item in operators)
 
+    capture = raw.get("capture")
+    if capture is not None:
+        capture = _mapping(
+            capture,
+            source=source,
+            location="capture",
+            non_empty=True,
+        )
+        version = capture.get("capture_schema_version")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise _fail(source, "capture.capture_schema_version", "must be an integer")
+        if version != SUPPORTED_CAPTURE_SCHEMA_VERSION:
+            raise _fail(
+                source,
+                "capture.capture_schema_version",
+                f"unsupported version {version}; "
+                f"expected {SUPPORTED_CAPTURE_SCHEMA_VERSION}",
+            )
+
+    def _list(name: str) -> list[Any]:
+        value = raw.get(name, [])
+        if value is None:
+            return []
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            raise _fail(source, name, "must be a list")
+        return list(value)
+
     payload = {
         "schema_version": DISCOVERY_SCHEMA_VERSION,
         "producer": dict(
@@ -109,9 +146,9 @@ def profiler_export_to_report(
             }
             for item in operators
         ],
-        "regions": [],
-        "graph_breaks": [],
-        "unsupported": [],
+        "regions": _list("regions"),
+        "graph_breaks": _list("graph_breaks"),
+        "unsupported": _list("unsupported"),
     }
     return DiscoveryReport.from_dict(payload, source=source)
 

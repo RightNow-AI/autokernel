@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from autokernel.discovery.fingerprint import graph_fingerprint
 from autokernel.discovery import (
     DEFAULT_IMPACT_FLOOR,
     GraphRegion,
@@ -286,4 +287,119 @@ def test_profiler_export_rejects_nested_secret_metadata():
         ],
     }
     with pytest.raises(ValueError, match="forbidden"):
+        profiler_export_to_report(export)
+
+
+def _capture_export(**overrides):
+    """A FastVideo-shaped export that also carries the optional FX capture block."""
+    inputs = [
+        {
+            "name": "input_0",
+            "shape": [2, 4],
+            "stride": [4, 1],
+            "dtype": "float32",
+            "device_type": "cpu",
+            "requires_grad": False,
+        }
+    ]
+    operations = ["aten::mul", "aten::silu", "aten::add"]
+    fingerprint = graph_fingerprint(
+        operations=operations,
+        input_signatures=[
+            {k: v for k, v in inputs[0].items() if k != "name"}
+        ],
+        output_signatures=[],
+        safe_constants={},
+        parent_module="transformer.blocks",
+    )
+    export = {
+        "schema_version": 1,
+        "producer": {"name": "fastvideo", "version": "1"},
+        "workload": {"workload_id": "unit", "model_id": "any-dit"},
+        "environment": {"torch": "2.x", "gpu_name": "unit"},
+        "total_cuda_time_us": 90.0,
+        "rows": [
+            {
+                "name": "aten::mul",
+                "calls": 4,
+                "cuda_time_us": 90.0,
+                "self_cuda_time_us": 90.0,
+                "cpu_time_us": 5.0,
+            }
+        ],
+        "capture": {
+            "capture_schema_version": 1,
+            "tracer": "symbolic",
+            "scopes": ["transformer.blocks"],
+            "errors": [],
+        },
+        "regions": [
+            {
+                "name": "transformer.blocks.7dff7ade",
+                "fingerprint": fingerprint,
+                "operations": operations,
+                "dependencies": ["0->1", "1->2"],
+                "inputs": inputs,
+                "outputs": [],
+                "cuda_time_us": 0.0,
+                "self_cuda_time_us": 0.0,
+                "calls": 120,
+                "rejection_reasons": [],
+                "shape_frequency": {"input_0:2x4:float32": 120},
+                "parent_module": "transformer.blocks",
+            }
+        ],
+        "graph_breaks": [
+            {"scope": "transformer.blocks", "reason": "empty_graph", "count": 2}
+        ],
+        "unsupported": [
+            {
+                "op_name": "module::attn",
+                "reason": "module::attn: nested module not expanded",
+                "count": 1,
+                "scope": "transformer.blocks",
+            }
+        ],
+    }
+    export.update(overrides)
+    return export
+
+
+def test_profiler_export_ingests_optional_fx_capture_block():
+    report = profiler_export_to_report(_capture_export())
+
+    assert len(report.operators) == 1
+    assert len(report.regions) == 1
+    region = report.regions[0]
+    assert region.parent_module == "transformer.blocks"
+    assert region.operations == ("aten::mul", "aten::silu", "aten::add")
+    assert region.calls == 120
+    assert dict(region.shape_frequency) == {"input_0:2x4:float32": 120}
+    assert [item.reason for item in report.graph_breaks] == ["empty_graph"]
+    assert report.unsupported[0].op_name == "module::attn"
+
+
+def test_profiler_export_without_capture_still_loads():
+    export = _capture_export()
+    for key in ("capture", "regions", "graph_breaks", "unsupported"):
+        export.pop(key)
+
+    report = profiler_export_to_report(export)
+    assert report.regions == ()
+    assert report.graph_breaks == ()
+
+
+def test_profiler_export_rejects_unknown_capture_schema_version():
+    export = _capture_export()
+    export["capture"] = {"capture_schema_version": 2}
+
+    with pytest.raises(ValueError, match="capture_schema_version"):
+        profiler_export_to_report(export)
+
+
+def test_profiler_export_rejects_tampered_region_fingerprint():
+    export = _capture_export()
+    export["regions"][0]["fingerprint"] = "0" * 32
+
+    with pytest.raises(ValueError, match="fingerprint"):
         profiler_export_to_report(export)

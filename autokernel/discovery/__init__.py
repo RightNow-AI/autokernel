@@ -1,5 +1,9 @@
 """Universal profiling and graph-region discovery contracts."""
 
+from .correlation import (
+    correlate_discovery_report,
+    correlate_profiler_to_regions,
+)
 from .fingerprint import fingerprint_payload, graph_fingerprint
 from .fx_capture import (
     CaptureResult,
@@ -57,6 +61,8 @@ __all__ = [
     "capture_model_regions",
     "capture_module_region",
     "classify_pattern_family",
+    "correlate_discovery_report",
+    "correlate_profiler_to_regions",
     "fingerprint_payload",
     "graph_fingerprint",
     "is_region_safe",
