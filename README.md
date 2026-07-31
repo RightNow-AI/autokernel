@@ -31,10 +31,17 @@ verification, and reproducible JSON result artifacts are implemented.
 
 The first video-specific pack covers three Wan boundaries: modulated
 pre-attention LayerNorm, post-attention gated residual plus LayerNorm, and the
-post-MLP gated residual. The post-attention fusion has been validated across
-its production shape corpus on an NVIDIA GB200; the other two are ready for
-the same GPU campaign. Complete model packs still require end-to-end benchmark
+post-MLP gated residual. All three have been validated across their
+production shape corpora on an NVIDIA GB200 (see
+[docs/WAN_KERNEL_RESULTS.md](docs/WAN_KERNEL_RESULTS.md)). These are isolated
+operator results; complete model packs still require end-to-end benchmark
 publication before support is claimed.
+
+A model-independent discovery foundation is also in place: declarative
+FastVideo workload manifests, a resumable native-versus-optimized launcher
+bridge, metadata-only profiler ingestion, CPU FX graph capture with stable
+fingerprints, and impact ranking with an end-to-end floor. Graph-derived
+spec generation and generic artifact dispatch are the next stages.
 
 MotionKernel currently retains the `autokernel` Python import namespace for
 compatibility with the upstream project. The import namespace will only move
@@ -259,6 +266,49 @@ and `{prompt_file}` placeholders. The next morning, inspect
 `workspace/morning_report.md`, the terminal receipt, agent log, and verified
 `kernel_<operation>_<rank>_optimized.py` artifacts in the same directory.
 
+## Workloads and Discovery
+
+The universal optimization path starts from a declarative workload manifest
+instead of model-specific scripts. A manifest in `workloads/` describes one
+reproducible FastVideo generation benchmark: model identifier, task and
+prompt reference, resolution, frame count, inference steps, seed, dtype,
+warmup and measured repetitions, and the output-parity policy. Canonical
+manifests exist for Wan 2.1 T2V 1.3B 480p and LTX 480p.
+
+```bash
+# validate and inspect a manifest
+uv run workload.py validate workloads/wan_t2v_1.3b_480p.yaml
+uv run workload.py show workloads/wan_t2v_1.3b_480p.yaml
+
+# run a resumable native-versus-optimized A/B through a FastVideo checkout
+uv run workload.py run-ab --fastvideo-checkout /path/to/FastVideo \
+  --workload workloads/wan_t2v_1.3b_480p.yaml --output workspace/wan_ab
+
+# validate a structured generation result
+uv run workload.py validate-result workspace/wan_ab/native_result.json
+```
+
+Discovery reports are metadata-only records of where a profiled generation
+actually spends time: profiler operator rows, captured FX graph regions with
+stable fingerprints, graph breaks, and unsupported operations. They never
+contain prompts, weights, activations, tensor values, or model outputs.
+
+```bash
+# convert a FastVideo profiler export into a discovery report
+uv run discovery.py ingest-profiler workspace/profiler_export.json \
+  --output workspace/discovery_report.json
+
+# validate and rank candidate regions by optimistic end-to-end impact
+uv run discovery.py validate workspace/discovery_report.json
+uv run discovery.py rank workspace/discovery_report.json --impact-floor 0.005
+```
+
+Ranking uses measured production frequency and an Amdahl-style ceiling: a
+candidate is only worth searching when its optimistic end-to-end improvement
+clears the impact floor (0.5% by default). Regions with mutation, collectives,
+data-dependent control flow, or unknown aliasing are rejected fail-closed
+before they can enter the search pipeline.
+
 ## Generalized Verification
 
 The harness compares complete output trees, including nested tensors and metadata. An
@@ -376,6 +426,16 @@ motionkernel/
 
   autokernel/specs/     KernelSpec types, registry, external spec loader,
                         built-in operation metadata, input generators
+  autokernel/campaign/  campaign contract, ranking, overnight runner
+  autokernel/workload/  workload manifest schema, FastVideo launcher bridge,
+                        structured generation results and parity checks
+  autokernel/discovery/ discovery report schema, FX capture, profiler
+                        ingestion, timing correlation, impact ranking
+
+  campaign.py           validate, rank, prepare, and run campaigns
+  workload.py           validate and A/B-run FastVideo workload manifests
+  discovery.py          validate, ingest, and rank discovery reports
+  workloads/            canonical workload manifests (Wan, LTX)
 
   profile.py            profile any PyTorch model, rank kernels by GPU time
   extract.py            extract bottleneck kernels into workspace/

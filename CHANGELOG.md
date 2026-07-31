@@ -2,6 +2,23 @@
 
 ## Unreleased (downstream)
 
+### Universal workload and discovery foundation
+
+- Added versioned, metadata-only FastVideo workload manifests under
+  `workloads/` (Wan 2.1 T2V 1.3B 480p and LTX 480p), a resume-safe
+  native-versus-optimized launcher bridge, structured generation results with
+  full-frame parity enforcement, and the `workload.py` CLI
+  (`validate`, `show`, `run-ab`, `validate-result`)
+- Added the discovery layer under `autokernel/discovery/`: metadata-only
+  discovery report schema with stable graph fingerprints, fail-closed
+  pure-tensor safety checks, model-independent CPU FX region capture,
+  profiler-export ingestion, profiler-to-region timing correlation, and
+  Amdahl-style impact ranking with a configurable end-to-end floor through
+  the `discovery.py` CLI (`validate`, `rank`, `ingest-profiler`)
+- Profiled Wan 2.1 T2V 1.3B and LTX-2 distilled T2V generations on GB200
+  through the model-agnostic path and ingested both into validated, ranked
+  discovery reports
+
 ### Model optimization campaigns
 
 - Added a versioned, metadata-only campaign contract with strict validation,
