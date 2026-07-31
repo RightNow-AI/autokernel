@@ -346,9 +346,10 @@ class OperatorHotspot:
         )
 
     def impact_pct(self, total_cuda_time_us: float) -> float:
+        """Return this operator's exclusive share of measured CUDA time."""
         if total_cuda_time_us <= 0:
             return 0.0
-        return 100.0 * self.cuda_time_us / total_cuda_time_us
+        return 100.0 * self.self_cuda_time_us / total_cuda_time_us
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -793,7 +794,7 @@ class DiscoveryReport:
         return tuple(
             sorted(
                 self.operators,
-                key=lambda op: (-op.cuda_time_us, -op.calls, op.name),
+                key=lambda op: (-op.self_cuda_time_us, -op.calls, op.name),
             )
         )
 

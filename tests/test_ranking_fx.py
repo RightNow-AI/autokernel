@@ -11,6 +11,7 @@ import torch.nn as nn
 from autokernel.discovery import (
     DEFAULT_IMPACT_FLOOR,
     GraphRegion,
+    OperatorHotspot,
     TensorMeta,
     capture_callable_region,
     capture_module_region,
@@ -18,6 +19,7 @@ from autokernel.discovery import (
     optimistic_e2e_improvement,
     parse_key_averages_rows,
     profiler_export_to_report,
+    rank_operators,
     rank_regions,
 )
 
@@ -229,6 +231,39 @@ def test_profiler_export_ingestion_and_cli(tmp_path):
     )
     loaded = load_discovery_report(output)
     assert len(loaded.operators) == 2
+
+
+def test_operator_ranking_uses_self_cuda_time():
+    nested_scope = OperatorHotspot(
+        name="attention_scope",
+        op_key="attention_scope",
+        calls=1,
+        cuda_time_us=100.0,
+        self_cuda_time_us=1.0,
+        cpu_time_us=0.0,
+        input_shapes=(),
+        parent_module=None,
+        source="torch_profiler",
+    )
+    kernel = OperatorHotspot(
+        name="attention_kernel",
+        op_key="attention_kernel",
+        calls=1,
+        cuda_time_us=80.0,
+        self_cuda_time_us=80.0,
+        cpu_time_us=0.0,
+        input_shapes=(),
+        parent_module=None,
+        source="torch_profiler",
+    )
+
+    ranked = rank_operators(
+        [nested_scope, kernel],
+        total_cuda_time_us=100.0,
+    )
+
+    assert ranked[0] == (kernel, pytest.approx(0.8))
+    assert ranked[1] == (nested_scope, pytest.approx(0.01))
 
 
 def test_profiler_export_rejects_nested_secret_metadata():

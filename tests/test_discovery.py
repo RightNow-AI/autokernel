@@ -108,7 +108,7 @@ def test_graph_region_build_and_report_roundtrip(tmp_path):
     )
     ranked = report.ranked_operators()
     assert ranked[0].op_key == "aten::mm"
-    assert ranked[0].impact_pct(report.total_cuda_time_us) == pytest.approx(60.0)
+    assert ranked[0].impact_pct(report.total_cuda_time_us) == pytest.approx(59.0)
     assert report.graph_breaks[0].reason.startswith("data-dependent")
 
     path = tmp_path / "discovery.json"

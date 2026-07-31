@@ -168,9 +168,16 @@ def rank_operators(
     *,
     total_cuda_time_us: float,
 ) -> tuple[tuple[OperatorHotspot, float], ...]:
-    """Return operators sorted by e2e share (descending)."""
+    """Return operators sorted by self CUDA e2e share (descending).
+
+    ``cuda_time_us`` is inclusive in torch profiler exports, so ranking with it
+    counts the same device work once for every enclosing record_function or
+    custom-op scope. ``total_cuda_time_us`` is the sum of self CUDA time and
+    operator shares must use the same accounting basis.
+    """
     rows = [
-        (op, e2e_share(op.cuda_time_us, total_cuda_time_us)) for op in operators
+        (op, e2e_share(op.self_cuda_time_us, total_cuda_time_us))
+        for op in operators
     ]
     rows.sort(key=lambda item: (-item[1], -item[0].calls, item[0].name))
     return tuple(rows)

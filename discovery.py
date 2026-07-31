@@ -89,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
                     "op_key": op.op_key,
                     "share_of_e2e": share,
                     "cuda_time_us": op.cuda_time_us,
+                    "self_cuda_time_us": op.self_cuda_time_us,
                     "calls": op.calls,
                 }
                 for op, share in ops
