@@ -537,3 +537,87 @@ def test_hierarchical_parent_module_matching():
     # Should still match due to hierarchical relationship
     assert len(correlated) == 1
     assert correlated[0].attributes["matched_profiler_rows"] == 1
+
+
+def test_exact_region_range_disambiguates_shared_operation():
+    profiler_rows = [
+        OperatorHotspot(
+            name="blocks.89abcdef",
+            op_key="blocks.89abcdef",
+            calls=12,
+            cuda_time_us=800.0,
+            self_cuda_time_us=50.0,
+            parent_module="blocks",
+        ),
+    ]
+    fx_regions = [
+        GraphRegion.build(
+            name="blocks.01234567",
+            operations=["aten::mul"],
+            inputs=[_tensor("x", (2, 128))],
+            parent_module="blocks",
+            calls=12,
+        ),
+        GraphRegion.build(
+            name="blocks.89abcdef",
+            operations=["aten::mul"],
+            inputs=[_tensor("x", (8, 128))],
+            parent_module="blocks",
+            calls=12,
+        ),
+    ]
+
+    correlated = correlate_profiler_to_regions(
+        profiler_rows,
+        fx_regions,
+        total_cuda_time_us=1000.0,
+    )
+
+    target = next(region for region in correlated if region.name == "blocks.89abcdef")
+    other = next(region for region in correlated if region.name == "blocks.01234567")
+    assert target.cuda_time_us == 800.0
+    assert target.attributes["matched_profiler_rows"] == 1
+    assert other.cuda_time_us == 0.0
+
+
+def test_ambiguous_op_only_row_remains_unmatched():
+    profiler_rows = [
+        OperatorHotspot(
+            name="aten::mul",
+            op_key="aten::mul",
+            calls=100,
+            cuda_time_us=900.0,
+            self_cuda_time_us=900.0,
+        ),
+    ]
+    fx_regions = [
+        GraphRegion.build(
+            name="first",
+            operations=["aten::mul"],
+            inputs=[_tensor("x", (2, 128))],
+            parent_module="blocks",
+        ),
+        GraphRegion.build(
+            name="second",
+            operations=["aten::mul"],
+            inputs=[_tensor("x", (8, 128))],
+            parent_module="blocks",
+        ),
+    ]
+
+    correlated = correlate_profiler_to_regions(
+        profiler_rows,
+        fx_regions,
+        total_cuda_time_us=1000.0,
+    )
+
+    assert all(
+        region.cuda_time_us == 0.0
+        for region in correlated
+        if region.name != "unmatched_profiler_rows"
+    )
+    unmatched = next(
+        region for region in correlated
+        if region.name == "unmatched_profiler_rows"
+    )
+    assert unmatched.attributes["unmatched_row_count"] == 1

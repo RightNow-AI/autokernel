@@ -58,6 +58,17 @@ def _match_scope_to_region(
 
     Returns None if no reasonable match is found.
     """
+    # Shape-specific record_function ranges exported by FastVideo carry the
+    # captured region name verbatim. Prefer this identity over broader module
+    # or operation heuristics.
+    if profiler_row.name == region.name:
+        return ScopeMatch(
+            profiler_row=profiler_row,
+            region=region,
+            confidence=1.0,
+            match_reason="exact_region_name",
+        )
+
     # Strategy 1: Exact parent_module match
     if profiler_row.parent_module and region.parent_module:
         if profiler_row.parent_module == region.parent_module:
@@ -204,17 +215,28 @@ def correlate_profiler_to_regions(
     unmatched_rows: list[OperatorHotspot] = []
 
     for row in profiler_rows:
-        best_match: ScopeMatch | None = None
-        best_confidence = 0.0
+        candidates: list[ScopeMatch] = []
 
         # Try to match against each region group (use first region as representative)
-        for fingerprint, accumulator in fingerprint_groups.items():
+        for accumulator in fingerprint_groups.values():
             match = _match_scope_to_region(row, accumulator.base_region)
-            if match and match.confidence > best_confidence:
-                best_match = match
-                best_confidence = match.confidence
+            if match:
+                candidates.append(match)
 
-        if best_match:
+        best_match: ScopeMatch | None = None
+        if candidates:
+            best_confidence = max(match.confidence for match in candidates)
+            strongest = [
+                match for match in candidates
+                if match.confidence == best_confidence
+            ]
+            # Never assign an aggregate operator row arbitrarily when the same
+            # op occurs in several captured regions. A shape-specific scope
+            # range or other unique match is required for trustworthy timing.
+            if len(strongest) == 1:
+                best_match = strongest[0]
+
+        if best_match is not None:
             matched_regions[best_match.region.fingerprint].append(best_match)
         else:
             unmatched_rows.append(row)
