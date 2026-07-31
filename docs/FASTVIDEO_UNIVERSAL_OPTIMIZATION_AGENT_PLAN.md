@@ -418,7 +418,7 @@ worthwhile compatible kernel was found.
 
 ### Workstream 1
 
-MotionKernel PR: https://github.com/RightNow-AI/autokernel/pull/15
+MotionKernel PR: https://github.com/aryan5v/motionkernel/pull/9
 
 - `autokernel/workload/` — versioned workload schema (`schema_version: 1`),
   generation-result schema, end-to-end classification, and FastVideo launcher
@@ -428,7 +428,7 @@ MotionKernel PR: https://github.com/RightNow-AI/autokernel/pull/15
 - `workload.py` CLI: `validate`, `show`, `validate-result`, `run-ab`.
 - CPU tests in `tests/test_workload.py`.
 
-FastVideo PR: https://github.com/hao-ai-lab/FastVideo/pull/1668
+FastVideo PR: https://github.com/aryan5v/FastVideo/pull/18
 
 - `examples/inference/optimizations/generation_launcher.py` — model-agnostic
   launcher that loads a workload manifest, runs one mode per process, and
@@ -441,6 +441,19 @@ MotionKernel:
 - `autokernel/discovery/` — metadata-only discovery report schema, stable graph
   fingerprints, pure-tensor allowlist, collective/data-dependent rejection.
 - CPU tests in `tests/test_discovery.py`.
-- `ranking.py`, `fx_capture.py`, `profiler_parse.py` — impact floor ranking,
-  CPU FX region capture, profiler table parse (CUDA times still need GPU).
-- Next GPU wall: end-to-end torch.profiler on Wan/LTX generation.
+- `ranking.py`, `fx_capture.py`, `profiler_parse.py`, and
+  `profiler_export.py` — impact-floor ranking, CPU FX region capture,
+  metadata-only profiler ingestion, and exclusive CUDA-time accounting.
+- FastVideo collects a dedicated post-warmup `torch.profiler` pass inside the
+  GPU worker without contaminating clean A/B timing samples.
+- Wan 2.1 T2V 1.3B GPU profiling and MotionKernel ingestion completed on a
+  GB200. The clean 480x832, 49-frame, four-step generation median was 4.4069s;
+  attention and copy/cast traffic dominated the captured operator data.
+- LTX-2 distilled T2V GPU profiling and MotionKernel ingestion also completed
+  on the same model-agnostic path: 480x768, 97 frames, eight steps, 4.6913s
+  clean median wall time, 67,802.22 MiB peak allocated CUDA memory, and 3,071
+  CPU-side operator rows representing 2.771s of exclusive CUDA time. The
+  producer excluded all duplicate raw CUDA activity rows.
+- Next framework wall: automatically capture executable module/FX regions and
+  correlate them with measured profiler hotspots. Operator ranking alone does
+  not yet produce a searchable generated `KernelSpec`.
