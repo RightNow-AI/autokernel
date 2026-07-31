@@ -352,6 +352,36 @@ def correlate_discovery_report(
         fx_discovery_report.regions,
         total_cuda_time_us=fx_discovery_report.total_cuda_time_us,
     )
+    unmatched = next(
+        (
+            region
+            for region in populated_regions
+            if region.name == "unmatched_profiler_rows"
+        ),
+        None,
+    )
+    searchable_regions = tuple(
+        region
+        for region in populated_regions
+        if region.name != "unmatched_profiler_rows"
+    )
+    unsupported = [
+        item.as_dict() for item in fx_discovery_report.unsupported
+    ]
+    if unmatched is not None:
+        attributes = unmatched.attributes or {}
+        unmatched_count = int(attributes.get("unmatched_row_count", 0))
+        unsupported.append(
+            {
+                "op_name": "profiler::unmatched",
+                "reason": (
+                    f"{unmatched_count} profiler row(s) did not match a "
+                    "captured FX region"
+                ),
+                "count": max(unmatched_count, 1),
+                "scope": "profiler_correlation",
+            }
+        )
 
     # Create new discovery report with populated regions
     return DiscoveryReport.from_dict(
@@ -362,8 +392,8 @@ def correlate_discovery_report(
             "environment": dict(fx_discovery_report.environment),
             "total_cuda_time_us": fx_discovery_report.total_cuda_time_us,
             "operators": [op.as_dict() for op in profiler_operators],
-            "regions": [region.as_dict() for region in populated_regions],
+            "regions": [region.as_dict() for region in searchable_regions],
             "graph_breaks": [item.as_dict() for item in fx_discovery_report.graph_breaks],
-            "unsupported": [item.as_dict() for item in fx_discovery_report.unsupported],
+            "unsupported": unsupported,
         }
     )

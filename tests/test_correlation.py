@@ -319,6 +319,48 @@ def test_correlate_discovery_report_integration():
     assert correlated_report.environment == fx_report.environment
 
 
+def test_correlate_discovery_report_keeps_unmatched_as_diagnostic():
+    profiler_export_rows = [
+        {
+            "name": "aten::unmatched",
+            "calls": 3,
+            "cuda_time_us": 30.0,
+            "self_cuda_time_us": 30.0,
+        },
+    ]
+    fx_report = DiscoveryReport.from_dict(
+        {
+            "schema_version": 1,
+            "producer": {"name": "fastvideo", "version": "test"},
+            "workload": {"workload_id": "test", "model_id": "test"},
+            "environment": {"hardware_profile_id": "cpu"},
+            "total_cuda_time_us": 30.0,
+            "operators": [],
+            "regions": [
+                GraphRegion.build(
+                    name="captured",
+                    operations=["aten::add"],
+                    inputs=[_tensor("x")],
+                ).as_dict(),
+            ],
+        }
+    )
+
+    correlated = correlate_discovery_report(
+        profiler_export_rows,
+        fx_report,
+    )
+
+    assert all(
+        region.name != "unmatched_profiler_rows"
+        for region in correlated.regions
+    )
+    assert any(
+        item.op_name == "profiler::unmatched"
+        for item in correlated.unsupported
+    )
+
+
 def test_confidence_calculation():
     """Test that confidence is calculated correctly."""
     profiler_rows = [
