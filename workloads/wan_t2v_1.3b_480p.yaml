@@ -1,0 +1,49 @@
+# Canonical Wan text-to-video workload matching the existing A/B benchmark in
+# FastVideo examples/inference/optimizations/wan_fusions_ab.py.
+schema_version: 1
+workload_id: wan-t2v-1.3b-480p
+description: >
+  Representative Wan 2.1 1.3B T2V workload used for end-to-end native-versus-fused
+  measurement. Default measurement uses a short step count suitable for CI-scale
+  dry runs; raise sampling.num_inference_steps to 50 for production ranking.
+model:
+  model_id: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+task: t2v
+prompt: >
+  A curious raccoon peers through a vibrant field of yellow sunflowers, soft
+  natural light, steady cinematic camera.
+sampling:
+  height: 480
+  width: 832
+  num_frames: 49
+  num_inference_steps: 4
+  guidance_scale: 5.0
+  seed: 1024
+  dtype: bfloat16
+runtime:
+  num_gpus: 1
+  use_fsdp_inference: false
+  dit_cpu_offload: false
+  vae_cpu_offload: false
+  text_encoder_cpu_offload: true
+  pin_cpu_memory: false
+measurement:
+  warmups: 1
+  runs: 2
+  save_frames: true
+  save_video: false
+parity:
+  policy: byte_equal
+performance:
+  min_end_to_end_speedup: 1.01
+  max_peak_memory_regression: 0.05
+mode_env:
+  native:
+    FASTVIDEO_WAN_FUSIONS: "0"
+  optimized:
+    FASTVIDEO_WAN_FUSIONS: "1"
+tags:
+  - wan
+  - t2v
+  - 480p
+  - baseline
