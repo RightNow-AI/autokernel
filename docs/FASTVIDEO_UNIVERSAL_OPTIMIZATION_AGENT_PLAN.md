@@ -441,4 +441,6 @@ MotionKernel:
 - `autokernel/discovery/` — metadata-only discovery report schema, stable graph
   fingerprints, pure-tensor allowlist, collective/data-dependent rejection.
 - CPU tests in `tests/test_discovery.py`.
-- Next: torch.profiler + Dynamo capture adapters and FastVideo producer.
+- `ranking.py`, `fx_capture.py`, `profiler_parse.py` — impact floor ranking,
+  CPU FX region capture, profiler table parse (CUDA times still need GPU).
+- Next GPU wall: end-to-end torch.profiler on Wan/LTX generation.

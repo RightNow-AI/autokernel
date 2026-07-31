@@ -1,6 +1,17 @@
 """Universal profiling and graph-region discovery contracts."""
 
 from .fingerprint import fingerprint_payload, graph_fingerprint
+from .fx_capture import CaptureResult, capture_callable_region, capture_module_region
+from .profiler_parse import parse_key_averages_rows
+from .ranking import (
+    DEFAULT_IMPACT_FLOOR,
+    DEFAULT_PROMOTION_TARGET,
+    RankedCandidate,
+    classify_pattern_family,
+    optimistic_e2e_improvement,
+    rank_operators,
+    rank_regions,
+)
 from .safety import (
     ALLOWED_ATEN_OPS,
     is_region_safe,
@@ -22,19 +33,30 @@ from .types import (
 
 __all__ = [
     "ALLOWED_ATEN_OPS",
+    "DEFAULT_IMPACT_FLOOR",
+    "DEFAULT_PROMOTION_TARGET",
     "DISCOVERY_SCHEMA_VERSION",
+    "CaptureResult",
     "DiscoveryError",
     "DiscoveryReport",
     "GraphBreakRecord",
     "GraphRegion",
     "OperatorHotspot",
+    "RankedCandidate",
     "TensorMeta",
     "UnsupportedOpRecord",
+    "capture_callable_region",
+    "capture_module_region",
+    "classify_pattern_family",
     "fingerprint_payload",
     "graph_fingerprint",
     "is_region_safe",
     "load_discovery_report",
     "normalize_op_name",
+    "optimistic_e2e_improvement",
+    "parse_key_averages_rows",
+    "rank_operators",
+    "rank_regions",
     "reject_region",
     "write_discovery_report",
 ]
