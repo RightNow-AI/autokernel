@@ -47,7 +47,8 @@ def test_rank_regions_marks_low_value_and_high_value():
             TensorMeta("r", (1, 128, 64), (8192, 64, 1), "bfloat16", "cpu"),
             TensorMeta("g", (1, 1, 64), (64, 64, 1), "float32", "cpu"),
         ],
-        cuda_time_us=50.0,
+            cuda_time_us=50.0,
+            self_cuda_time_us=50.0,
         calls=40,
     )
     high = GraphRegion.build(
@@ -56,7 +57,8 @@ def test_rank_regions_marks_low_value_and_high_value():
         inputs=[
             TensorMeta("x", (1, 128, 64), (8192, 64, 1), "float16", "cpu"),
         ],
-        cuda_time_us=2500.0,
+            cuda_time_us=2500.0,
+            self_cuda_time_us=2500.0,
         calls=40,
     )
     ranked = rank_regions(
@@ -130,6 +132,7 @@ def test_capture_module_region_cpu_fx():
         pattern_family=result.region.pattern_family,
         rejection_reasons=result.region.rejection_reasons,
         cuda_time_us=2000.0,
+        self_cuda_time_us=2000.0,
         calls=32,
     )
     ranked = rank_regions([timed], total_cuda_time_us=10_000.0)

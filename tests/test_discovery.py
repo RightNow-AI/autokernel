@@ -44,6 +44,31 @@ def test_fingerprint_stable_across_equivalent_regions():
     assert different != a
 
 
+def test_fingerprint_rejects_nonfinite_and_unsupported_constants():
+    with pytest.raises(ValueError, match="finite"):
+        graph_fingerprint(
+            operations=("aten::add",),
+            input_signatures=[_tensor().signature_dict()],
+            safe_constants={"scale": float("inf")},
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        graph_fingerprint(
+            operations=("aten::add",),
+            input_signatures=[_tensor().signature_dict()],
+            safe_constants={"opaque": object()},
+        )
+
+
+def test_rejects_in_place_mutation_and_invalid_region_name():
+    assert any("in-place mutation" in reason for reason in reject_region(["aten::add_"]))
+    with pytest.raises(ValueError, match="invalid graph region name"):
+        GraphRegion.build(
+            name="invalid name",
+            operations=["aten::add"],
+            inputs=[_tensor()],
+        )
+
+
 def test_graph_region_build_and_report_roundtrip(tmp_path):
     region = GraphRegion.build(
         name="elementwise.mul_add",

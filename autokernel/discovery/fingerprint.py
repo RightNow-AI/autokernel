@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any, Mapping, Sequence
 
 
 def _canonical(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         if isinstance(value, float):
-            # Stable JSON-friendly finite floats only.
+            if not math.isfinite(value):
+                raise ValueError("fingerprint values must be finite")
             return float(value)
         return value
     if isinstance(value, Mapping):
         return {str(k): _canonical(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [_canonical(item) for item in value]
-    return repr(value)
+    raise ValueError(
+        f"unsupported fingerprint value type: {type(value).__name__}"
+    )
 
 
 def fingerprint_payload(payload: Mapping[str, Any], *, length: int = 32) -> str:

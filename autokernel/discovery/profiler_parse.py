@@ -6,9 +6,17 @@ collection is a separate step; this module only normalizes metadata.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, Sequence
 
 from .types import OperatorHotspot
+
+_UNSAFE_OP_CHARACTERS = re.compile(r"[^A-Za-z0-9_./:-]")
+
+
+def canonical_op_key(name: str) -> str:
+    normalized = _UNSAFE_OP_CHARACTERS.sub("_", name).strip("_")
+    return (normalized or "unknown_operator")[:256]
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -88,7 +96,7 @@ def parse_key_averages_rows(
         hotspots.append(
             OperatorHotspot(
                 name=name,
-                op_key=name,
+                op_key=canonical_op_key(name),
                 calls=calls_i,
                 cuda_time_us=cuda,
                 self_cuda_time_us=min(self_cuda, cuda) if cuda else self_cuda,

@@ -36,7 +36,7 @@ def _parser() -> argparse.ArgumentParser:
                 "--impact-floor",
                 type=float,
                 default=0.005,
-                help="Minimum optimistic e2e improvement to search (default 0.5%)",
+                help="Minimum optimistic e2e improvement to search (default 0.5%%)",
             )
     ingest = sub.add_parser(
         "ingest-profiler",

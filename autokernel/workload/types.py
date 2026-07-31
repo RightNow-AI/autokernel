@@ -109,6 +109,7 @@ _FORBIDDEN_KEYS = {
     "weights",
     "activations",
 }
+FORBIDDEN_METADATA_KEYS = frozenset(_FORBIDDEN_KEYS)
 
 
 class WorkloadError(ValueError):

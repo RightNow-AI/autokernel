@@ -537,12 +537,15 @@ class GraphRegion:
         fingerprint = _text(
             raw.get("fingerprint"), source, f"{location}.fingerprint"
         )
+        parent_module = _optional_text(
+            raw.get("parent_module"), source, f"{location}.parent_module"
+        )
         expected = graph_fingerprint(
             operations=operations,
             input_signatures=[item.signature_dict() for item in inputs],
             output_signatures=[item.signature_dict() for item in outputs],
             safe_constants=raw.get("safe_constants") or {},
-            parent_module=raw.get("parent_module"),
+            parent_module=parent_module,
         )
         # Recomputed fingerprint is the source of truth for equivalent regions.
         if fingerprint != expected:
@@ -596,9 +599,7 @@ class GraphRegion:
             calls=_positive_int(
                 raw.get("calls", 1), source, f"{location}.calls"
             ),
-            parent_module=_optional_text(
-                raw.get("parent_module"), source, f"{location}.parent_module"
-            ),
+            parent_module=parent_module,
             pattern_family=_optional_text(
                 raw.get("pattern_family"), source, f"{location}.pattern_family"
             ),
@@ -619,6 +620,8 @@ class GraphRegion:
         **kwargs: Any,
     ) -> "GraphRegion":
         """Construct a region with a recomputed stable fingerprint."""
+        if not _NAME_PATTERN.fullmatch(name):
+            raise ValueError(f"invalid graph region name: {name!r}")
         fingerprint = graph_fingerprint(
             operations=operations,
             input_signatures=[item.signature_dict() for item in inputs],

@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from .safety import is_region_safe, reject_region
+from .safety import reject_region
 from .types import GraphRegion, OperatorHotspot
 
 
@@ -104,7 +104,7 @@ def rank_regions(
     """Rank graph regions by optimistic end-to-end value."""
     ranked: list[RankedCandidate] = []
     for region in regions:
-        share = e2e_share(region.cuda_time_us, total_cuda_time_us)
+        share = e2e_share(region.self_cuda_time_us, total_cuda_time_us)
         safety_reasons = tuple(reject_region(region.operations))
         if region.rejection_reasons:
             safety_reasons = tuple(
@@ -113,7 +113,7 @@ def rank_regions(
         improvement = optimistic_e2e_improvement(
             share, reducible_fraction=reducible_fraction
         )
-        safe = is_region_safe(region.operations) and not safety_reasons
+        safe = not safety_reasons
         # Confidence: higher when more calls and pure allowlist.
         confidence = 0.4
         if safe:
@@ -126,9 +126,7 @@ def rank_regions(
 
         search_worthy = safe and improvement >= impact_floor
         reasons = list(safety_reasons)
-        if not safe:
-            pass
-        elif improvement < impact_floor:
+        if safe and improvement < impact_floor:
             reasons.append(
                 f"below_impact_floor: optimistic e2e {improvement:.4f} "
                 f"< floor {impact_floor:.4f}"

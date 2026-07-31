@@ -13,13 +13,9 @@ from typing import Iterable, Sequence
 ALLOWED_ATEN_OPS: frozenset[str] = frozenset(
     {
         "aten::add",
-        "aten::add_",
         "aten::mul",
-        "aten::mul_",
         "aten::sub",
-        "aten::sub_",
         "aten::div",
-        "aten::div_",
         "aten::neg",
         "aten::exp",
         "aten::silu",
@@ -49,7 +45,6 @@ ALLOWED_ATEN_OPS: frozenset[str] = frozenset(
         "aten::expand",
         "aten::broadcast_to",
         "aten::type_as",
-        "aten::copy_",
     }
 )
 
@@ -99,6 +94,9 @@ def reject_region(
 
     for op in operations:
         normalized = normalize_op_name(op)
+        if normalized.startswith("aten::") and normalized.endswith("_"):
+            reasons.append(f"{normalized}: in-place mutation")
+            continue
         lower = normalized.lower()
         for token, reason in REJECT_SUBSTRINGS:
             if token in lower:

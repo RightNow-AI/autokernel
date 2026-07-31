@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ._validate import (
-    fail,
     finite_number,
     mapping as _mapping_base,
     non_negative_int as _non_negative_int_base,
@@ -21,7 +20,7 @@ from ._validate import (
     positive_int as _positive_int_base,
     text as _text_base,
 )
-from .types import WorkloadError
+from .types import FORBIDDEN_METADATA_KEYS, WorkloadError
 
 RESULT_SCHEMA_VERSION = 1
 
@@ -87,7 +86,12 @@ def _positive_int(value: Any, source: object, location: str) -> int:
 def _mapping(value: Any, source: object, location: str, *, non_empty: bool = False):
     try:
         return _mapping_base(
-            value, source, location, kind=_kind(), non_empty=non_empty
+            value,
+            source,
+            location,
+            kind=_kind(),
+            non_empty=non_empty,
+            forbidden_keys=FORBIDDEN_METADATA_KEYS,
         )
     except Exception as exc:
         raise WorkloadError(str(exc)) from exc
@@ -361,8 +365,8 @@ def compare_frame_outputs(
 
     import numpy as np
 
-    native = np.load(native_file, allow_pickle=False)
-    optimized = np.load(optimized_file, allow_pickle=False)
+    native = np.load(native_file, allow_pickle=False, mmap_mode="r")
+    optimized = np.load(optimized_file, allow_pickle=False, mmap_mode="r")
     same_shape = native.shape == optimized.shape
     result: dict[str, Any] = {
         "policy": policy,
@@ -383,13 +387,6 @@ def compare_frame_outputs(
         result["reason"] = "frame shapes differ"
         return result
 
-    difference = np.abs(
-        native.astype(np.float64) - optimized.astype(np.float64)
-    )
-    result["max_abs_diff"] = float(difference.max()) if difference.size else 0.0
-    result["mean_abs_diff"] = (
-        float(difference.mean()) if difference.size else 0.0
-    )
     if policy == "byte_equal":
         passed = bool(
             native.dtype == optimized.dtype and np.array_equal(native, optimized)
@@ -402,6 +399,13 @@ def compare_frame_outputs(
         )
         return result
     if policy == "tolerance":
+        difference = np.abs(native - optimized)
+        result["max_abs_diff"] = (
+            float(difference.max()) if difference.size else 0.0
+        )
+        result["mean_abs_diff"] = (
+            float(difference.mean()) if difference.size else 0.0
+        )
         passed = bool(
             np.allclose(
                 native,

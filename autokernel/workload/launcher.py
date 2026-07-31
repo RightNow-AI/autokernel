@@ -39,6 +39,28 @@ class LauncherPaths:
     comparison_path: Path
 
 
+def _validate_result_identity(
+    result: GenerationRunResult,
+    *,
+    workload_id: str,
+    requested_mode: str,
+) -> None:
+    if result.workload_id != workload_id:
+        raise WorkloadError(
+            f"generation result workload_id {result.workload_id!r} does not "
+            f"match manifest {workload_id!r}"
+        )
+    accepted_modes = (
+        {"optimized", "fused"} if requested_mode == "optimized"
+        else {requested_mode}
+    )
+    if result.mode not in accepted_modes:
+        raise WorkloadError(
+            f"generation result mode {result.mode!r} does not match requested "
+            f"mode {requested_mode!r}"
+        )
+
+
 def _paths(output_dir: str | Path) -> LauncherPaths:
     root = Path(output_dir).expanduser().resolve()
     return LauncherPaths(
@@ -148,6 +170,7 @@ def run_mode(
     model_override: str | None = None,
     env: Mapping[str, str] | None = None,
     check: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one baseline or optimized generation mode in a subprocess."""
     if isinstance(workload, WorkloadManifest):
@@ -182,13 +205,34 @@ def run_mode(
         checkout if not existing else f"{checkout}{os.pathsep}{existing}"
     )
 
-    completed = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        capture_output=True,
-        env=child_env,
-        cwd=checkout,
+    logs = Path(output_dir)
+    logs.mkdir(parents=True, exist_ok=True)
+    stdout_path = logs / f"{mode}.stdout.log"
+    stderr_path = logs / f"{mode}.stderr.log"
+    try:
+        with stdout_path.open("w", encoding="utf-8") as stdout_file, (
+            stderr_path.open("w", encoding="utf-8")
+        ) as stderr_file:
+            raw = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env=child_env,
+                cwd=checkout,
+                timeout=timeout,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkloadError(
+            f"launcher mode {mode!r} timed out after {timeout} seconds; "
+            f"logs: {stdout_path}, {stderr_path}"
+        ) from exc
+    completed = subprocess.CompletedProcess(
+        raw.args,
+        raw.returncode,
+        stdout_path.read_text(encoding="utf-8"),
+        stderr_path.read_text(encoding="utf-8"),
     )
     if check and completed.returncode != 0:
         raise WorkloadError(
@@ -209,6 +253,7 @@ def run_ab(
     model_override: str | None = None,
     modes: Sequence[str] = ("native", "optimized"),
     resume: bool = True,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run native and optimized modes with resume-friendly stage tracking."""
     paths = _paths(output_dir)
@@ -240,7 +285,13 @@ def run_ab(
                 result_path = legacy
 
         if resume and mode in completed and result_path.is_file():
-            results[mode] = load_generation_result(result_path)
+            loaded = load_generation_result(result_path)
+            _validate_result_identity(
+                loaded,
+                workload_id=manifest.workload_id,
+                requested_mode=mode,
+            )
+            results[mode] = loaded
             continue
 
         mode_env = {}
@@ -257,6 +308,7 @@ def run_ab(
                 model_override=model_override,
                 env=mode_env or None,
                 check=True,
+                timeout=timeout,
             )
             # Launcher may write mode-specific names.
             written = paths.output_dir / f"{mode}_result.json"
@@ -266,12 +318,18 @@ def run_ab(
                 raise WorkloadError(
                     f"launcher did not write expected result: {written}"
                 )
-            results[mode] = load_generation_result(written)
+            loaded = load_generation_result(written)
+            _validate_result_identity(
+                loaded,
+                workload_id=manifest.workload_id,
+                requested_mode=mode,
+            )
+            results[mode] = loaded
             completed.add(mode)
             state["completed_stages"] = sorted(completed)
             state.get("failed_stages", {}).pop(mode, None)
             _write_state(paths.state_path, state)
-        except Exception as exc:  # noqa: BLE001 - record and re-raise
+        except Exception as exc:
             state.setdefault("failed_stages", {})[mode] = str(exc)
             _write_state(paths.state_path, state)
             raise

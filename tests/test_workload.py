@@ -276,6 +276,8 @@ def test_compare_frame_outputs_policies(tmp_path):
     assert exact["passed"] is True
     mismatch = compare_frame_outputs(native, close, policy="byte_equal")
     assert mismatch["passed"] is False
+    frames_only = compare_frame_outputs(native, close, policy="frames_only")
+    assert frames_only["passed"] is True
     tolerant = compare_frame_outputs(
         native,
         close,

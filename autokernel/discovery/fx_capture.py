@@ -149,7 +149,7 @@ def capture_module_region(
     rejection = reject_region(operations)
     for reason in rejection:
         if "unsupported custom" in reason or "not in pure-tensor" in reason:
-            op_name = reason.split(":", 1)[0]
+            op_name = reason.rsplit(": ", 1)[0]
             unsupported.append(
                 UnsupportedOpRecord(op_name=op_name, reason=reason, count=1, scope=name)
             )

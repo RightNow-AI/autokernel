@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -23,7 +22,6 @@ _EXPORT_FIELDS = {
     "total_cuda_time_us",
     "rows",
 }
-_UNSAFE_OP_CHARACTERS = re.compile(r"[^A-Za-z0-9_./:-]")
 
 
 def _fail(source: object, location: str, message: str) -> DiscoveryError:
@@ -41,11 +39,6 @@ def _mapping(
         qualifier = "non-empty " if non_empty else ""
         raise _fail(source, location, f"must be a {qualifier}object")
     return value
-
-
-def _canonical_op_key(name: str) -> str:
-    normalized = _UNSAFE_OP_CHARACTERS.sub("_", name).strip("_")
-    return (normalized or "unknown_operator")[:256]
 
 
 def profiler_export_to_report(
@@ -112,7 +105,7 @@ def profiler_export_to_report(
         "operators": [
             {
                 **item.as_dict(),
-                "op_key": _canonical_op_key(item.op_key),
+                    "op_key": item.op_key,
             }
             for item in operators
         ],
