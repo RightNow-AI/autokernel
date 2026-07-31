@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 import torch.nn as nn
@@ -140,3 +142,41 @@ def test_capture_callable_region():
     assert result.region is not None
     joined = " ".join(result.region.operations).lower()
     assert "mul" in joined or "add" in joined
+
+
+def test_discovery_cli_rank_entry_point(tmp_path):
+    from discovery import main as discovery_main
+
+    region = GraphRegion.build(
+        name="cli.region",
+        operations=["aten::mul", "aten::add"],
+        inputs=[TensorMeta("x", (1, 8, 8), (64, 8, 1), "float16", "cpu")],
+        cuda_time_us=3000.0,
+        calls=10,
+    )
+    payload = {
+        "schema_version": 1,
+        "producer": {"name": "test", "version": "0"},
+        "workload": {"workload_id": "unit", "model_id": "m"},
+        "environment": {
+            "hardware_profile_id": "h",
+            "software_profile_id": "s",
+        },
+        "total_cuda_time_us": 10000.0,
+        "operators": [
+            {
+                "name": "aten::mm",
+                "op_key": "aten::mm",
+                "calls": 1,
+                "cuda_time_us": 5000.0,
+                "self_cuda_time_us": 5000.0,
+            }
+        ],
+        "regions": [region.as_dict()],
+        "graph_breaks": [],
+        "unsupported": [],
+    }
+    path = tmp_path / "d.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert discovery_main(["validate", str(path)]) == 0
+    assert discovery_main(["rank", str(path)]) == 0
