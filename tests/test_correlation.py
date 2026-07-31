@@ -8,18 +8,23 @@ from autokernel.discovery import (
     DiscoveryReport,
     GraphRegion,
     OperatorHotspot,
+    TensorMeta,
     correlate_discovery_report,
     correlate_profiler_to_regions,
 )
 
 
-def _tensor(name: str = "x", shape: tuple[int, ...] = (1, 128, 64)) -> GraphRegion:
+def _tensor(name: str = "x", shape: tuple[int, ...] = (1, 128, 64)) -> TensorMeta:
     """Helper to create a simple tensor metadata for testing."""
-    from autokernel.discovery import TensorMeta
+    stride: list[int] = []
+    running = 1
+    for dim in reversed(shape):
+        stride.append(running)
+        running *= max(dim, 1)
     return TensorMeta(
         name=name,
         shape=shape,
-        stride=(8192, 64, 1),
+        stride=tuple(reversed(stride)),
         dtype="bfloat16",
         device_type="cuda",
     )
@@ -66,14 +71,15 @@ def test_correlate_profiler_to_regions_basic_match():
     ]
 
     # Correlate
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
     )
 
-    # Should have 2 regions (no unmatched rows)
+    # Should have 2 regions and no unmatched rows
     assert len(correlated) == 2
+    assert unmatched == ()
 
     # Check that timing data was populated
     attn_region = next(r for r in correlated if r.name == "attention")
@@ -88,7 +94,7 @@ def test_correlate_profiler_to_regions_basic_match():
 
 
 def test_correlate_unmatched_profiler_rows():
-    """Test that unmatched profiler rows are tracked in a special region."""
+    """Test that unmatched profiler rows are returned separately."""
     profiler_rows = [
         OperatorHotspot(
             name="aten::mm",
@@ -118,21 +124,19 @@ def test_correlate_unmatched_profiler_rows():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
     )
 
-    # Should have 2 regions: one matched, one unmatched
-    assert len(correlated) == 2
-
-    # Check unmatched region
-    unmatched = next(r for r in correlated if r.name == "unmatched_profiler_rows")
-    assert unmatched.self_cuda_time_us == 100.0
-    assert unmatched.calls == 10
-    assert "no_fx_region_match" in unmatched.rejection_reasons
-    assert unmatched.attributes["unmatched_row_count"] == 1
+    # Only the captured region is returned; the custom op row is unmatched
+    assert len(correlated) == 1
+    assert correlated[0].name == "attention"
+    assert len(unmatched) == 1
+    assert unmatched[0].op_key == "custom::unknown_op"
+    assert unmatched[0].self_cuda_time_us == 100.0
+    assert unmatched[0].calls == 10
 
 
 def test_deduplicate_equivalent_regions():
@@ -169,7 +173,7 @@ def test_deduplicate_equivalent_regions():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -216,7 +220,7 @@ def test_exclusive_time_without_double_counting():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -255,7 +259,7 @@ def test_synthetic_cpu_fixtures_produce_timed_regions():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=0.0,  # CPU-only
@@ -361,6 +365,73 @@ def test_correlate_discovery_report_keeps_unmatched_as_diagnostic():
     )
 
 
+def test_overload_qualified_op_key_matches_normalized_operations():
+    """Profiler rows keep overload suffixes; region ops are normalized."""
+    profiler_rows = [
+        OperatorHotspot(
+            name="aten::add.Tensor",
+            op_key="aten::add.Tensor",
+            calls=20,
+            cuda_time_us=200.0,
+            self_cuda_time_us=200.0,
+        ),
+    ]
+    fx_regions = [
+        GraphRegion.build(
+            name="residual",
+            operations=["aten::add"],
+            inputs=[_tensor("x")],
+        ),
+    ]
+
+    correlated, unmatched = correlate_profiler_to_regions(
+        profiler_rows,
+        fx_regions,
+        total_cuda_time_us=1000.0,
+    )
+
+    assert unmatched == ()
+    assert correlated[0].attributes["matched_profiler_rows"] == 1
+    assert correlated[0].self_cuda_time_us == 200.0
+
+
+def test_correlated_report_with_unmatched_rows_round_trips():
+    """A report produced from unmatched rows must survive serialization."""
+    profiler_export_rows = [
+        {
+            "name": "custom::unknown_op",
+            "calls": 3,
+            "cuda_time_us": 30.0,
+            "self_cuda_time_us": 30.0,
+        },
+    ]
+    fx_report = DiscoveryReport.from_dict(
+        {
+            "schema_version": 1,
+            "producer": {"name": "fastvideo", "version": "test"},
+            "workload": {"workload_id": "test", "model_id": "test"},
+            "environment": {"hardware_profile_id": "cpu"},
+            "total_cuda_time_us": 30.0,
+            "operators": [],
+            "regions": [
+                GraphRegion.build(
+                    name="captured",
+                    operations=["aten::add"],
+                    inputs=[_tensor("x")],
+                ).as_dict(),
+            ],
+        }
+    )
+
+    correlated = correlate_discovery_report(profiler_export_rows, fx_report)
+    reloaded = DiscoveryReport.from_dict(correlated.as_dict())
+    assert len(reloaded.regions) == 1
+    assert any(
+        item.op_name == "profiler::unmatched"
+        for item in reloaded.unsupported
+    )
+
+
 def test_confidence_calculation():
     """Test that confidence is calculated correctly."""
     profiler_rows = [
@@ -384,7 +455,7 @@ def test_confidence_calculation():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -418,7 +489,7 @@ def test_e2e_improvement_estimation():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -455,7 +526,7 @@ def test_shape_frequency_aggregation():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -492,7 +563,7 @@ def test_rejection_reasons_aggregation():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -528,7 +599,7 @@ def test_hierarchical_parent_module_matching():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=10000.0,
@@ -567,7 +638,7 @@ def test_exact_region_range_disambiguates_shared_operation():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=1000.0,
@@ -606,19 +677,12 @@ def test_ambiguous_op_only_row_remains_unmatched():
         ),
     ]
 
-    correlated = correlate_profiler_to_regions(
+    correlated, unmatched = correlate_profiler_to_regions(
         profiler_rows,
         fx_regions,
         total_cuda_time_us=1000.0,
     )
 
-    assert all(
-        region.cuda_time_us == 0.0
-        for region in correlated
-        if region.name != "unmatched_profiler_rows"
-    )
-    unmatched = next(
-        region for region in correlated
-        if region.name == "unmatched_profiler_rows"
-    )
-    assert unmatched.attributes["unmatched_row_count"] == 1
+    assert all(region.cuda_time_us == 0.0 for region in correlated)
+    assert len(unmatched) == 1
+    assert unmatched[0].op_key == "aten::mul"

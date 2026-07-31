@@ -371,7 +371,7 @@ def capture_module_region(
             or "not in pure-tensor" in reason
             or "nested module" in reason
         ):
-            op_name = reason.split(":", 1)[0]
+            op_name = reason.rsplit(": ", 1)[0]
             unsupported.append(
                 UnsupportedOpRecord(
                     op_name=op_name, reason=reason, count=1, scope=name
@@ -539,10 +539,11 @@ class RegionCaptureSession:
             capture_name = re.sub(
                 r"[^A-Za-z0-9._-]", "_", f"{self.name_prefix}.{scope}"
             )
-            # GraphRegion names must match _NAME_PATTERN
-            capture_name = capture_name[:128]
             if not re.match(r"^[A-Za-z0-9]", capture_name):
                 capture_name = f"r.{capture_name}"
+            # GraphRegion names must match _NAME_PATTERN (128 chars max),
+            # so truncate after any prefix is applied.
+            capture_name = capture_name[:128]
             self._capturing = True
             try:
                 result = capture_module_region(

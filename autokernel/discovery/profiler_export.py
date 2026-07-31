@@ -103,6 +103,16 @@ def profiler_export_to_report(
                 f"unsupported version {version}; "
                 f"expected {SUPPORTED_CAPTURE_SCHEMA_VERSION}",
             )
+    else:
+        # Captured payloads are versioned through the capture mapping; refuse
+        # capture data that arrives without its version declaration.
+        for name in ("regions", "graph_breaks", "unsupported"):
+            if raw.get(name):
+                raise _fail(
+                    source,
+                    "capture",
+                    f"required when {name!r} is present",
+                )
 
     def _list(name: str) -> list[Any]:
         value = raw.get(name, [])

@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from .profiler_parse import parse_key_averages_rows
 from .ranking import optimistic_e2e_improvement
-from .safety import reject_region
+from .safety import normalize_op_name, reject_region
 from .types import (
     DiscoveryReport,
     GraphRegion,
@@ -88,8 +88,13 @@ def _match_scope_to_region(
                 match_reason="hierarchical_parent_module",
             )
 
-    # Strategy 2: Op key appears in region operations
-    if profiler_row.op_key in region.operations:
+    # Strategy 2: Op key appears in region operations. Region operations are
+    # normalized during FX capture (overload suffixes stripped), while
+    # profiler rows keep overload-qualified names, so normalize both sides.
+    normalized_op_key = normalize_op_name(profiler_row.op_key)
+    if normalized_op_key in {
+        normalize_op_name(op) for op in region.operations
+    }:
         return ScopeMatch(
             profiler_row=profiler_row,
             region=region,
@@ -197,7 +202,7 @@ def correlate_profiler_to_regions(
     fx_regions: Sequence[GraphRegion],
     *,
     total_cuda_time_us: float,
-) -> tuple[GraphRegion, ...]:
+) -> tuple[tuple[GraphRegion, ...], tuple[OperatorHotspot, ...]]:
     """Correlate profiler rows with FX regions and populate timing data.
 
     This is the main entry point for offline correlation. It:
@@ -206,7 +211,7 @@ def correlate_profiler_to_regions(
     3. Deduplicates equivalent regions using stable graph fingerprints
     4. Aggregates timing, call counts, and shape frequencies
     5. Computes confidence and rejection reasons
-    6. Returns populated GraphRegion tuples
+    6. Returns populated GraphRegion tuples plus the unmatched rows
 
     Args:
         profiler_rows: OperatorHotspot rows from the profiler
@@ -214,7 +219,10 @@ def correlate_profiler_to_regions(
         total_cuda_time_us: Total end-to-end CUDA time for percentage calculations
 
     Returns:
-        Tuple of GraphRegion instances with populated timing and metadata
+        A ``(regions, unmatched_rows)`` pair: populated GraphRegion
+        instances, and the profiler rows that matched no captured region.
+        Unmatched rows are reported separately because they carry no input
+        metadata and therefore cannot form a valid, serializable region.
     """
     # Step 1: Group regions by fingerprint for deduplication
     fingerprint_groups = _deduplicate_regions_by_fingerprint(fx_regions)
@@ -330,31 +338,7 @@ def correlate_profiler_to_regions(
 
         final_regions.append(populated_region)
 
-    # Track unmatched profiler rows and capture failures in a special region
-    if unmatched_rows:
-        # Create a synthetic region to capture unmatched profiler data
-        unmatched_region = GraphRegion.build(
-            name="unmatched_profiler_rows",
-            operations=[row.op_key for row in unmatched_rows],
-            inputs=[],  # No input metadata for unmatched rows
-            outputs=[],
-            dependencies=[],
-            parent_module=None,
-            safe_constants=None,
-            pattern_family=None,
-            rejection_reasons=("no_fx_region_match",),
-            calls=sum(row.calls for row in unmatched_rows),
-            shape_frequency=None,
-            cuda_time_us=sum(row.cuda_time_us for row in unmatched_rows),
-            self_cuda_time_us=sum(row.self_cuda_time_us for row in unmatched_rows),
-            attributes={
-                "unmatched_row_count": len(unmatched_rows),
-                "unmatched_row_names": [row.name for row in unmatched_rows],
-            },
-        )
-        final_regions.append(unmatched_region)
-
-    return tuple(final_regions)
+    return tuple(final_regions), tuple(unmatched_rows)
 
 
 def correlate_discovery_report(
@@ -378,38 +362,23 @@ def correlate_discovery_report(
     profiler_operators = parse_key_averages_rows(profiler_export_rows)
 
     # Correlate profiler rows with FX regions
-    populated_regions = correlate_profiler_to_regions(
+    searchable_regions, unmatched_rows = correlate_profiler_to_regions(
         profiler_operators,
         fx_discovery_report.regions,
         total_cuda_time_us=fx_discovery_report.total_cuda_time_us,
     )
-    unmatched = next(
-        (
-            region
-            for region in populated_regions
-            if region.name == "unmatched_profiler_rows"
-        ),
-        None,
-    )
-    searchable_regions = tuple(
-        region
-        for region in populated_regions
-        if region.name != "unmatched_profiler_rows"
-    )
     unsupported = [
         item.as_dict() for item in fx_discovery_report.unsupported
     ]
-    if unmatched is not None:
-        attributes = unmatched.attributes or {}
-        unmatched_count = int(attributes.get("unmatched_row_count", 0))
+    if unmatched_rows:
         unsupported.append(
             {
                 "op_name": "profiler::unmatched",
                 "reason": (
-                    f"{unmatched_count} profiler row(s) did not match a "
+                    f"{len(unmatched_rows)} profiler row(s) did not match a "
                     "captured FX region"
                 ),
-                "count": max(unmatched_count, 1),
+                "count": len(unmatched_rows),
                 "scope": "profiler_correlation",
             }
         )

@@ -389,6 +389,14 @@ def test_profiler_export_without_capture_still_loads():
     assert report.graph_breaks == ()
 
 
+def test_profiler_export_rejects_capture_payload_without_version_block():
+    export = _capture_export()
+    export.pop("capture")
+
+    with pytest.raises(ValueError, match="capture"):
+        profiler_export_to_report(export)
+
+
 def test_profiler_export_rejects_unknown_capture_schema_version():
     export = _capture_export()
     export["capture"] = {"capture_schema_version": 2}
