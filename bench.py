@@ -14,6 +14,12 @@ Usage:
   uv run bench.py --quick                # skip stages 3-5, bench only large size
   uv run bench.py --profile              # emit torch profiler trace
   uv run bench.py --sizes large          # benchmark only 'large' size
+  uv run bench.py --dtype bfloat16       # benchmark with bf16 as the primary dtype
+
+kernel.py may override the built-in benchmark config by declaring any of
+TEST_SIZES, EDGE_SIZES, TOLERANCES, TEST_DTYPES, FLOPS_FN, BYTES_FN --
+extract.py writes these into every kernel it generates so that a kernel taken
+from a real model is benchmarked at that model's shapes and dtype.
 """
 
 from __future__ import annotations
@@ -598,6 +604,160 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
 
 
 # =========================================================================
+# 4b. CONFIG RESOLUTION -- overlay per-kernel overrides from kernel.py
+# =========================================================================
+
+_DTYPE_BY_NAME: Dict[str, torch.dtype] = {
+    "float16": torch.float16, "fp16": torch.float16, "half": torch.float16,
+    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+    "float32": torch.float32, "fp32": torch.float32, "float": torch.float32,
+}
+
+_DEFAULT_TOLERANCES: Dict[torch.dtype, Dict[str, float]] = {
+    torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+    torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
+    torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
+}
+
+# Labels marking the primary benchmark size, in preference order. The built-in
+# configs use 'large'; kernels written by extract.py use 'model_primary'.
+_PRIMARY_SIZE_LABELS = ("model_primary", "large")
+
+
+def _coerce_dtype(value: Any) -> torch.dtype:
+    """Accept a torch.dtype or a string name like 'bfloat16' / 'torch.bfloat16'."""
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        key = value.lower().strip().replace("torch.", "")
+        if key in _DTYPE_BY_NAME:
+            return _DTYPE_BY_NAME[key]
+    raise ValueError(
+        f"Unrecognized dtype {value!r}. Supported: {sorted(set(_DTYPE_BY_NAME))}"
+    )
+
+
+def pick_primary_size(sizes: List[Tuple[str, Dict[str, int]]]) -> Tuple[str, Dict[str, int]]:
+    """Return the (label, size) pair to report as the primary benchmark result."""
+    for preferred in _PRIMARY_SIZE_LABELS:
+        for label, sz in sizes:
+            if label == preferred:
+                return label, sz
+    return sizes[-1]
+
+
+def pick_smallest_size(sizes: List[Tuple[str, Dict[str, int]]]) -> Tuple[str, Dict[str, int]]:
+    """Return the (label, size) pair with the fewest elements, for the smoke test.
+
+    The built-in configs already list their smallest size first, so this picks
+    the same entry they always did. Extracted kernels list the model shape
+    first, and smoke-testing on a full model shape is needlessly slow."""
+    def _volume(item: Tuple[str, Dict[str, int]]) -> int:
+        vol = 1
+        for v in item[1].values():
+            if isinstance(v, int) and v > 0:
+                vol *= v
+        return vol
+    return min(sizes, key=_volume)
+
+
+def _coerce_sizes(raw: Any, attr: str) -> List[Tuple[str, Dict[str, int]]]:
+    """Validate a TEST_SIZES/EDGE_SIZES override into [(label, {dim: int})]."""
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError(f"{attr} must be a non-empty list of (label, size_dict) pairs")
+    sizes = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(
+                f"{attr} entries must be (label, size_dict) pairs, got {item!r}"
+            )
+        label, sz = item
+        if not isinstance(sz, dict) or not sz:
+            raise ValueError(f"{attr} entry '{label}' must be a non-empty dict")
+        if not all(isinstance(v, int) and v > 0 for v in sz.values()):
+            raise ValueError(
+                f"{attr} entry '{label}' must map dimension names to positive ints"
+            )
+        sizes.append((str(label), dict(sz)))
+    return sizes
+
+
+def resolve_config(
+    kernel_type: str,
+    kernel_module: Any,
+    dtype_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the benchmark config for this run.
+
+    Starts from the built-in KERNEL_CONFIGS entry, then overlays whatever the
+    kernel file declares: TEST_SIZES, EDGE_SIZES, TOLERANCES, TEST_DTYPES,
+    FLOPS_FN, BYTES_FN. extract.py writes those into every generated kernel, so
+    a kernel pulled out of a real model is benchmarked at that model's shapes
+    and dtype instead of the generic defaults. A hand-written kernel.py that
+    declares none of them gets the built-in config unchanged.
+
+    --dtype, if given, moves that dtype to the front of test_dtypes, which is
+    what the performance run and stages 3-5 measure with.
+    """
+    config = dict(KERNEL_CONFIGS[kernel_type])
+    overrides: List[str] = []
+
+    raw_sizes = getattr(kernel_module, "TEST_SIZES", None)
+    if raw_sizes is not None:
+        config["test_sizes"] = _coerce_sizes(raw_sizes, "TEST_SIZES")
+        overrides.append(f"test_sizes({len(config['test_sizes'])})")
+
+    raw_edge = getattr(kernel_module, "EDGE_SIZES", None)
+    if raw_edge is not None:
+        config["edge_sizes"] = _coerce_sizes(raw_edge, "EDGE_SIZES")
+        overrides.append("edge_sizes")
+
+    raw_tols = getattr(kernel_module, "TOLERANCES", None)
+    if raw_tols is not None:
+        if not isinstance(raw_tols, dict) or not raw_tols:
+            raise ValueError("TOLERANCES must be a non-empty dict keyed by dtype")
+        config["tolerances"] = {_coerce_dtype(k): dict(v) for k, v in raw_tols.items()}
+        overrides.append("tolerances")
+
+    raw_dtypes = getattr(kernel_module, "TEST_DTYPES", None)
+    if raw_dtypes is not None:
+        if not isinstance(raw_dtypes, (list, tuple)) or not raw_dtypes:
+            raise ValueError("TEST_DTYPES must be a non-empty list of dtypes")
+        config["test_dtypes"] = [_coerce_dtype(d) for d in raw_dtypes]
+        overrides.append("test_dtypes")
+
+    flops_fn = getattr(kernel_module, "FLOPS_FN", None)
+    if callable(flops_fn):
+        config["flops_fn"] = flops_fn
+        overrides.append("flops_fn")
+
+    bytes_fn = getattr(kernel_module, "BYTES_FN", None)
+    if callable(bytes_fn):
+        # kernel.py declares BYTES_FN(size, dt_bytes); configs want (size, dtype).
+        config["bytes_fn"] = lambda s, dt, _fn=bytes_fn: _fn(s, _dtype_bytes(dt))
+        overrides.append("bytes_fn")
+
+    if dtype_override is not None:
+        primary = _coerce_dtype(dtype_override)
+        config["test_dtypes"] = [primary] + [
+            d for d in config["test_dtypes"] if d != primary
+        ]
+        overrides.append(f"primary_dtype={primary}")
+
+    # Every dtype under test needs a tolerance entry.
+    tols = dict(config["tolerances"])
+    for dt in config["test_dtypes"]:
+        if dt not in tols:
+            tols[dt] = _DEFAULT_TOLERANCES.get(dt, {"atol": 1e-2, "rtol": 1e-2})
+    config["tolerances"] = tols
+
+    if overrides:
+        print(f"config_overrides: {', '.join(overrides)}")
+
+    return config
+
+
+# =========================================================================
 # 5. CORRECTNESS TESTING (5 stages)
 # =========================================================================
 
@@ -663,7 +823,7 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     # ------------------------------------------------------------------
     print("\n--- Stage 1: Smoke Test ---")
     try:
-        tiny_label, tiny_size = sizes[0]
+        tiny_label, tiny_size = pick_smallest_size(sizes)
         # Use first dtype
         dtype0 = dtypes[0]
         inputs = gen_fn(tiny_size, dtype0, device, seed=42)
@@ -1021,24 +1181,11 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 bench_sizes = [(label, sz)]
                 break
         if not bench_sizes:
-            # If filter doesn't match, use 'large' or the biggest available
-            for label, sz in sizes:
-                if label == "large":
-                    bench_sizes = [(label, sz)]
-                    break
-            if not bench_sizes:
-                bench_sizes = [sizes[-1]]
+            # If filter doesn't match, fall back to the primary size
+            bench_sizes = [pick_primary_size(sizes)]
 
-    # Find the primary benchmark size (large or biggest)
-    primary_label = None
-    primary_size = None
-    for label, sz in sizes:
-        if label == "large":
-            primary_label = label
-            primary_size = sz
-            break
-    if primary_size is None:
-        primary_label, primary_size = sizes[-1]
+    # Find the primary benchmark size (model_primary, large, or biggest)
+    primary_label, primary_size = pick_primary_size(sizes)
 
     dtype = dtypes[0]  # primary dtype for benchmarking
 
@@ -1203,6 +1350,9 @@ def main():
                         help="Quick mode: skip correctness stages 3-5, bench only large size")
     parser.add_argument("--profile", action="store_true",
                         help="Enable torch profiler trace")
+    parser.add_argument("--dtype", type=str, default=None,
+                        help="Primary dtype to benchmark with, e.g. bfloat16 "
+                             "(default: read TEST_DTYPES from kernel.py, else float16)")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -1260,7 +1410,13 @@ def main():
         print(f"throughput_tflops: 0.000")
         sys.exit(1)
 
-    config = KERNEL_CONFIGS[kernel_type]
+    try:
+        config = resolve_config(kernel_type, kernel_module, args.dtype)
+    except ValueError as e:
+        print(f"\nERROR: Invalid benchmark config: {e}")
+        print(f"\ncorrectness: FAIL")
+        print(f"throughput_tflops: 0.000")
+        sys.exit(1)
 
     # ------------------------------------------------------------------
     # GPU Detection
@@ -1302,16 +1458,7 @@ def main():
     # Performance
     # ------------------------------------------------------------------
     # Determine primary size info for the header
-    _perf_sizes = config["test_sizes"]
-    _perf_primary_label = None
-    _perf_primary_size = None
-    for _pl, _ps in _perf_sizes:
-        if _pl == "large":
-            _perf_primary_label = _pl
-            _perf_primary_size = _ps
-            break
-    if _perf_primary_size is None:
-        _perf_primary_label, _perf_primary_size = _perf_sizes[-1]
+    _perf_primary_label, _perf_primary_size = pick_primary_size(config["test_sizes"])
     _perf_dtype = config["test_dtypes"][0]
     _size_params = ", ".join(f"{k}={v}" for k, v in _perf_primary_size.items())
     print(f"\n=== PERFORMANCE ({_perf_primary_label}: {_size_params}, dtype={_perf_dtype}) ===")

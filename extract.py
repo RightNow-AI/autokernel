@@ -8,6 +8,7 @@ Usage:
     uv run extract.py --kernel-type matmul     # extract only matmul kernels
     uv run extract.py --report path/to/report.json
     uv run extract.py --backend cuda           # use CUDA C++ starter kernels instead of Triton
+    uv run extract.py --dtype bfloat16         # override the profiled dtype
 """
 
 from __future__ import annotations
@@ -129,6 +130,35 @@ TOLERANCES_MAP: Dict[str, Dict[str, Dict[str, float]]] = {
     },
 }
 
+# Dtypes swept per op_type, mirroring bench.py's built-in test_dtypes.
+# The profiled model's dtype is moved to the front of this list, since bench.py
+# measures performance with test_dtypes[0].
+TEST_DTYPES_MAP: Dict[str, List[str]] = {
+    "matmul":           ["float16", "bfloat16", "float32"],
+    "softmax":          ["float16", "bfloat16", "float32"],
+    "layernorm":        ["float16", "bfloat16", "float32"],
+    "flash_attention":  ["float16", "bfloat16"],
+    "fused_mlp":        ["float16", "bfloat16", "float32"],
+    "cross_entropy":    ["float16", "bfloat16", "float32"],
+    "rotary_embedding": ["float16", "bfloat16", "float32"],
+    "rmsnorm":          ["float16", "bfloat16"],
+    "reduce":           ["float16", "bfloat16"],
+}
+
+# Canonical dtype names, so --dtype bf16 and --dtype bfloat16 agree.
+DTYPE_ALIASES: Dict[str, str] = {
+    "float16": "float16", "fp16": "float16", "half": "float16",
+    "bfloat16": "bfloat16", "bf16": "bfloat16",
+    "float32": "float32", "fp32": "float32", "float": "float32",
+}
+
+# Fallback tolerances when a model's dtype has no entry in TOLERANCES_MAP.
+DEFAULT_TOLERANCE_BY_DTYPE: Dict[str, Dict[str, float]] = {
+    "float16":  {"atol": 1e-2, "rtol": 1e-2},
+    "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
+    "float32":  {"atol": 1e-4, "rtol": 1e-4},
+}
+
 # FLOPS formulas as source strings, per op_type
 FLOPS_FN_SRC: Dict[str, str] = {
     "matmul":           'return 2 * s["M"] * s["N"] * s["K"]',
@@ -243,6 +273,23 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
 # Kernel file generation
 # ---------------------------------------------------------------------------
 
+def normalize_dtype(dtype_str: Optional[str]) -> str:
+    """Canonicalize a dtype name from the profile report. Defaults to float16."""
+    if not dtype_str:
+        return "float16"
+    return DTYPE_ALIASES.get(str(dtype_str).lower().strip(), "float16")
+
+
+def order_test_dtypes(op_type: str, model_dtype: str) -> List[str]:
+    """Return the dtype sweep for an op with the model's dtype first.
+
+    bench.py benchmarks with test_dtypes[0], so a bf16 model must not be
+    measured in fp16.
+    """
+    candidates = list(TEST_DTYPES_MAP.get(op_type, ["float16", "bfloat16"]))
+    return [model_dtype] + [d for d in candidates if d != model_dtype]
+
+
 def read_starter_kernel(op_type: str, backend: str = "triton") -> Optional[str]:
     """Read the starter kernel file. Returns None if not found.
 
@@ -296,6 +343,7 @@ def generate_kernel_file(
     gpu_time_ms: float,
     starter_code: str,
     backend: str = "triton",
+    model_dtype: str = "float16",
 ) -> str:
     """Generate the complete kernel file content for extraction."""
 
@@ -306,11 +354,15 @@ def generate_kernel_file(
     half_display = shape_to_display(half_shape)
     double_display = shape_to_display(double_shape)
 
-    tolerances = TOLERANCES_MAP.get(op_type, {
-        "float16":  {"atol": 1e-2, "rtol": 1e-2},
-        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
-        "float32":  {"atol": 1e-4, "rtol": 1e-4},
-    })
+    test_dtypes = order_test_dtypes(op_type, model_dtype)
+
+    tolerances = dict(TOLERANCES_MAP.get(op_type, DEFAULT_TOLERANCE_BY_DTYPE))
+    # Every dtype in the sweep needs a tolerance entry.
+    for dt in test_dtypes:
+        if dt not in tolerances:
+            tolerances[dt] = DEFAULT_TOLERANCE_BY_DTYPE.get(
+                dt, {"atol": 1e-2, "rtol": 1e-2}
+            )
 
     flops_fn_body = FLOPS_FN_SRC.get(op_type, 'return 0')
     bytes_fn_body = BYTES_FN_SRC.get(op_type, 'return 0')
@@ -327,6 +379,7 @@ def generate_kernel_file(
     lines.append(f"Op type: {op_type}")
     lines.append(f"Rank: {rank} ({pct_total}% of GPU time)")
     lines.append(f"Model shape: {shape_display}")
+    lines.append(f"Model dtype: {model_dtype}")
     lines.append(f"")
     lines.append(f"This kernel was extracted from profiling {model_name}.")
     lines.append(f"The agent optimizes this to maximize throughput at the model-specific shapes.")
@@ -345,13 +398,20 @@ def generate_kernel_file(
     lines.append("")
 
     # Benchmark config
-    lines.append("# Benchmark config (self-describing -- bench.py can load this dynamically)")
+    lines.append("# Benchmark config -- bench.py loads these and overlays them onto its")
+    lines.append("# built-in config for this kernel type, so the model's own shapes and")
+    lines.append("# dtype are what get benchmarked.")
     lines.append("TEST_SIZES = [")
     lines.append(f'    ("model_primary", {repr(model_shape)}),')
     lines.append(f"    # Also test nearby sizes for robustness")
     lines.append(f'    ("model_half", {repr(half_shape)}),')
     lines.append(f'    ("model_double", {repr(double_shape)}),')
     lines.append("]")
+    lines.append("")
+
+    # Dtypes (model dtype first -- bench.py measures with TEST_DTYPES[0])
+    lines.append("# Model dtype first: bench.py measures performance with TEST_DTYPES[0].")
+    lines.append(f"TEST_DTYPES = {repr(test_dtypes)}")
     lines.append("")
 
     # Tolerances
@@ -464,6 +524,7 @@ def extract_kernels(
     top_n: Optional[int] = None,
     kernel_type_filter: Optional[str] = None,
     backend: str = "triton",
+    dtype_override: Optional[str] = None,
 ) -> None:
     """Main extraction pipeline."""
 
@@ -481,6 +542,10 @@ def extract_kernels(
 
     # -- Get model name --
     model_name = report.get("model_name", report.get("model", "unknown model"))
+
+    # -- Get model dtype (bench.py measures with TEST_DTYPES[0]) --
+    model_dtype = normalize_dtype(dtype_override or report.get("dtype"))
+    print(f"Model dtype: {model_dtype}")
 
     # -- Get supported kernels --
     supported = get_supported_kernels(report)
@@ -552,6 +617,7 @@ def extract_kernels(
             gpu_time_ms=gpu_time_ms,
             starter_code=starter_code,
             backend=backend,
+            model_dtype=model_dtype,
         )
 
         # Write to workspace
@@ -633,6 +699,14 @@ def main() -> None:
         default="triton",
         help="Backend for starter kernels: 'triton' (default) or 'cuda' (native CUDA C++)",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        help="Override the dtype recorded in the profile report (e.g. bfloat16). "
+             "This becomes TEST_DTYPES[0] in the generated kernels, which is what "
+             "bench.py measures with.",
+    )
 
     args = parser.parse_args()
 
@@ -641,6 +715,7 @@ def main() -> None:
         top_n=args.top,
         kernel_type_filter=args.kernel_type,
         backend=args.backend,
+        dtype_override=args.dtype,
     )
 
 

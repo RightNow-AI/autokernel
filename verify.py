@@ -218,6 +218,17 @@ def generate_sample_input(
 
 def infer_input_type(model: nn.Module) -> str:
     """Try to determine if the model expects integer token IDs or float tensors."""
+    # The forward signature is the most reliable signal. HuggingFace
+    # *ForCausalLM / *ForConditionalGeneration wrappers take input_ids, but
+    # their children are (model, lm_head) -- so the child scan below would hit
+    # lm_head and wrongly answer "float".
+    try:
+        sig = inspect.signature(model.forward)
+        if "input_ids" in sig.parameters:
+            return "token_ids"
+    except (ValueError, TypeError):
+        pass
+
     # Check if model has an embedding layer as the first module
     for name, child in model.named_children():
         if isinstance(child, nn.Embedding):
@@ -225,6 +236,20 @@ def infer_input_type(model: nn.Module) -> str:
         if isinstance(child, (nn.Linear, nn.Conv2d)):
             return "float"
     return "float"
+
+
+def infer_vocab_size(model: nn.Module, default: int = 32000) -> int:
+    """Find the model's vocab size so generated token IDs are always in range."""
+    config = getattr(model, "config", None)
+    vocab = getattr(config, "vocab_size", None)
+    if isinstance(vocab, int) and vocab > 0:
+        return vocab
+
+    for module in model.modules():
+        if isinstance(module, nn.Embedding) and module.num_embeddings > 0:
+            return module.num_embeddings
+
+    return default
 
 
 def make_model_input(
@@ -240,7 +265,8 @@ def make_model_input(
         # Language model: expects integer input_ids
         dims = [int(d.strip()) for d in input_shape.split(",")]
         torch.manual_seed(42)
-        input_ids = torch.randint(0, 32000, dims, device=device, dtype=torch.long)
+        vocab_size = infer_vocab_size(model)
+        input_ids = torch.randint(0, vocab_size, dims, device=device, dtype=torch.long)
 
         # Check if model accepts input_ids keyword
         sig = inspect.signature(model.forward)
