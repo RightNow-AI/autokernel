@@ -22,13 +22,31 @@ import os
 import pickle
 import re
 import sys
+import sysconfig
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-import torch.nn as nn
+# cProfile imports `profile` by name; expose the stdlib API when this CLI shadows it.
+if __name__ == "profile":
+    stdlib_dir = sysconfig.get_path("stdlib")
+    if not stdlib_dir:
+        raise ImportError("Could not determine the Python standard library path")
+    stdlib_path = Path(stdlib_dir) / "profile.py"
+    spec = importlib.util.spec_from_file_location("_stdlib_profile", stdlib_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load stdlib profile module from {stdlib_path}")
+    stdlib_profile = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stdlib_profile)
+    __all__ = stdlib_profile.__all__
+    _Utils = stdlib_profile._Utils
+    Profile = stdlib_profile.Profile
+    run = stdlib_profile.run
+    runctx = stdlib_profile.runctx
+else:
+    import torch
+    import torch.nn as nn
 
 # ---------------------------------------------------------------------------
 # Constants
