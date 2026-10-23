@@ -10,6 +10,11 @@
 - `kernels/cuda/_compile.py` targets `sm_90a` / `sm_100a` / `sm_103a` on Hopper and datacenter Blackwell, so kernels can use wgmma / tcgen05 / TMEM.
 - Added Blackwell sections to the Triton and CUDA playbooks in `program.md`.
 
+### Engine mode
+
+- Added `engine/decode_step.py`: decode-step benchmark for a running vLLM server. It reports median step time at exactly B running requests (prefill excluded), decode tok/s, tok/s/user and tokens per step, verifies B through `/metrics`, and has a `compare` command that refuses mismatched profiles.
+- Added the optional `engine` dependency group (`httpx`).
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)

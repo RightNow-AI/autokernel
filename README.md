@@ -154,6 +154,30 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 | `kernelbench/scorer.py` | Batch evaluation across a level, computes `fast_p` at thresholds (1.0x, 1.5x, 2.0x, 3.0x, 5.0x) |
 | `kernelbench/program_kb.md` | Agent instructions for KernelBench mode |
 
+## Engine Mode: Decode-Step Benchmark
+
+Kernel speedups only matter if the serving engine's decode step gets faster. `engine/decode_step.py`
+measures that step on a running vLLM server, the way vLLM's specialized-decode PRs do:
+median inter-token latency at **exactly B running requests**, with prefill excluded.
+
+```bash
+uv sync --extra engine
+
+# Baseline twice (the A/A ratio is your noise floor), then the candidate
+uv run engine/decode_step.py run --base-url http://127.0.0.1:8000 --model <name> \
+ --batch 1,2,4,8,16,32,64 --isl 1 --osl 1024 --label stock --out results/stock.json
+uv run engine/decode_step.py run ... --label ours --out results/ours.json
+
+uv run engine/decode_step.py compare results/stock.json results/ours.json
+```
+
+- Prompts are random token IDs, so ISL is exact and the prefix cache cannot help.
+- Tokens are counted from `usage` on every chunk, so speculative decoding is counted correctly.
+- `/metrics` is polled to confirm the engine really had B requests running in the window.
+- `compare` refuses to compare runs with different profiles (exit 4).
+
+Run the client on the server's host, and cross-check step times against nsys graph-replay time.
+
 ## HuggingFace Kernels Export
 
 Export optimized kernels to the [HuggingFace Hub](https://huggingface.co/docs/kernels/en/index)
