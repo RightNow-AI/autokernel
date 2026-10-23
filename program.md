@@ -511,6 +511,15 @@ Once block sizes are tuned, memory is usually the bottleneck.
 
 ### Tier 5: Architecture-Specific Optimizations
 
+**B200 / B300 / GB200 / GB300 (datacenter Blackwell, SM100 / SM103):**
+- `tl.dot` lowers to tcgen05 MMA with the accumulator in tensor memory (TMEM), so
+  register pressure from the accumulator drops: try larger tiles (128x256) and more stages.
+- Use tensor descriptors (`tl.make_tensor_descriptor`, Triton 3.4+) so loads go through TMA.
+- FP8 (e4m3) `tl.dot`, and `tl.dot_scaled` for block-scaled MXFP8 / MXFP4 inputs.
+- 148 SMs (B200) with ~8 TB/s HBM: small decode-shape kernels are launch- and
+  occupancy-bound long before they are bandwidth-bound; check grid size vs SM count.
+- Run `uv run calibrate.py` once per new GPU to confirm the roofline peaks.
+
 **H100 (Hopper, SM90):**
 - TMA (Tensor Memory Accelerator): hardware-accelerated bulk copies.
 - WGMMA (Warp Group Matrix Multiply Accumulate): next-gen tensor core instructions.
@@ -661,6 +670,18 @@ asm volatile("cp.async.wait_group 0;");
 **Typical gains**: 10-20% from advanced techniques.
 
 ### CUDA Tier 5: Architecture-Specific
+
+**Datacenter Blackwell (SM100 B200/GB200, SM103 B300/GB300):**
+- `_compile.py` builds for `sm_100a` / `sm_103a`, which exposes the arch-specific
+  instructions (needs nvcc 12.9+ for `sm_103a`).
+- `tcgen05.mma` with accumulators in tensor memory (`tcgen05.alloc` / `tcgen05.ld`),
+  issued by a single thread; `cta_group::2` pairs two CTAs on one MMA.
+- TMA (`cp.async.bulk.tensor`) with multicast across a cluster.
+- Block-scaled MMA kinds for MXFP8 / MXFP6 / MXFP4 / NVFP4 with per-block scale factors.
+- Programmatic dependent launch (`cudaGridDependencySynchronize` /
+  `cudaTriggerProgrammaticLaunchCompletion`) to overlap a kernel's prologue with
+  the previous kernel's tail. Measure it inside a CUDA graph, not with single launches.
+- For full GEMMs, prefer CUTLASS / CuTe templates over hand-written tcgen05.
 
 **Hopper (SM90, H100):**
 - TMA (Tensor Memory Accelerator): `cp.async.bulk` for hardware-accelerated bulk copies.

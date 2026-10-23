@@ -50,10 +50,14 @@ def _get_arch_flags() -> list:
     major, minor = cap
     sm = f"{major}{minor}"
 
+    # Hopper (sm_90a) and datacenter Blackwell (sm_100a / sm_103a) only expose
+    # wgmma / tcgen05 / TMEM through the arch-specific "a" target.
+    cubin_sm = f"{sm}a" if major in (9, 10) else sm
+
     flags = [
         # Compile for the exact GPU
-        f"-gencode=arch=compute_{sm},code=sm_{sm}",
-        # Also embed PTX for forward compatibility
+        f"-gencode=arch=compute_{cubin_sm},code=sm_{cubin_sm}",
+        # Also embed PTX for forward compatibility ("a" PTX is not portable)
         f"-gencode=arch=compute_{sm},code=compute_{sm}",
     ]
     return flags

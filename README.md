@@ -79,6 +79,7 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | `orchestrate.py` | Multi-kernel scheduler: decides which kernel to optimize next using Amdahl's law, tracks aggregate progress |
 | `bench.py` | Fixed benchmark: 5-stage correctness (smoke, shape sweep, numerical stability, determinism, edge cases) + performance + roofline |
 | `verify.py` | Plugs optimized kernels back into the model, checks end-to-end correctness, reports total speedup |
+| `calibrate.py` | Measures achieved HBM bandwidth and FP16/BF16 GEMM throughput on a new GPU and compares them to the roofline peaks in the GPU database |
 
 ## Supported Kernels
 

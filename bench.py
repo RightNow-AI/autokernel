@@ -100,7 +100,16 @@ class GPUSpec:
 
 
 # Known GPU database: name_fragment -> (peak_fp16_tflops, peak_bandwidth_gb_s, l2_cache_mb)
+# Fragments are matched in order, so GB300/GB200 must come before B300/B200.
+# l2_cache_mb = 0.0 means "read L2 size from the device".
+# Blackwell: dense FP16/BF16 = half of NVIDIA's sparse HGX/NVL72 table figure.
+# Check a new node with `uv run calibrate.py`.
 _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
+    "GB300":      (2500.0, 8000.0, 0.0),
+    "GB200":      (2500.0, 8000.0, 0.0),
+    "B300":       (2250.0, 8000.0, 0.0),
+    "B200":       (2250.0, 8000.0, 0.0),
+    "H200":       (989.5,  4800.0, 50.0),
     "H100 SXM":   (989.5,  3352.0, 50.0),
     "H100 PCIe":  (756.0,  2039.0, 50.0),
     "H100":       (756.0,  2039.0, 50.0),   # fallback for H100 variants
@@ -164,14 +173,24 @@ def detect_gpu() -> GPUSpec:
 
     if matched is not None:
         peak_fp16, peak_bw, l2 = matched
+        if l2 <= 0.0:
+            l2 = props.L2_cache_size / (1024 * 1024) if hasattr(props, 'L2_cache_size') else 0.0
     else:
+        print(f"WARNING: {name} is not in the GPU database; roofline peaks are estimates. "
+              f"Run `uv run calibrate.py` and add an entry.")
         if hasattr(props, 'clock_rate') and props.clock_rate > 0:
             # NVIDIA path: fp16 tensor cores estimate
             ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
             clock_ghz = props.clock_rate / 1e6  # clock_rate is in kHz
             peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3
-            peak_bw = props.clock_rate / 1e6 * 256 / 8 * 2
-            peak_bw = max(peak_bw, 500.0)
+            mem_clock_khz = getattr(props, 'memory_clock_rate', 0)
+            bus_width_bits = getattr(props, 'memory_bus_width', 0)
+            if mem_clock_khz > 0 and bus_width_bits > 0:
+                # Same formula as the CUDA deviceQuery sample (DDR: x2)
+                peak_bw = 2.0 * mem_clock_khz * (bus_width_bits / 8) / 1e6
+            else:
+                peak_bw = props.clock_rate / 1e6 * 256 / 8 * 2
+                peak_bw = max(peak_bw, 500.0)
         else:
             # ROCm fallback: no clock_rate available
             peak_fp16 = 500.0  # conservative estimate

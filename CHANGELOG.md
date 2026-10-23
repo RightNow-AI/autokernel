@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Datacenter Blackwell support
+
+- Added B200, B300, GB200, GB300 and H200 to the GPU database in `bench.py` and `profile.py`. Blackwell entries read L2 size from the device. Before this, Blackwell GPUs fell back to a clock-based estimate of ~500 GB/s HBM bandwidth (real: ~8 TB/s), so every `pct_peak_bandwidth` and roofline verdict was wrong.
+- The unknown-GPU fallback now computes bandwidth from `memory_clock_rate` x `memory_bus_width` when PyTorch exposes them, and warns that the peaks are estimates.
+- Added `calibrate.py`: measures achieved HBM bandwidth (device copy) and FP16/BF16 GEMM throughput, and compares them to the database entry.
+- `kernels/cuda/_compile.py` targets `sm_90a` / `sm_100a` / `sm_103a` on Hopper and datacenter Blackwell, so kernels can use wgmma / tcgen05 / TMEM.
+- Added Blackwell sections to the Triton and CUDA playbooks in `program.md`.
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)
