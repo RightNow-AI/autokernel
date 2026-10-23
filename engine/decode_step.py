@@ -31,6 +31,7 @@ Usage:
         --model <served-name> --batch 1,2,4,8 --isl 1 --osl 1024 --label stock \\
         --out results/stock.json
     uv run --extra engine engine/decode_step.py compare results/stock.json results/ours.json
+    uv run --extra engine engine/decode_step.py table results/stock.json results/exp01.json results/exp02.json
 
 Exit codes: 0 ok, 2 usage error or every request failed, 3 missing/unreadable
 file, 4 the two files measured different profiles (compare refuses).
@@ -321,6 +322,44 @@ def cmd_compare(args) -> int:
     return 0
 
 
+def cmd_table(args) -> int:
+    """Markdown progress table: every candidate run against one baseline, in order."""
+    base = _load(args.baseline)
+    if base is None:
+        print(f"MISSING_ARM: could not read baseline {args.baseline}")
+        return 3
+    rows = []
+    for path in args.candidates:
+        doc = _load(path)
+        if doc is None:
+            print(f"MISSING_ARM: could not read {path}")
+            return 3
+        diff = [k for k in PROFILE_FIELDS if base.get(k) != doc.get(k)]
+        if diff:
+            print(f"PROFILE_MISMATCH in {path}: {', '.join(diff)}")
+            return 4
+        rows.append(doc)
+
+    batches = base["batches"]
+    print(f"**{base['model']}**, ISL {base['isl']}, OSL {base['osl']}; baseline = `{base['label']}`. "
+          f"Cells: step ms (speedup vs baseline). Last column: tok/s/user at B={batches[0]}.\n")
+    print("| # | arm | " + " | ".join(f"B={b}" for b in batches) + f" | tok/s/user B={batches[0]} | exact_B | notes |")
+    print("|---|---|" + "---|" * len(batches) + "---|---|---|")
+    for i, doc in enumerate([base] + rows):
+        cells, exact = [], True
+        for b in batches:
+            s, sb = doc["results"][str(b)]["summary"], base["results"][str(b)]["summary"]
+            if not (s.get("valid_runs") and sb.get("valid_runs")):
+                cells.append("absent")
+                continue
+            cells.append(f"{s['step_ms_p50']:.3f} ({sb['step_ms_p50'] / s['step_ms_p50']:.2f}x)")
+            exact = exact and bool(s["exact_b_all"])
+        s0 = doc["results"][str(batches[0])]["summary"]
+        tps = f"{s0['tok_s_per_user']:.1f}" if s0.get("valid_runs") else "absent"
+        print(f"| {i} | {doc['label']} | " + " | ".join(cells) + f" | {tps} | {exact} | {doc.get('notes', '')} |")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Decode-step benchmark at exactly B running requests")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -346,9 +385,15 @@ def main() -> int:
     c.add_argument("baseline")
     c.add_argument("candidate")
 
+    t = sub.add_parser("table", help="Markdown progress table of candidate runs vs one baseline")
+    t.add_argument("baseline")
+    t.add_argument("candidates", nargs="+", help="Run files in experiment order")
+
     args = parser.parse_args()
     if args.cmd == "compare":
         return cmd_compare(args)
+    if args.cmd == "table":
+        return cmd_table(args)
 
     try:
         args.batches = [int(x) for x in args.batch.split(",") if x.strip()]
