@@ -157,8 +157,10 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 ## Engine Mode: Decode-Step Benchmark
 
 Kernel speedups only matter if the serving engine's decode step gets faster. `engine/decode_step.py`
-measures that step on a running vLLM server, the way vLLM's specialized-decode PRs do:
-median inter-token latency at **exactly B running requests**, with prefill excluded.
+records **SSE event-gap latency** and usage-based throughput in a common decode window at requested
+batch B. vLLM's output collector can merge outputs when a consumer falls behind: an SSE event
+is not necessarily one engine step. `/metrics` supplies **sampled occupancy**, not scheduler-level
+proof that exactly B requests ran at every instant.
 
 Supply a local identity JSON for each arm. All fields below are required; values are
 illustrative placeholders to replace with the actual measurement configuration.
@@ -196,10 +198,31 @@ uv run engine/decode_step.py table results/stock.json results/ours.json --arm-de
 - Prompts are random token IDs, so ISL is exact and the prefix cache cannot help.
 - Tokens come from continuous `usage.completion_tokens`, including multi-token speculative chunks.
   Missing, non-increasing, or inconsistent usage invalidates the stream; chunk counts never substitute.
-- `/metrics` samples running requests every 250 ms inside the common decode window. `compare`
-  and `table` require `exact_b_all: true` and check raw repetitions when present. False, missing,
-  or null evidence refuses with **exit 5**. `--allow-inexact` permits diagnostic output, marks
-  affected rows `INEXACT` or `UNVERIFIED`, and marks affected ratios `UNQUALIFIED`.
+  A successful stream also requires `[DONE]`, a `stop` or `length` finish reason, the exact
+  requested completion count, and observed prompt usage equal to the requested ISL. Truncated
+  streams, missing terminal evidence and token-count mismatches invalidate the point with reasons.
+- `/metrics` sums **all** matching `vllm:num_requests_running` series across engines, with a
+  250 ms pause between polls. Every attempt is retained in `metric_polls`, including failures
+  and request/response timestamps. The `occupancy` record states the coverage bounds and reasons:
+  at least `max(2, ceil(window_s / 1.5) + 1)` distinct fresh samples; no sample-to-sample or
+  window-boundary gap above **1.5 s**; a fresh sample's scrape completes within **1.0 s**; and the
+  engine-series set remains present and stable. Failed or slow polls never count as fresh and are
+  reported, but a lone one voids nothing while the gap bound holds, since `/metrics` competes with
+  B streams on a busy API server. Missing,
+  duplicate, negative or non-finite metric values are failed polls. Insufficient coverage makes
+  `exact_b: null` / `UNVERIFIED`; adequate coverage with an observed count different from B gives
+  `false`. Even `true` means only that this **sampled occupancy** check passed.
+- `compare` and `table` require `exact_b_all: true`, coverage evidence, and usable event statistics,
+  checking raw repetitions when present. Failures refuse with **exit 5**. `--allow-inexact`
+  permits diagnostic output with affected rows and ratios explicitly marked.
+- Compatibility keys `step_ms_p50`, `step_ms_p90` and `tokens_per_step` remain, with
+  `step_basis: "sse-event-gap"`; tables say **event gap** and **tokens/event**. When identity
+  declares `speculation.k == 0`, any event carrying more than one usage token (including the
+  first event) is counted in `merged_events`. A positive count marks that point's `step_status`
+  `UNVERIFIED` and blocks event-gap ratios unless `--allow-inexact` is passed. `EVENT_GAP` means
+  only an event statistic, never a verified engine step. With speculation or unknown identity,
+  merging cannot be inferred from token counts: `merged_events` is null and the limitation is
+  recorded in `step_reason`. Cross-check latency with **graph-replay time from a profiler**.
 - Both commands refuse different workload profiles, primary rate formulas, or undeclared identity
   differences with **exit 4**, naming the differing keys. `--arm-delta` lists exact dotted leaf
   keys, such as `image.digest,arm.label` or `speculation.method,speculation.k,speculation.draft_revision`.
@@ -218,18 +241,25 @@ Here **N is the full-stream usage count** and **dt is last output arrival minus 
 arrival**; usage-only trailers do not extend dt. Single-token or nonpositive intervals have null rates.
 Each repetition's full-stream rates are the mean across its streams; summaries take the median
 across valid repetitions. `rate_formula_primary` defaults to **`window`**: usage-token deltas inside
-the common exact-B window divided by its duration (`window_decode_tok_s`), per user as
-`tok_s_window_per_user`. It excludes prefill, like step timing and tokens/step, which use only gaps
-fully within that window. Select `--rate-formula-primary '(N-1)/dt'` (production decode telemetry's
+the common decode window divided by its duration (`window_decode_tok_s`), per user as
+`tok_s_window_per_user`. The window starts at the latest first-token arrival and ends at the
+earliest last-token arrival. For **each stream**, subtract the last cumulative usage **at or before
+the start** from the last cumulative usage **at or before the end**; interpolate nothing. This
+accounting is independent of the fully-contained-gap filter used for event latency and tokens/event.
+`window_tokens` and `window_boundary_usage` retain the numerator and per-stream boundary counts;
+`window_token_basis: "cumulative-at-boundaries"` identifies this corrected accounting.
+Select `--rate-formula-primary '(N-1)/dt'` (production decode telemetry's
 formula) or `'N/dt'` explicitly for the full-stream rates; these can include other requests'
 prefill overlap. Tables name the selected formula; `tok_s_per_user` uses it and `decode_tok_s` is
 B times it.
 
-Old JSON still loads. Its missing identity needs the explicit override, and its rates keep the
-label `legacy window delta/dt`; summaries cannot reconstruct first/last stream timestamps. Because
-v1 computed the same exact-B window delta, legacy files compare with `window` files. Comparisons
-between different primary formulas refuse with exit 4: rerun both arms on the same formula before
-using their ratios. Exit 2 denotes bad run arguments or no valid runs;
+Old JSON still loads. Its missing identity needs the explicit override, and missing occupancy or
+event-statistic evidence also requires `--allow-inexact`. Old rates retain the label
+`legacy window delta/dt`; summaries cannot reconstruct first/last stream timestamps or missing
+boundary tokens. Older files counted only tokens in fully-contained event gaps, so their window
+rates **cannot compare with corrected boundary-based rates** (exit 4, `window_token_basis`).
+Different primary formulas also refuse with exit 4: rerun both arms on the same accounting basis
+before using their ratios. Exit 2 denotes bad run arguments or no valid runs;
 exit 3 denotes an unreadable result or log. Overrides are diagnostic, not qualified evidence.
 
 Offline regression gates (no server or GPU; includes refusal cases):
@@ -240,7 +270,7 @@ python -m pytest engine/test_decode_step.py
 python -m unittest engine.test_decode_step -v
 ```
 
-Run the client on the server's host, and cross-check step times against nsys graph-replay time.
+Run the client on the server's host, and cross-check event-gap measurements against nsys graph-replay time.
 
 ## HuggingFace Kernels Export
 

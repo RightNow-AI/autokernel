@@ -3,6 +3,7 @@
 import copy
 import io
 import json
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -29,6 +30,7 @@ def identity():
 def result():
     return {
         "schema": "autokernel-decode-step.v2", "identity": identity(),
+        "step_basis": "sse-event-gap", "window_token_basis": "cumulative-at-boundaries",
         "label": "stock", "model": "Qwen/Qwen3-8B", "isl": 1, "osl": 100,
         "batches": [1], "runs": 1, "seed": 0, "token_id_range": [1000, 20000],
         "rate_formula_primary": "(N-1)/dt",
@@ -37,6 +39,8 @@ def result():
             "decode_tok_s": 99, "tok_s_per_user": 99, "tokens_per_step": 1,
             "tok_s_n_over_dt": 100, "tok_s_n_minus_1_over_dt": 99, "tok_s_window_per_user": 98,
             "window_decode_tok_s": 98, "step_ms_spread": [9, 11], "exact_b_all": True,
+            "occupancy_coverage_all": True, "step_basis": "sse-event-gap",
+            "step_status": "EVENT_GAP", "merged_events": 0,
         }}},
     }
 
@@ -45,6 +49,8 @@ def record(start=10, tokens_per_chunk=1):
     return {
         "t_start": start - 1, "chunks": [(start + i, (i + 1) * tokens_per_chunk) for i in range(16)],
         "completion_tokens": 16 * tokens_per_chunk, "prompt_tokens": 1,
+        "requested_completion_tokens": 16 * tokens_per_chunk, "requested_prompt_tokens": 1,
+        "done_received": True, "finish_reason": "length",
         "token_source": "usage", "error": None,
     }
 
@@ -205,26 +211,30 @@ class ComparisonTests(OfflineCase):
     def test_legacy_json_loads_and_keeps_legacy_formula(self):
         old = result()
         old["schema"] = "autokernel-decode-step.v1"
-        del old["identity"], old["rate_formula_primary"]
+        del old["identity"], old["rate_formula_primary"], old["step_basis"], old["window_token_basis"]
         for field in (*ds.RATE_FIELDS.values(), "window_decode_tok_s"):
+            del old["results"]["1"]["summary"][field]
+        for field in ("occupancy_coverage_all", "step_basis", "step_status", "merged_events"):
             del old["results"]["1"]["summary"][field]
         for command in ("compare", "table"):
             code, output = self.compare(old, old, command=command)
             self.assertEqual(code, 4, output)
             self.assertIn("IDENTITY_MISSING", output)
             code, output = self.compare(old, old, ["--allow-missing-identity"], command)
+            self.assertEqual(code, 5, output)
+            code, output = self.compare(old, old, ["--allow-missing-identity", "--allow-inexact"], command)
             self.assertEqual(code, 0, output)
             self.assertIn("legacy window delta/dt", output)
             self.assertIn("UNQUALIFIED", output)
         code, output = self.compare(old, result(), ["--allow-missing-identity"])
         self.assertEqual(code, 4, output)
         self.assertIn("rate_formula_primary", output)
-        # v1 files used the exact-B window delta, so they compare with the default "window" formula.
+        # Old gap-filtered accounting must not be mixed with corrected boundary deltas.
         windowed = result()
         windowed["rate_formula_primary"] = "window"
         code, output = self.compare(old, windowed, ["--allow-missing-identity"])
-        self.assertEqual(code, 0, output)
-        self.assertIn("UNQUALIFIED", output)
+        self.assertEqual(code, 4, output)
+        self.assertIn("window_token_basis", output)
 
     def test_different_primary_formula_refuses(self):
         b = result()
@@ -324,7 +334,7 @@ class RateTests(OfflineCase):
 
     def test_primary_formula_and_multistream_aggregation(self):
         records = [record(tokens_per_chunk=3), record(start=11, tokens_per_chunk=3)]
-        measured = ds.analyze(records, [(15, 2)], 2, "N/dt")
+        measured = ds.analyze(records, covered_polls(11, 25, 2), 2, "N/dt")
         self.assertAlmostEqual(measured["tok_s_per_user"], 48 / 15)
         self.assertAlmostEqual(measured["decode_tok_s"], 2 * 48 / 15)
         self.assertEqual(measured["window_decode_tok_s"], 6)
@@ -354,6 +364,13 @@ class RateTests(OfflineCase):
 
 class StreamingTests(OfflineCase):
     def stream(self, events):
+        # These tests isolate timestamp/usage behavior; terminal checks have their
+        # own counterexamples below. Supply complete protocol evidence here.
+        events = copy.deepcopy(events)
+        for event in events:
+            event.setdefault("usage", {})["prompt_tokens"] = 1
+        requested = next((e["usage"]["completion_tokens"] for e in reversed(events)
+                          if "completion_tokens" in e["usage"]), 16)
         class Response:
             status_code = 200
 
@@ -366,12 +383,13 @@ class StreamingTests(OfflineCase):
             async def aiter_lines(self):
                 for event in events:
                     yield "data: " + json.dumps(event)
+                yield 'data: {"choices": [{"text": "", "finish_reason": "length"}]}'
                 yield "data: [DONE]"
 
         client = Mock()
         client.stream.return_value = Response()
         with patch.object(ds.time, "perf_counter", side_effect=range(100)):
-            return finish_without_io(ds.stream_one(client, "http://localhost/v1/completions", {}, "Qwen/Qwen3-8B", [1], 16))
+            return finish_without_io(ds.stream_one(client, "http://localhost/v1/completions", {}, "Qwen/Qwen3-8B", [1], requested))
 
     def test_first_last_output_timestamps_exclude_usage_only_trailer(self):
         measured = self.stream([
@@ -506,6 +524,253 @@ class RunTests(OfflineCase):
         bad["extra"] = float("nan")
         with self.assertRaisesRegex(ValueError, "finite"):
             validate_identity(bad)
+
+
+def covered_polls(start, end, batch):
+    """Fresh, successful synthetic scrapes at the documented 250 ms cadence."""
+    return [{"t_start": start + i * 0.25 - 0.01, "t_end": start + i * 0.25,
+             "running": batch, "series": ["engine-0"], "error": None}
+            for i in range(int((end - start) / 0.25) + 1)]
+
+
+def complete_record(start=0, count=13, interval=2, tokens_per_event=1):
+    return {"t_start": start - 1,
+            "chunks": [(start + i * interval, (i + 1) * tokens_per_event) for i in range(count)],
+            "completion_tokens": count * tokens_per_event, "prompt_tokens": 1,
+            "requested_completion_tokens": count * tokens_per_event, "requested_prompt_tokens": 1,
+            "done_received": True, "finish_reason": "length", "token_source": "usage", "error": None}
+
+
+class ReviewRegressionTests(OfflineCase):
+    def poll_once(self, body="", status=200, error=None):
+        client = Mock()
+        client.get = AsyncMock(side_effect=error, return_value=SimpleNamespace(status_code=status, text=body))
+        stop = Mock()
+        stop.is_set.side_effect = [False, True]
+        stop.wait = AsyncMock()
+        async def immediate_wait(awaitable, timeout):
+            return await awaitable
+        samples = []
+        with patch.object(ds.asyncio, "wait_for", side_effect=immediate_wait), \
+                patch.object(ds.time, "perf_counter", side_effect=[0, 0.01]):
+            finish_without_io(ds.poll_running(client, "http://localhost/metrics", stop, samples))
+        return samples
+
+    def stream(self, count=13, osl=1024, done=False, finish=None, prompt_tokens=1):
+        class Response:
+            status_code = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def aiter_lines(self):
+                for i in range(count):
+                    yield "data: " + json.dumps({"choices": [{"text": "x"}],
+                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": i + 1}})
+                if finish:
+                    yield "data: " + json.dumps({"choices": [{"text": "", "finish_reason": finish}]})
+                if done:
+                    yield "data: [DONE]"
+
+        client = Mock()
+        client.stream.return_value = Response()
+        with patch.object(ds.time, "perf_counter", side_effect=range(100)):
+            return finish_without_io(ds.stream_one(client, "http://localhost/v1/completions", {},
+                                                   "Qwen/Qwen3-8B", [1], osl))
+
+    def test_finding15_thirteen_of_1024_without_terminal_is_invalid(self):
+        rec = self.stream()
+        self.assertIsNotNone(rec["error"])
+        self.assertIn("[DONE]", rec["error"])
+        self.assertIn("finish reason", rec["error"])
+        self.assertIn("13", rec["error"])
+        self.assertIn("1024", rec["error"])
+        measured = ds.analyze([rec], [(5, 1)], 1)
+        self.assertFalse(measured["valid"])
+        self.assertTrue(measured["errors"])
+
+    def test_finding15_each_terminal_length_and_prompt_check_is_required(self):
+        cases = [({"done": False, "finish": "length"}, "[DONE]"),
+                 ({"done": True, "finish": None}, "finish reason"),
+                 ({"done": True, "finish": "length", "osl": 1024}, "completion_tokens"),
+                 ({"done": True, "finish": "length", "prompt_tokens": 2}, "prompt_tokens")]
+        for options, reason in cases:
+            with self.subTest(reason=reason):
+                rec = self.stream(**({"osl": 13} | options))
+                self.assertIsNotNone(rec["error"])
+                self.assertIn(reason, rec["error"])
+        self.assertIsNone(self.stream(osl=13, done=True, finish="length")["error"])
+
+    def test_finding16_one_sample_in_23_seconds_is_unverified(self):
+        rec = complete_record(count=24, interval=1)
+        measured = ds.analyze([rec], [(1, 1)], 1)
+        self.assertTrue(measured["valid"])
+        self.assertIsNone(measured["exact_b"])
+
+    def test_finding16_all_engine_series_are_summed(self):
+        samples = self.poll_once('vllm:num_requests_running{engine="0"} 2\nvllm:num_requests_running{engine="1"} 3\n')
+        observed = samples[0]["running"] if isinstance(samples[0], dict) else samples[0][1]
+        self.assertEqual(observed, 5)
+
+    def test_poll_failures_and_bad_metrics_leave_evidence(self):
+        for options in ({"status": 503}, {"error": TimeoutError()}, {"body": "unrelated_metric 2"},
+                        {"body": "vllm:num_requests_running NaN"},
+                        {"body": "vllm:num_requests_running -1"},
+                        {"body": "vllm:num_requests_running 1.5"},
+                        {"body": "vllm:num_requests_running 2\nvllm:num_requests_running 2"}):
+            with self.subTest(options=options):
+                samples = self.poll_once(**options)
+                self.assertEqual(len(samples), 1)
+                self.assertIsNotNone(samples[0]["error"])
+                self.assertIsNone(samples[0]["running"])
+                self.assertEqual(samples[0]["t_start"], 0)
+                self.assertEqual(samples[0]["t_end"], 0.01)
+        samples = self.poll_once('vllm:num_requests_running_created 999\nvllm:num_requests_running 2\n')
+        self.assertEqual(samples[0]["running"], 2)
+
+    def test_fresh_coverage_qualifies_and_every_coverage_failure_is_unverified(self):
+        rec = complete_record(count=24, interval=1)
+        good = covered_polls(0, 23, 1)
+        measured = ds.analyze([rec], good, 1)
+        self.assertIs(measured["exact_b"], True)
+        self.assertTrue(measured["occupancy"]["coverage_ok"])
+        for change in ("sparse", "interior_gap", "start_gap", "end_gap", "failed_run", "stale_run", "series"):
+            polls = copy.deepcopy(good)
+            if change == "sparse":
+                polls = [polls[4]]
+            elif change == "interior_gap":
+                polls = [p for p in polls if not 10 <= p["t_end"] <= 12.5]
+            elif change == "start_gap":
+                polls = polls[8:]
+            elif change == "end_gap":
+                polls = polls[:-8]
+            elif change == "failed_run":
+                for poll in polls[40:48]:
+                    poll["error"] = "metrics poll failed"
+                    poll["running"] = None
+            elif change == "stale_run":
+                for poll in polls[40:48]:
+                    poll["t_start"] = poll["t_end"] - 1.2
+            else:
+                polls[40]["series"] = ["different-engine"]
+            with self.subTest(change=change):
+                measured = ds.analyze([rec], polls, 1)
+                self.assertIsNone(measured["exact_b"])
+                self.assertFalse(measured["occupancy"]["coverage_ok"])
+                self.assertTrue(measured["occupancy"]["reasons"])
+                if change == "failed_run":
+                    self.assertEqual(measured["occupancy"]["failed_polls"], 8)
+        # One failed or slow poll stops counting as fresh, is reported, and voids nothing
+        # while the fresh gap bound holds: /metrics competes with B streams under load.
+        tolerated = copy.deepcopy(good)
+        tolerated[40]["error"] = "metrics poll failed"
+        tolerated[40]["running"] = None
+        tolerated[60]["t_start"] = tolerated[60]["t_end"] - 1.2
+        measured = ds.analyze([rec], tolerated, 1)
+        self.assertIs(measured["exact_b"], True)
+        self.assertEqual(measured["occupancy"]["failed_polls"], 1)
+        self.assertEqual(measured["occupancy"]["stale_polls"], 1)
+        good[40]["running"] = 2
+        self.assertIs(ds.analyze([rec], good, 1)["exact_b"], False)
+
+    def test_raw_unverified_event_statistic_cannot_hide_in_summary(self):
+        a, b = result(), result()
+        b["results"]["1"]["runs"] = [{"valid": True, "exact_b": True,
+            "occupancy": {"coverage_ok": True}, "step_basis": "sse-event-gap",
+            "step_status": "UNVERIFIED", "merged_events": 1}]
+        code, output = self.compare(a, b)
+        self.assertEqual(code, 5, output)
+        self.assertIn("STEP_STATISTIC_REFUSED", output)
+
+    def test_merging_detection_is_specific_to_no_speculation(self):
+        rec = complete_record(tokens_per_event=8)
+        spec = identity()
+        spec["speculation"]["k"] = 3
+        measured = ds.analyze([rec], [], 1, identity=spec)
+        self.assertIsNone(measured["merged_events"])
+        self.assertEqual(measured["step_status"], "EVENT_GAP")
+        self.assertIn("not detectable", measured["step_reason"])
+        clean = ds.analyze([complete_record()], [], 1, identity=identity())
+        self.assertEqual(clean["merged_events"], 0)
+        self.assertEqual(clean["step_status"], "EVENT_GAP")
+
+    def test_summary_carries_unverified_event_statistic(self):
+        good = ds.analyze([complete_record()], covered_polls(0, 24, 1), 1, identity=identity())
+        merged = ds.analyze([complete_record(tokens_per_event=8)], covered_polls(0, 24, 1), 1, identity=identity())
+        summary = ds.summarize([good, merged])
+        self.assertTrue(summary["exact_b_all"])
+        self.assertEqual(summary["step_status"], "UNVERIFIED")
+        self.assertEqual(summary["merged_events"], 13)
+
+    def test_cumulative_boundary_accounting_never_interpolates(self):
+        chunks = [(0, 2), (2, 5), (4, 9)]
+        self.assertEqual(ds.cumulative_at(chunks, 1), 2)
+        self.assertEqual(ds.cumulative_at(chunks, 2), 5)
+        self.assertEqual(ds.cumulative_at(chunks, 3), 5)
+
+    def test_tables_name_event_gaps_instead_of_engine_steps(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ds.print_table(result())
+        self.assertIn("event gap", out.getvalue())
+        self.assertIn("tok/event", out.getvalue())
+        for command in ("compare", "table"):
+            code, output = self.compare(result(), result(), command=command)
+            self.assertEqual(code, 0, output)
+            self.assertIn("event gap", output)
+            self.assertIn("sampled occupancy", output)
+            self.assertNotIn("step_ms", output)
+
+    def test_measure_uses_run_identity_for_merging_detection(self):
+        args = SimpleNamespace(token_id_range=[1, 2], isl=1, osl=26,
+                               base_url="http://localhost", model="Qwen/Qwen3-8B",
+                               rate_formula_primary="window", run_identity=identity(), keep_timelines=False)
+        async def gather_inline(*coroutines):
+            return [await coroutine for coroutine in coroutines]
+        async def poll_inline(client, url, stop, samples):
+            samples.extend(covered_polls(0, 24, 1))
+        with patch.object(ds, "stream_one", new_callable=AsyncMock, return_value=complete_record(tokens_per_event=2)), \
+                patch.object(ds, "poll_running", side_effect=poll_inline), \
+                patch.object(ds.asyncio, "create_task", side_effect=lambda coroutine: coroutine), \
+                patch.object(ds.asyncio, "gather", side_effect=gather_inline):
+            measured = finish_without_io(ds.measure(Mock(), args, {}, 1, 0, random.Random(0)))
+        self.assertEqual(measured["merged_events"], 13)
+        self.assertEqual(measured["step_status"], "UNVERIFIED")
+        self.assertIs(measured["exact_b"], True)
+
+    def test_finding17_speculative_merged_outputs_are_event_gaps(self):
+        rec = complete_record(interval=0.02, tokens_per_event=8)
+        measured = ds.analyze([rec], [], 1)
+        self.assertEqual(measured.get("step_basis"), "sse-event-gap")
+        self.assertEqual(measured["step_ms_p50"], 20)
+        self.assertEqual(measured["tokens_per_step"], 8)
+
+    def test_finding17_no_speculation_merged_events_refuse_ratios(self):
+        rec = complete_record(interval=0.02, tokens_per_event=8)
+        measured = ds.analyze([rec], covered_polls(0, 0.24, 1), 1, identity=identity())
+        self.assertEqual(measured["merged_events"], 13)
+        self.assertEqual(measured["step_status"], "UNVERIFIED")
+        a, b = result(), result()
+        b["results"]["1"]["summary"]["step_status"] = "UNVERIFIED"
+        b["results"]["1"]["summary"]["merged_events"] = 13
+        for command in ("compare", "table"):
+            code, output = self.compare(a, b, command=command)
+            self.assertEqual(code, 5, output)
+            self.assertIn("STEP_STATISTIC_REFUSED", output)
+            code, output = self.compare(a, b, ["--allow-inexact"], command)
+            self.assertEqual(code, 0, output)
+            self.assertIn("UNVERIFIED", output)
+
+    def test_finding18_offset_streams_count_23_boundary_tokens(self):
+        measured = ds.analyze([complete_record(), complete_record(start=1)], [(5, 2)], 2)
+        self.assertTrue(measured["valid"])
+        self.assertEqual(measured["window_s"], 23)
+        self.assertEqual(measured["tok_s_window_per_user"], 0.5)
+        self.assertEqual(measured["window_tokens"], 23)
+        self.assertEqual(measured["step_samples"], 22)
 
 
 if __name__ == "__main__":

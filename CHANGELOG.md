@@ -12,11 +12,15 @@
 
 ### Engine mode
 
+- Refuse incomplete decode streams: require `[DONE]`, a successful finish reason, exact requested completion usage and matching prompt usage. Invalid points retain explicit reasons.
+- Sum running-request metrics across engines and retain all poll attempts. Sampled occupancy now requires fresh, sufficiently frequent coverage, bounded sample/boundary gaps, stable series and no overlapping failed polls; insufficient evidence stays UNVERIFIED.
+- Label latency as SSE event gaps, retaining `step_ms_*` and `tokens_per_step` compatibility keys with `step_basis: "sse-event-gap"`. Detect multi-token merged events without speculation and refuse their unverified event-gap ratios unless explicitly overridden. Profiler graph-replay timing remains necessary for engine-step claims.
+- Correct window token accounting using cumulative usage at each boundary independently of the latency-gap filter. Keep `window` as the default; record `window_token_basis` and refuse comparisons against older gap-filtered window rates. Added regression counterexamples for truncation, sparse metrics, merged events and staggered boundary tokens.
 - Decode-step schema v2 records a validated declared identity (hardware, image, engine, model/revision, parallelism, speculation, KV dtype and arm). `compare` and `table` refuse undeclared identity differences (exit 4); exact dotted `--arm-delta` keys declare planned changes. Missing identity requires an explicitly `UNQUALIFIED` override.
 - Enforced exact-B evidence in comparisons and progress tables (exit 5), including unverified metrics and raw repetitions. `--allow-inexact` marks affected rows and ratios instead of silently qualifying them.
 - Persisted first/last output arrival timestamps and both usage-based full-stream `N/dt` and `(N-1)/dt` rates per stream. The primary rate defaults to `window` (usage-token delta inside the exact-B window, prefill excluded); `--rate-formula-primary` selects a full-stream formula instead, and headers name it. Removed the chunk-count fallback.
-- Old result JSON remains readable with a labelled legacy rate basis that compares with `window`; other mismatched rate bases refuse comparison. Added an offline dry-run plan, progress logs, and synthetic regression tests covering successful and refused comparisons without a server.
-- Added `engine/decode_step.py`: decode-step benchmark for a running vLLM server. It reports median step time at exactly B running requests (prefill excluded), decode tok/s, tok/s/user and tokens per step, verifies B through `/metrics`, and has a `compare` command that refuses mismatched profiles.
+- Old result JSON remains readable with a labelled legacy rate basis; corrected and legacy window accounting cannot be mixed. Added an offline dry-run plan, progress logs, and synthetic regression tests covering successful and refused comparisons without a server.
+- Added `engine/decode_step.py`: decode-window benchmark for a running vLLM server. It reports median event-gap latency, decode tok/s, tok/s/user and tokens per event, checks sampled occupancy through `/metrics`, and has a `compare` command that refuses mismatched profiles.
 - Added the optional `engine` dependency group (`httpx`).
 
 ## v1.3.0 -- 2026-03-13
