@@ -160,21 +160,85 @@ Kernel speedups only matter if the serving engine's decode step gets faster. `en
 measures that step on a running vLLM server, the way vLLM's specialized-decode PRs do:
 median inter-token latency at **exactly B running requests**, with prefill excluded.
 
+Supply a local identity JSON for each arm. All fields below are required; values are
+illustrative placeholders to replace with the actual measurement configuration.
+`sm_count` is per GPU; `gpu_count` is the allocated GPU count. Use `method: "none"`,
+`k: 0`, and `draft_revision: null` when speculation is disabled. Additional fields
+are preserved and compared. The harness records declarations; it does not attest them.
+
+```json
+{
+  "hardware": {"gpu_name": "NVIDIA H100", "gpu_count": 2, "sm_count": 132, "driver": "<driver version>"},
+  "image": {"digest": "sha256:<actual image digest>"},
+  "engine": {"version": "<engine version or commit>"},
+  "model": {"id": "Qwen/Qwen3-8B", "revision": "<immutable revision>"},
+  "parallelism": {"tp": 2, "dcp": 1, "ep": 1},
+  "speculation": {"method": "none", "k": 0, "draft_revision": null},
+  "kv_dtype": "auto",
+  "arm": {"label": "stock"}
+}
+```
+
 ```bash
 uv sync --extra engine
 
 # Baseline twice (the A/A ratio is your noise floor), then the candidate
-uv run engine/decode_step.py run --base-url http://127.0.0.1:8000 --model <name> \
- --batch 1,2,4,8,16,32,64 --isl 1 --osl 1024 --label stock --out results/stock.json
-uv run engine/decode_step.py run ... --label ours --out results/ours.json
+uv run engine/decode_step.py run --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B \
+ --batch 1,2,4,8,16,32,64 --isl 1 --osl 1024 --label stock \
+ --identity stock-identity.json --out results/stock.json
+# Repeat the same workload for stock-repeat.json, then ours.json with its own identity.
 
-uv run engine/decode_step.py compare results/stock.json results/ours.json
+uv run engine/decode_step.py compare results/stock.json results/stock-repeat.json
+uv run engine/decode_step.py compare results/stock.json results/ours.json --arm-delta image.digest,arm.label
+uv run engine/decode_step.py table results/stock.json results/ours.json --arm-delta image.digest,arm.label
 ```
 
 - Prompts are random token IDs, so ISL is exact and the prefix cache cannot help.
-- Tokens are counted from `usage` on every chunk, so speculative decoding is counted correctly.
-- `/metrics` is polled to confirm the engine really had B requests running in the window.
-- `compare` refuses to compare runs with different profiles (exit 4).
+- Tokens come from continuous `usage.completion_tokens`, including multi-token speculative chunks.
+  Missing, non-increasing, or inconsistent usage invalidates the stream; chunk counts never substitute.
+- `/metrics` samples running requests every 250 ms inside the common decode window. `compare`
+  and `table` require `exact_b_all: true` and check raw repetitions when present. False, missing,
+  or null evidence refuses with **exit 5**. `--allow-inexact` permits diagnostic output, marks
+  affected rows `INEXACT` or `UNVERIFIED`, and marks affected ratios `UNQUALIFIED`.
+- Both commands refuse different workload profiles, primary rate formulas, or undeclared identity
+  differences with **exit 4**, naming the differing keys. `--arm-delta` lists exact dotted leaf
+  keys, such as `image.digest,arm.label` or `speculation.method,speculation.k,speculation.draft_revision`.
+  It grants no workload exceptions. Parent keys and unknown keys refuse; no differences are implicit.
+- Without `--identity`, `run` warns and writes `identity: null`. Comparisons refuse missing identity
+  with **exit 4** unless `--allow-missing-identity` is supplied; output then says `UNQUALIFIED`.
+  An incomplete or malformed identity cannot use that override. `table` applies the same identity gate.
+- `run --dry-run` prints the resolved measurement plan without HTTP calls or output writes.
+  Each real warmup/timed run logs progress to `<out>.log` (or `decode-step.log` without `--out`);
+  `--log` selects another log path. Keep credentials out of identity files, labels, URLs and notes.
+
+New output uses schema `autokernel-decode-step.v2`. Each repetition includes `streams`, even
+without `--keep-timelines`: `t_first_output_token`, `t_last_output_token` (client monotonic
+seconds), usage token counts, and both `tok_s_n_over_dt` and `tok_s_n_minus_1_over_dt`.
+Here **N is the full-stream usage count** and **dt is last output arrival minus first output
+arrival**; usage-only trailers do not extend dt. Single-token or nonpositive intervals have null rates.
+Each repetition's full-stream rates are the mean across its streams; summaries take the median
+across valid repetitions. `rate_formula_primary` defaults to **`window`**: usage-token deltas inside
+the common exact-B window divided by its duration (`window_decode_tok_s`), per user as
+`tok_s_window_per_user`. It excludes prefill, like step timing and tokens/step, which use only gaps
+fully within that window. Select `--rate-formula-primary '(N-1)/dt'` (production decode telemetry's
+formula) or `'N/dt'` explicitly for the full-stream rates; these can include other requests'
+prefill overlap. Tables name the selected formula; `tok_s_per_user` uses it and `decode_tok_s` is
+B times it.
+
+Old JSON still loads. Its missing identity needs the explicit override, and its rates keep the
+label `legacy window delta/dt`; summaries cannot reconstruct first/last stream timestamps. Because
+v1 computed the same exact-B window delta, legacy files compare with `window` files. Comparisons
+between different primary formulas refuse with exit 4: rerun both arms on the same formula before
+using their ratios. Exit 2 denotes bad run arguments or no valid runs;
+exit 3 denotes an unreadable result or log. Overrides are diagnostic, not qualified evidence.
+
+Offline regression gates (no server or GPU; includes refusal cases):
+
+```bash
+python -m pytest engine/test_decode_step.py
+# If pytest is unavailable:
+python -m unittest engine.test_decode_step -v
+```
 
 Run the client on the server's host, and cross-check step times against nsys graph-replay time.
 

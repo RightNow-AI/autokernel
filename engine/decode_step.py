@@ -19,9 +19,13 @@ How one measurement works:
   4. While it runs, /metrics is polled for vllm:num_requests_running, so the
      result records whether the engine really had exactly B running.
 
-Reported per B: step_ms (median chunk gap = one engine step), p90, decode
-tok/s (all requests), tok/s/user, tokens per step (> 1 under spec decode),
-and the running-request range seen in the window.
+Reported per B: step_ms (median chunk gap = one engine step), p90, tokens per
+step (> 1 under spec decode), and the running-request range in the window.
+The primary rate ("window", the default) is the usage-token delta inside that
+exact-B window divided by its duration, so it excludes prefill like step_ms.
+Full-stream rates use usage N and dt = last output arrival - first output
+arrival, with both N/dt and (N-1)/dt retained as alternatives; they can
+include other requests' prefill overlap.
 
 Run the client on the same host as the server: network jitter lands directly
 in the step time. Cross-check the step time with nsys graph-replay time.
@@ -34,7 +38,7 @@ Usage:
     uv run --extra engine engine/decode_step.py table results/stock.json results/exp01.json results/exp02.json
 
 Exit codes: 0 ok, 2 usage error or every request failed, 3 missing/unreadable
-file, 4 the two files measured different profiles (compare refuses).
+file, 4 incompatible profile/identity/rate basis, 5 inexact or unverified B.
 """
 
 from __future__ import annotations
@@ -42,13 +46,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import statistics
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import List, Optional
+
+if __package__:
+    from .identity import flatten_identity, identity_differences, validate_identity
+else:
+    from identity import flatten_identity, identity_differences, validate_identity
 
 try:
     import httpx
@@ -57,9 +67,37 @@ except ImportError:
 
 # Fields that must match between two runs for a comparison to mean anything
 PROFILE_FIELDS = ("model", "isl", "osl", "batches", "runs", "seed", "token_id_range")
+FULL_STREAM_FIELDS = {"N/dt": "tok_s_n_over_dt", "(N-1)/dt": "tok_s_n_minus_1_over_dt"}
+# "window": usage-token delta inside the exact-B common window / window duration, per user.
+# It is the default because it excludes prefill, matching step_ms and what v1 files reported.
+RATE_FIELDS = {"window": "tok_s_window_per_user", **FULL_STREAM_FIELDS}
+DEFAULT_RATE_FORMULA = "window"
+LEGACY_RATE_FORMULA = "legacy window delta/dt"
 
 METRICS_POLL_S = 0.25
 REQUEST_TIMEOUT_S = 3600.0
+
+
+def token_rates(n: Optional[int], first: Optional[float], last: Optional[float]) -> dict:
+    """Both full-stream formulas; undefined intervals stay null, never infinity."""
+    rates = {key: None for key in FULL_STREAM_FIELDS.values()}
+    if (type(n) is not int or n < 2 or first is None or last is None
+            or not math.isfinite(first) or not math.isfinite(last) or last <= first):
+        return rates
+    dt = last - first
+    return {"tok_s_n_over_dt": n / dt, "tok_s_n_minus_1_over_dt": (n - 1) / dt}
+
+
+def stream_stats(record: dict) -> dict:
+    """Persist per-stream evidence even when full chunk timelines are omitted."""
+    chunks = record["chunks"]
+    first = record.get("t_first_output_token", chunks[0][0] if chunks else None)
+    last = record.get("t_last_output_token", chunks[-1][0] if chunks else None)
+    n = record.get("completion_tokens")
+    return {"t_first_output_token": first, "t_last_output_token": last,
+            "completion_tokens": n, "prompt_tokens": record.get("prompt_tokens"),
+            "token_source": record.get("token_source"), "error": record.get("error"),
+            **token_rates(n, first, last)}
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +118,13 @@ async def stream_one(client, url: str, headers: dict, model: str,
         "stream_options": {"include_usage": True, "continuous_usage_stats": True},
     }
     rec = {"t_start": time.perf_counter(), "chunks": [], "prompt_tokens": None,
+           "t_first_output_token": None, "t_last_output_token": None,
            "completion_tokens": None, "token_source": "usage", "error": None}
     try:
         async with client.stream("POST", url, json=body, headers=headers) as resp:
             if resp.status_code != 200:
-                rec["error"] = f"HTTP {resp.status_code}: {(await resp.aread())[:300]!r}"
+                rec["error"] = f"HTTP {resp.status_code}"
                 return rec
-            n_chunks = 0
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -97,23 +135,33 @@ async def stream_one(client, url: str, headers: dict, model: str,
                 msg = json.loads(payload)
                 usage = msg.get("usage") or {}
                 has_text = any(c.get("text") for c in msg.get("choices", []))
+                tokens = usage.get("completion_tokens")
+                # A token may decode to empty text. Only a choices-bearing event
+                # with increasing usage is an output event; trailers are not.
+                has_output = has_text or (bool(msg.get("choices")) and type(tokens) is int
+                                          and tokens > (rec["completion_tokens"] or 0))
                 if usage.get("prompt_tokens") is not None:
                     rec["prompt_tokens"] = usage["prompt_tokens"]
                 if usage.get("completion_tokens") is not None:
                     rec["completion_tokens"] = usage["completion_tokens"]
-                if has_text:
-                    n_chunks += 1
-                    if usage.get("completion_tokens") is not None:
-                        tokens = usage["completion_tokens"]
-                    else:
-                        # Server ignored continuous_usage_stats: chunk count
-                        # undercounts under speculative decoding.
-                        rec["token_source"] = "chunks"
-                        tokens = n_chunks
+                if has_output:
+                    if rec["t_first_output_token"] is None:
+                        rec["t_first_output_token"] = t
+                    rec["t_last_output_token"] = t
+                    if type(tokens) is not int or tokens < 1:
+                        rec["error"] = "missing or invalid continuous completion_tokens usage"
+                        continue
+                    if rec["chunks"] and tokens <= rec["chunks"][-1][1]:
+                        rec["error"] = "completion_tokens usage did not increase"
+                        continue
                     rec["chunks"].append((t, tokens))
+            if rec["chunks"] and rec["completion_tokens"] != rec["chunks"][-1][1]:
+                rec["error"] = "final usage differs from last output-token usage"
     except Exception as exc:  # noqa: BLE001 -- recorded, not raised
-        rec["error"] = f"{type(exc).__name__}: {exc}"
+        # Exception text may contain request credentials or response content.
+        rec["error"] = f"stream failed: {type(exc).__name__}"
     rec["t_end"] = time.perf_counter()
+    rec.update(token_rates(rec["completion_tokens"], rec["t_first_output_token"], rec["t_last_output_token"]))
     return rec
 
 
@@ -139,10 +187,14 @@ async def poll_running(client, metrics_url: str, stop: asyncio.Event, samples: l
 # One measurement at batch B
 # ---------------------------------------------------------------------------
 
-def analyze(records: List[dict], running: list, batch: int) -> dict:
-    ok = [r for r in records if not r["error"] and len(r["chunks"]) >= 2]
+def analyze(records: List[dict], running: list, batch: int,
+            rate_formula_primary: str = DEFAULT_RATE_FORMULA) -> dict:
+    streams = [stream_stats(r) for r in records]
+    ok = [r for r, s in zip(records, streams) if not r["error"] and len(r["chunks"]) >= 2
+          and r.get("token_source") == "usage" and s["tok_s_n_over_dt"] is not None]
     out = {"batch": batch, "ok_requests": len(ok), "failed_requests": len(records) - len(ok),
-           "errors": [r["error"] for r in records if r["error"]][:3]}
+           "errors": [r["error"] for r in records if r["error"]][:3],
+           "streams": streams, "rate_formula_primary": rate_formula_primary, "exact_b": None}
     if len(ok) != batch:
         out["valid"] = False
         return out
@@ -161,25 +213,30 @@ def analyze(records: List[dict], running: list, batch: int) -> dict:
     out.update({
         "window_s": round(w_end - w_start, 4),
         "step_samples": len(gaps_ms),
-        "token_source": "chunks" if any(r["token_source"] == "chunks" for r in ok) else "usage",
+        "token_source": "usage",
         "prompt_tokens": sorted({r["prompt_tokens"] for r in ok if r["prompt_tokens"] is not None}),
         "running_min": min(in_window) if in_window else None,
         "running_max": max(in_window) if in_window else None,
+        "exact_b": all(v == batch for v in in_window) if in_window else None,
     })
     if len(gaps_ms) < 10 or w_end <= w_start:
         out["valid"] = False
         return out
 
     gaps_ms.sort()
-    decode_tok_s = tokens_in_window / (w_end - w_start)
+    rates = {key: statistics.mean(s[key] for s in streams) for key in FULL_STREAM_FIELDS.values()}
+    window_decode_tok_s = tokens_in_window / (w_end - w_start)
+    rates["tok_s_window_per_user"] = window_decode_tok_s / batch
+    primary = rates[RATE_FIELDS[rate_formula_primary]]
     out.update({
         "valid": True,
-        "exact_b": (out["running_min"] == batch and out["running_max"] == batch) if in_window else None,
         "step_ms_p50": round(statistics.median(gaps_ms), 4),
         "step_ms_p90": round(gaps_ms[int(0.9 * (len(gaps_ms) - 1))], 4),
         "tokens_per_step": round(tokens_in_window / steps_in_window, 3),
-        "decode_tok_s": round(decode_tok_s, 2),
-        "tok_s_per_user": round(decode_tok_s / batch, 2),
+        "window_decode_tok_s": window_decode_tok_s,
+        **rates,
+        "decode_tok_s": primary * batch,
+        "tok_s_per_user": primary,
     })
     return out
 
@@ -195,7 +252,7 @@ async def measure(client, args, headers, batch: int, run_idx: int, rng: random.R
     ])
     stop.set()
     await poller
-    result = analyze(list(records), running, batch)
+    result = analyze(list(records), running, batch, args.rate_formula_primary)
     result["run"] = run_idx
     if args.keep_timelines:
         t0 = min(r["t_start"] for r in records)
@@ -205,8 +262,11 @@ async def measure(client, args, headers, batch: int, run_idx: int, rng: random.R
 
 def summarize(points: List[dict]) -> dict:
     valid = [p for p in points if p.get("valid")]
+    # A failed or unobserved repetition cannot disappear behind valid ones.
+    states = [p.get("exact_b") if p.get("valid") or p.get("exact_b") is False else None for p in points]
+    exact = False if any(s is False for s in states) else (True if states and all(s is True for s in states) else None)
     if not valid:
-        return {"valid_runs": 0}
+        return {"valid_runs": 0, "exact_b_all": exact}
     med = lambda key: round(statistics.median(p[key] for p in valid), 4)  # noqa: E731
     return {
         "valid_runs": len(valid),
@@ -215,14 +275,18 @@ def summarize(points: List[dict]) -> dict:
         "decode_tok_s": med("decode_tok_s"),
         "tok_s_per_user": med("tok_s_per_user"),
         "tokens_per_step": med("tokens_per_step"),
+        **{key: med(key) for key in (*RATE_FIELDS.values(), "window_decode_tok_s")},
         # None = /metrics unreachable, so "exactly B running" is unverified
-        "exact_b_all": (None if any(p.get("exact_b") is None for p in valid)
-                        else all(p["exact_b"] for p in valid)),
+        "exact_b_all": exact,
         "step_ms_spread": [min(p["step_ms_p50"] for p in valid), max(p["step_ms_p50"] for p in valid)],
     }
 
 
-async def run_all(args) -> dict:
+async def run_all(args, log) -> dict:
+    def progress(message: str):
+        print(message, flush=True)
+        print(message, file=log, flush=True)
+
     headers = {}
     if args.api_key_env and os.environ.get(args.api_key_env):
         headers["Authorization"] = f"Bearer {os.environ[args.api_key_env]}"
@@ -233,14 +297,16 @@ async def run_all(args) -> dict:
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
         for batch in args.batches:
             for w in range(args.warmup):
+                progress(f"  B={batch} warmup {w}: started")
                 await measure(client, args, headers, batch, -1 - w, rng)
             points = []
             for run_idx in range(args.runs):
+                progress(f"  B={batch} run {run_idx}: started")
                 p = await measure(client, args, headers, batch, run_idx, rng)
                 points.append(p)
                 state = (f"step {p['step_ms_p50']:.3f} ms, {p['tok_s_per_user']:.1f} tok/s/user"
                          if p.get("valid") else f"INVALID ({p['ok_requests']}/{batch} ok)")
-                print(f"  B={batch} run {run_idx}: {state}", flush=True)
+                progress(f"  B={batch} run {run_idx}: {state}")
             results[str(batch)] = {"summary": summarize(points), "runs": points}
     return results
 
@@ -249,26 +315,174 @@ async def run_all(args) -> dict:
 # Commands
 # ---------------------------------------------------------------------------
 
+def rate_formula(doc: dict) -> str:
+    # Old window-delta rates cannot be relabelled or reconstructed from summaries.
+    return doc.get("rate_formula_primary", LEGACY_RATE_FORMULA)
+
+
+def comparable_formula(doc: dict) -> str:
+    # v1 files computed the same exact-B window delta as "window", so the two compare.
+    formula = rate_formula(doc)
+    return "window" if formula == LEGACY_RATE_FORMULA else formula
+
+
+def primary_rates(doc: dict, summary: dict, batch: int) -> tuple[float, float]:
+    formula = rate_formula(doc)
+    if formula == LEGACY_RATE_FORMULA:
+        return summary["decode_tok_s"], summary["tok_s_per_user"]
+    per_user = summary[RATE_FIELDS[formula]]
+    return per_user * batch, per_user
+
+
+def exact_b_status(doc: dict, batch: int) -> str:
+    entry = doc["results"][str(batch)]
+    states = [entry["summary"].get("exact_b_all")]
+    states += [p.get("exact_b") for p in entry.get("runs", [])]
+    if any(s is False for s in states):
+        return "INEXACT"
+    if any(s is not True for s in states):
+        return "UNVERIFIED"
+    if not entry["summary"].get("valid_runs"):
+        return "UNVERIFIED"
+    if any(p.get("valid") is False for p in entry.get("runs", [])):
+        return "UNVERIFIED"
+    return "True"
+
+
+def check_exact_b(docs: list[dict], allow_inexact: bool) -> int:
+    issues = [f"{doc['label']} B={batch}: {exact_b_status(doc, batch)}"
+              for doc in docs for batch in doc["batches"] if exact_b_status(doc, batch) != "True"]
+    if not issues:
+        return 0
+    print(("UNQUALIFIED exact_B override: " if allow_inexact else "EXACT_B_REFUSED: ") + "; ".join(issues))
+    return 0 if allow_inexact else 5
+
+
+def check_comparison(a: dict, b: dict, args) -> int:
+    diff = [k for k in PROFILE_FIELDS if a.get(k) != b.get(k)]
+    if comparable_formula(a) != comparable_formula(b):
+        diff.append("rate_formula_primary")
+    if diff:
+        print("PROFILE_MISMATCH: " + ", ".join(diff))
+        return 4
+    identities = [a.get("identity"), b.get("identity")]
+    for side, identity in zip(("baseline", "candidate"), identities):
+        if identity is not None:
+            try:
+                validate_identity(identity)
+            except ValueError as exc:
+                print(f"IDENTITY_INVALID ({side}): {exc}")
+                return 4
+    if any(identity is None for identity in identities):
+        if not args.allow_missing_identity:
+            sides = [side for side, identity in zip(("baseline", "candidate"), identities) if identity is None]
+            print("IDENTITY_MISSING: " + ", ".join(sides) + "; use --allow-missing-identity for UNQUALIFIED output")
+            return 4
+    else:
+        allowed = {key.strip() for key in args.arm_delta.split(",") if key.strip()}
+        known = flatten_identity(identities[0]).keys() | flatten_identity(identities[1]).keys()
+        unknown = allowed - known
+        if unknown:
+            print("ARM_DELTA_UNKNOWN: " + ", ".join(sorted(unknown)))
+            return 4
+        changed = identity_differences(*identities)
+        undeclared = [key for key in changed if key not in allowed]
+        if undeclared:
+            print("IDENTITY_MISMATCH: " + ", ".join(undeclared))
+            return 4
+        if changed:
+            print("DECLARED_ARM_DELTA: " + ", ".join(changed))
+    for doc in (a, b):
+        formula = rate_formula(doc)
+        if formula not in (*RATE_FIELDS, LEGACY_RATE_FORMULA):
+            print("RATE_INVALID: rate_formula_primary")
+            return 4
+        for batch in doc["batches"]:
+            entry = doc["results"][str(batch)]
+            if any(p.get("token_source") == "chunks" for p in [entry["summary"], *entry.get("runs", [])]):
+                print(f"RATE_INVALID: {doc['label']} B={batch} used chunk counts")
+                return 4
+            if entry["summary"].get("valid_runs"):
+                keys = ("decode_tok_s", "tok_s_per_user") if formula == LEGACY_RATE_FORMULA else tuple(RATE_FIELDS.values())
+                if any(type(entry["summary"].get(key)) not in (int, float)
+                       or not math.isfinite(entry["summary"][key]) or entry["summary"][key] <= 0 for key in keys):
+                    print(f"RATE_INVALID: {doc['label']} B={batch} missing or invalid rate fields")
+                    return 4
+    return 0
+
+
 def print_table(doc: dict):
     print(f"\n{doc['label']}: {doc['model']}  ISL {doc['isl']}  OSL {doc['osl']}")
+    formula = rate_formula(doc)
+    basis = ("exact-B window usage delta per user" if formula in ("window", LEGACY_RATE_FORMULA)
+             else "full-stream mean per user, may include prefill overlap")
+    print(f"Rate formula: {formula} ({basis})")
     print(f"{'B':>4}{'step_ms':>10}{'p90_ms':>10}{'tok/s':>11}{'tok/s/user':>12}{'tok/step':>10}{'exact_B':>9}")
     for b in doc["batches"]:
         s = doc["results"][str(b)]["summary"]
         if not s.get("valid_runs"):
             print(f"{b:>4}{'invalid':>10}")
             continue
-        print(f"{b:>4}{s['step_ms_p50']:>10.3f}{s['step_ms_p90']:>10.3f}{s['decode_tok_s']:>11.1f}"
-              f"{s['tok_s_per_user']:>12.1f}{s['tokens_per_step']:>10.2f}{str(s['exact_b_all']):>9}")
+        total, per_user = primary_rates(doc, s, b)
+        print(f"{b:>4}{s['step_ms_p50']:>10.3f}{s['step_ms_p90']:>10.3f}{total:>11.1f}"
+              f"{per_user:>12.1f}{s['tokens_per_step']:>10.2f}{exact_b_status(doc, b):>11}")
 
 
 def cmd_run(args) -> int:
+    identity = None
+    if args.identity:
+        try:
+            with open(args.identity, encoding="utf-8-sig") as f:
+                identity = validate_identity(json.load(f))
+        except (OSError, ValueError) as exc:
+            print(f"IDENTITY_INVALID: {exc}")
+            return 4
+    else:
+        print("WARNING: no --identity supplied; recording identity: null. Comparisons will refuse it by default.", file=sys.stderr)
+    log_path = args.log or (args.out + ".log" if args.out else "decode-step.log")
+    paths = [os.path.normcase(os.path.realpath(path)) for path in (args.identity, args.out, log_path) if path]
+    if len(paths) != len(set(paths)):
+        print("ERROR: identity, result and log paths must be distinct")
+        return 2
+    if args.dry_run:
+        invocation = [sys.executable, "engine/decode_step.py", "run"]
+        for option in ("base_url", "model", "batch", "isl", "osl", "runs", "warmup", "seed",
+                       "token_id_range", "api_key_env", "label", "notes", "out", "log", "identity",
+                       "rate_formula_primary"):
+            value = getattr(args, option)
+            if value is not None and value != "":
+                rendered = ",".join(map(str, value)) if isinstance(value, list) else str(value)
+                invocation.extend(["--" + option.replace("_", "-"), rendered])
+        if args.keep_timelines:
+            invocation.append("--keep-timelines")
+        print(json.dumps({"dry_run": True, "argv": invocation, "base_url": args.base_url,
+                          **{k: getattr(args, k) for k in PROFILE_FIELDS},
+                          "warmup": args.warmup, "label": args.label, "out": args.out, "log": log_path,
+                          "identity": identity, "rate_formula_primary": args.rate_formula_primary,
+                          "requests_per_batch": "B concurrent POST /v1/completions per warmup and timed run",
+                          "request_url": args.base_url.rstrip("/") + "/v1/completions",
+                          "metrics_url": args.base_url.rstrip("/") + "/metrics",
+                          "prompt_generation": "seeded random token IDs; warmups advance the same RNG",
+                          "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+                          "temperature": 0.0, "ignore_eos": True, "max_tokens": args.osl,
+                          "min_tokens": args.osl, "metrics_poll_s": METRICS_POLL_S}, indent=2))
+        return 0
     if httpx is None:
         print("ERROR: httpx is not installed (uv sync --extra engine)")
         return 2
     started = datetime.now(timezone.utc).isoformat()
-    results = asyncio.run(run_all(args))
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as log:
+            print(f"{started} rate_formula_primary={args.rate_formula_primary}", file=log, flush=True)
+            results = asyncio.run(run_all(args, log))
+    except OSError:
+        print("ERROR: could not open/write benchmark log or complete network I/O")
+        return 3
     doc = {
-        "schema": "autokernel-decode-step.v1",
+        "schema": "autokernel-decode-step.v2",
+        "identity": identity,
+        "rate_formula_primary": args.rate_formula_primary,
         "label": args.label,
         "started_utc": started,
         "finished_utc": datetime.now(timezone.utc).isoformat(),
@@ -278,9 +492,13 @@ def cmd_run(args) -> int:
         "results": results,
     }
     if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        with open(args.out, "w") as f:
-            json.dump(doc, f, indent=1)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=1)
+        except OSError:
+            print("ERROR: could not write result JSON")
+            return 3
         print(f"\nwrote {args.out}")
     print_table(doc)
     return 0 if any(r["summary"].get("valid_runs") for r in results.values()) else 2
@@ -288,10 +506,33 @@ def cmd_run(args) -> int:
 
 def _load(path: str) -> Optional[dict]:
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:
             doc = json.load(f)
-        return doc if isinstance(doc, dict) else None
-    except (OSError, ValueError):
+        if (not isinstance(doc, dict) or not isinstance(doc.get("batches"), list)
+                or not doc["batches"] or any(type(b) is not int or b < 1 for b in doc["batches"])):
+            return None
+        # These fields are also present in v1. Do not require new metadata here.
+        for key in ("label", *PROFILE_FIELDS):
+            doc[key]
+        for batch in doc["batches"]:
+            entry = doc["results"][str(batch)]
+            if not isinstance(entry["summary"], dict) or not isinstance(entry.get("runs", []), list):
+                return None
+            if any(not isinstance(point, dict) for point in entry.get("runs", [])):
+                return None
+            summary = entry["summary"]
+            if type(summary.get("valid_runs")) is not int or summary["valid_runs"] < 0:
+                return None
+            if summary["valid_runs"]:
+                values = [summary[key] for key in ("step_ms_p50", "step_ms_p90", "tokens_per_step")]
+                spread = summary["step_ms_spread"]
+                if not isinstance(spread, list) or len(spread) != 2:
+                    return None
+                if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                       for value in values + spread):
+                    return None
+        return doc
+    except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
@@ -300,11 +541,16 @@ def cmd_compare(args) -> int:
     if a is None or b is None:
         print(f"MISSING_ARM: could not read {'baseline' if a is None else 'candidate'}")
         return 3
-    diff = [k for k in PROFILE_FIELDS if a.get(k) != b.get(k)]
-    if diff:
-        print(f"PROFILE_MISMATCH: {', '.join(f'{k} ({a.get(k)} vs {b.get(k)})' for k in diff)}")
-        return 4
+    code = check_comparison(a, b, args)
+    if code:
+        return code
+    code = check_exact_b([a, b], args.allow_inexact)
+    if code:
+        return code
+    if args.allow_missing_identity:
+        print("UNQUALIFIED: --allow-missing-identity enabled")
     print(f"\n{a['model']}  ISL {a['isl']}  OSL {a['osl']}   A = {a['label']}   B = {b['label']}")
+    print(f"Rate formula: {rate_formula(a)}")
     print(f"{'B':>4}{'A step_ms':>11}{'B step_ms':>11}{'speedup':>9}{'A tok/s/u':>11}{'B tok/s/u':>11}"
           f"{'tok/s/u':>9}{'A spread':>18}{'exact_B':>9}")
     for batch in a["batches"]:
@@ -313,10 +559,12 @@ def cmd_compare(args) -> int:
             print(f"{batch:>4}{'absent':>11}")
             continue
         spread = f"{sa['step_ms_spread'][0]:.3f}-{sa['step_ms_spread'][1]:.3f}"
+        _, ra = primary_rates(a, sa, batch)
+        _, rb = primary_rates(b, sb, batch)
+        exact = f"A:{exact_b_status(a, batch)} B:{exact_b_status(b, batch)}"
         print(f"{batch:>4}{sa['step_ms_p50']:>11.3f}{sb['step_ms_p50']:>11.3f}"
-              f"{sa['step_ms_p50'] / sb['step_ms_p50']:>8.3f}x{sa['tok_s_per_user']:>11.1f}"
-              f"{sb['tok_s_per_user']:>11.1f}{sb['tok_s_per_user'] / sa['tok_s_per_user']:>8.3f}x"
-              f"{spread:>18}{str(sa['exact_b_all'] and sb['exact_b_all']):>9}")
+              f"{sa['step_ms_p50'] / sb['step_ms_p50']:>8.3f}x{ra:>11.1f}"
+              f"{rb:>11.1f}{rb / ra:>8.3f}x{spread:>18} {exact}")
     print("\nspeedup = A step / B step; tok/s/u = B tok/s/user / A tok/s/user (differs when tokens per step differ,"
           " e.g. spec decode).\nRun the baseline twice first: its A/A ratio is the noise floor.")
     return 0
@@ -334,33 +582,44 @@ def cmd_table(args) -> int:
         if doc is None:
             print(f"MISSING_ARM: could not read {path}")
             return 3
-        diff = [k for k in PROFILE_FIELDS if base.get(k) != doc.get(k)]
-        if diff:
-            print(f"PROFILE_MISMATCH in {path}: {', '.join(diff)}")
-            return 4
+        code = check_comparison(base, doc, args)
+        if code:
+            return code
         rows.append(doc)
 
+    code = check_exact_b([base, *rows], args.allow_inexact)
+    if code:
+        return code
+    if args.allow_missing_identity:
+        print("UNQUALIFIED: --allow-missing-identity enabled")
     batches = base["batches"]
     print(f"**{base['model']}**, ISL {base['isl']}, OSL {base['osl']}; baseline = `{base['label']}`. "
           f"Cells: step ms (speedup vs baseline). Last column: tok/s/user at B={batches[0]}.\n")
-    print("| # | arm | " + " | ".join(f"B={b}" for b in batches) + f" | tok/s/user B={batches[0]} | exact_B | notes |")
+    print("| # | arm | " + " | ".join(f"B={b}" for b in batches)
+          + f" | tok/s/user B={batches[0]} [{rate_formula(base)}] | exact_B | notes |")
     print("|---|---|" + "---|" * len(batches) + "---|---|---|")
     for i, doc in enumerate([base] + rows):
-        cells, exact = [], True
+        cells, markers = [], []
         for b in batches:
             s, sb = doc["results"][str(b)]["summary"], base["results"][str(b)]["summary"]
+            state = exact_b_status(doc, b)
+            if state != "True":
+                markers.append(f"B={b} {state}")
             if not (s.get("valid_runs") and sb.get("valid_runs")):
                 cells.append("absent")
                 continue
-            cells.append(f"{s['step_ms_p50']:.3f} ({sb['step_ms_p50'] / s['step_ms_p50']:.2f}x)")
-            exact = exact and bool(s["exact_b_all"])
+            base_state = exact_b_status(base, b)
+            mark = " [UNQUALIFIED exact_B]" if state != "True" or base_state != "True" else ""
+            cells.append(f"{s['step_ms_p50']:.3f} ({sb['step_ms_p50'] / s['step_ms_p50']:.2f}x){mark}")
         s0 = doc["results"][str(batches[0])]["summary"]
-        tps = f"{s0['tok_s_per_user']:.1f}" if s0.get("valid_runs") else "absent"
-        print(f"| {i} | {doc['label']} | " + " | ".join(cells) + f" | {tps} | {exact} | {doc.get('notes', '')} |")
+        tps = f"{primary_rates(doc, s0, batches[0])[1]:.1f}" if s0.get("valid_runs") else "absent"
+        exact = "; ".join(markers) or "True"
+        note = "UNQUALIFIED identity; " if args.allow_missing_identity else ""
+        print(f"| {i} | {doc['label']} | " + " | ".join(cells) + f" | {tps} | {exact} | {note}{doc.get('notes', '')} |")
     return 0
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Decode-step benchmark at exactly B running requests")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -379,7 +638,11 @@ def main() -> int:
     r.add_argument("--label", required=True, help="Arm name, e.g. stock or ours-exp12")
     r.add_argument("--notes", default="", help="Free text stored in the output (image digest, flags)")
     r.add_argument("--out", default="", help="Raw JSON output path")
+    r.add_argument("--log", default="", help="Progress log (default: <out>.log, or decode-step.log)")
     r.add_argument("--keep-timelines", action="store_true", help="Store every chunk timestamp")
+    r.add_argument("--identity", help="Local JSON identity file (see README for required fields)")
+    r.add_argument("--rate-formula-primary", choices=tuple(RATE_FIELDS), default=DEFAULT_RATE_FORMULA)
+    r.add_argument("--dry-run", action="store_true", help="Print the resolved measurement plan without network calls or writes")
 
     c = sub.add_parser("compare", help="Compare two run files (A = baseline, B = candidate)")
     c.add_argument("baseline")
@@ -389,7 +652,12 @@ def main() -> int:
     t.add_argument("baseline")
     t.add_argument("candidates", nargs="+", help="Run files in experiment order")
 
-    args = parser.parse_args()
+    for command in (c, t):
+        command.add_argument("--arm-delta", default="", help="Comma-separated identity leaf keys allowed to differ, e.g. image.digest,arm.label")
+        command.add_argument("--allow-missing-identity", action="store_true", help="Allow missing identity; mark output UNQUALIFIED")
+        command.add_argument("--allow-inexact", action="store_true", help="Allow inexact or unverified B; mark affected rows")
+
+    args = parser.parse_args(argv)
     if args.cmd == "compare":
         return cmd_compare(args)
     if args.cmd == "table":
@@ -398,10 +666,12 @@ def main() -> int:
     try:
         args.batches = [int(x) for x in args.batch.split(",") if x.strip()]
         args.token_id_range = [int(x) for x in args.token_id_range.split(",")]
-        assert args.batches and min(args.batches) >= 1 and args.isl >= 1 and args.osl >= 16
-        assert len(args.token_id_range) == 2 and 0 <= args.token_id_range[0] < args.token_id_range[1]
-    except (ValueError, AssertionError):
-        print("ERROR: bad --batch, --isl, --osl or --token-id-range")
+        if (not args.batches or min(args.batches) < 1 or len(set(args.batches)) != len(args.batches)
+                or args.isl < 1 or args.osl < 16 or args.runs < 1 or args.warmup < 0
+                or len(args.token_id_range) != 2 or not 0 <= args.token_id_range[0] < args.token_id_range[1]):
+            raise ValueError
+    except ValueError:
+        print("ERROR: bad --batch, --isl, --osl, --runs, --warmup or --token-id-range")
         return 2
     return cmd_run(args)
 
