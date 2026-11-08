@@ -78,6 +78,22 @@ class MeasureTests(unittest.TestCase):
         self.assertTrue(result["backends"]["math"]["kv_expanded"])
         self.assertIn("tflops", result["backends"]["math"])
 
+    def test_flashinfer_is_measured_when_installed_and_reported_otherwise(self):
+        with patch.object(calibrate, "ATTENTION_BACKENDS", ()), patch.dict(sys.modules, {"flashinfer": None}):
+            result = calibrate.measure_attention(SMALL, torch.float32, "cpu", bench_fn=lambda fn: 1.0)
+        self.assertEqual(result["backends"]["flashinfer"], {"unavailable": True})
+
+        def single_prefill_with_kv_cache(q, k, v, causal=False):  # NHD layout, grouped KV heads
+            group = q.shape[1] // k.shape[1]
+            qh, kh, vh = q.transpose(0, 1), k.repeat_interleave(group, 1).transpose(0, 1), v.repeat_interleave(group, 1).transpose(0, 1)
+            return torch.softmax(qh @ kh.transpose(-2, -1) / math.sqrt(q.shape[-1]), dim=-1).matmul(vh).transpose(0, 1)
+        fake = type(sys)("flashinfer")
+        fake.single_prefill_with_kv_cache = single_prefill_with_kv_cache
+        with patch.object(calibrate, "ATTENTION_BACKENDS", ()), patch.dict(sys.modules, {"flashinfer": fake}):
+            result = calibrate.measure_attention(SMALL, torch.float32, "cpu", bench_fn=lambda fn: fn() is not None and 4.0)
+        self.assertIn("tflops", result["backends"]["flashinfer"])
+        self.assertEqual(result["best_backend"], "flashinfer")
+
 
 if __name__ == "__main__":
     unittest.main()

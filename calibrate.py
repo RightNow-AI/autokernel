@@ -68,13 +68,44 @@ def parse_attention_shape(spec: str) -> dict:
     return size
 
 
+def _judge(out, run, expected, tol, bench_fn, flops, **extra) -> dict:
+    """Time run only if its output matches the oracle."""
+    error = (out.float() - expected).abs().max().item()
+    entry = {"max_abs_error": error, **extra}
+    if not torch.allclose(out.float(), expected, **tol):
+        return {**entry, "wrong": True}
+    ms = bench_fn(run)
+    return {**entry, "ms": ms, "tflops": flops / (ms / 1e3) / 1e12}
+
+
+def _flashinfer(x: dict, expected, tol, bench_fn, flops) -> dict:
+    try:
+        import flashinfer
+    except ImportError:
+        return {"unavailable": True}
+    if x["Q"].shape[0] != 1:
+        return {"unsupported": True}
+    # [1, heads, len, head_dim] -> FlashInfer's NHD layout [len, heads, head_dim], once, outside the timed call
+    q, k, v = (t[0].transpose(0, 1).contiguous() for t in (x["Q"], x["K"], x["V"]))
+
+    def run():
+        return flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False).transpose(0, 1).unsqueeze(0)
+    try:
+        out = run()
+    except Exception:  # noqa: BLE001 -- an unsupported shape, dtype or GPU is reported, not raised
+        return {"unsupported": True}
+    return _judge(out, run, expected, tol, bench_fn, flops, kv_expanded=False)
+
+
 def measure_attention(size: dict, dtype: torch.dtype = torch.bfloat16, device: str = "cuda",
                       bench_fn=None) -> dict:
-    """Dense attention of one q_len chunk over kv_len keys, timed per SDPA backend.
+    """Dense attention of one q_len chunk over kv_len keys, timed per SDPA backend and FlashInfer.
 
     A backend is timed only after its output matches the float32 oracle at the bench tolerance. Grouped KV
     heads go in as they are (enable_gqa); a backend that refuses them is retried with expanded heads, built
     outside the timed call and reported as kv_expanded. Unsupported and wrong backends are reported, not timed.
+    FlashInfer's single-request prefill (the kernel family behind vLLM's FlashInfer backend) is measured
+    when the package is installed, with layouts converted outside the timed call.
     """
     from torch.nn.attention import SDPBackend, sdpa_kernel
     bench_fn = bench_fn or (lambda fn: _do_bench(fn, warmup=25, rep=200))
@@ -104,13 +135,8 @@ def measure_attention(size: dict, dtype: torch.dtype = torch.bfloat16, device: s
         if out is None:
             backends[name.lower()] = {"unsupported": True}
             continue
-        error = (out.float() - expected).abs().max().item()
-        entry = {"max_abs_error": error, "kv_expanded": expanded}
-        if not torch.allclose(out.float(), expected, **tol):
-            backends[name.lower()] = {**entry, "wrong": True}
-            continue
-        ms = bench_fn(run)
-        backends[name.lower()] = {**entry, "ms": ms, "tflops": flops / (ms / 1e3) / 1e12}
+        backends[name.lower()] = _judge(out, run, expected, tol, bench_fn, flops, kv_expanded=expanded)
+    backends["flashinfer"] = _flashinfer(x, expected, tol, bench_fn, flops)
     timed = {k: v for k, v in backends.items() if "tflops" in v}
     best = max(timed, key=lambda k: timed[k]["tflops"]) if timed else None
     return {"shape": size, "dtype": str(dtype).replace("torch.", ""), "flops": flops, "backends": backends,
