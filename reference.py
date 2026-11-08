@@ -76,3 +76,52 @@ def reduce_sum_ref(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
 def reduce_max_ref(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Max reduction."""
     return x.max(dim=dim).values
+
+# GQA chunked prefill attention: one prefill chunk against a long KV cache
+def gqa_prefill_attention_ref(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, sm_scale: float = None,
+                              q_tile: int = 1024, kv_tile: int = 8192, causal: bool = True) -> torch.Tensor:
+    """Exact float32 oracle for one chunk of a long causal prefill with grouped-query attention.
+
+    Q: [batch, heads_q, q_len, head_dim], the chunk's queries at absolute positions kv_len - q_len .. kv_len - 1.
+    K, V: [batch, heads_kv, kv_len, head_dim], every key the chunk attends to: the cached prefix plus the chunk.
+    heads_q is a multiple of heads_kv; query head h reads KV head h // (heads_q // heads_kv).
+    The causal mask is bottom-right aligned: query i sees keys 0 .. kv_len - q_len + i (causal=False: every key).
+    Online softmax over KV tiles in float32, so the q_len x kv_len score matrix is never materialized
+    (a 32K-token chunk against a 1M-token cache would need 128 GiB per head).
+    """
+    batch, heads_q, q_len, head_dim = Q.shape
+    heads_kv, kv_len = K.shape[1], K.shape[2]
+    if K.shape != V.shape or K.shape[0] != batch or K.shape[3] != head_dim:
+        raise ValueError("K and V must be [batch, heads_kv, kv_len, head_dim] matching Q")
+    if heads_kv < 1 or heads_q % heads_kv or not 1 <= q_len <= kv_len:
+        raise ValueError("need heads_q % heads_kv == 0 and 1 <= q_len <= kv_len")
+    group = heads_q // heads_kv
+    scale = head_dim ** -0.5 if sm_scale is None else sm_scale
+    offset = kv_len - q_len
+    out = torch.empty_like(Q)
+    for b in range(batch):
+        for g in range(heads_kv):
+            heads = slice(g * group, (g + 1) * group)
+            for q0 in range(0, q_len, q_tile):
+                q1 = min(q0 + q_tile, q_len)
+                q = Q[b, heads, q0:q1].float() * scale  # [group, rows, head_dim]
+                rows = q1 - q0
+                m = torch.full((group, rows), float("-inf"), device=Q.device)
+                l = torch.zeros((group, rows), device=Q.device)
+                acc = torch.zeros((group, rows, head_dim), device=Q.device)
+                last_key = offset + q1 - 1 if causal else kv_len - 1  # the last key this tile may see
+                for k0 in range(0, last_key + 1, kv_tile):
+                    k1 = min(k0 + kv_tile, last_key + 1)
+                    s = torch.matmul(q, K[b, g, k0:k1].float().transpose(0, 1))  # [group, rows, keys]
+                    if causal and k1 - 1 > offset + q0:  # this tile holds keys some queries must not see
+                        limit = torch.arange(q0, q1, device=Q.device)[:, None] + offset
+                        keys = torch.arange(k0, k1, device=Q.device)[None, :]
+                        s = s.masked_fill(keys > limit, float("-inf"))
+                    m_new = torch.maximum(m, s.amax(dim=-1))
+                    p = torch.exp(s - m_new[..., None])
+                    alpha = torch.exp(m - m_new)
+                    l = l * alpha + p.sum(dim=-1)
+                    acc = acc * alpha[..., None] + torch.matmul(p, V[b, g, k0:k1].float())
+                    m = m_new
+                out[b, heads, q0:q1] = (acc / l[..., None]).to(Q.dtype)
+    return out

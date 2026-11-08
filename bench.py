@@ -32,6 +32,29 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+
+def _load_stdlib_profile() -> None:
+    """Register the standard-library profile module before anything imports it.
+
+    Running a script from this directory puts it first on sys.path, where profile.py (AutoKernel's profiler)
+    shadows the standard module that cProfile imports. torch._dynamo imports cProfile, so torch.compile and
+    torch.nn.attention.bias would otherwise fail with "module 'profile' has no attribute 'run'".
+    """
+    if "profile" in sys.modules:
+        return
+    import importlib.util
+    import sysconfig
+    spec = importlib.util.spec_from_file_location(
+        "profile", os.path.join(sysconfig.get_paths()["stdlib"], "profile.py"))
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["profile"] = module
+    spec.loader.exec_module(module)
+
+
+_load_stdlib_profile()
+
 # ---------------------------------------------------------------------------
 # Timeout helper (cross-platform)
 # ---------------------------------------------------------------------------
@@ -100,7 +123,16 @@ class GPUSpec:
 
 
 # Known GPU database: name_fragment -> (peak_fp16_tflops, peak_bandwidth_gb_s, l2_cache_mb)
+# Fragments are matched in order, so GB300/GB200 must come before B300/B200.
+# l2_cache_mb = 0.0 means "read L2 size from the device".
+# Blackwell: dense FP16/BF16 = half of NVIDIA's sparse HGX/NVL72 table figure.
+# Check a new node with `uv run calibrate.py`.
 _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
+    "GB300":      (2500.0, 8000.0, 0.0),
+    "GB200":      (2500.0, 8000.0, 0.0),
+    "B300":       (2250.0, 8000.0, 0.0),
+    "B200":       (2250.0, 8000.0, 0.0),
+    "H200":       (989.5,  4800.0, 50.0),
     "H100 SXM":   (989.5,  3352.0, 50.0),
     "H100 PCIe":  (756.0,  2039.0, 50.0),
     "H100":       (756.0,  2039.0, 50.0),   # fallback for H100 variants
@@ -164,14 +196,24 @@ def detect_gpu() -> GPUSpec:
 
     if matched is not None:
         peak_fp16, peak_bw, l2 = matched
+        if l2 <= 0.0:
+            l2 = props.L2_cache_size / (1024 * 1024) if hasattr(props, 'L2_cache_size') else 0.0
     else:
+        print(f"WARNING: {name} is not in the GPU database; roofline peaks are estimates. "
+              f"Run `uv run calibrate.py` and add an entry.")
         if hasattr(props, 'clock_rate') and props.clock_rate > 0:
             # NVIDIA path: fp16 tensor cores estimate
             ops_per_clock_per_sm = 256 if cc[0] >= 8 else 128
             clock_ghz = props.clock_rate / 1e6  # clock_rate is in kHz
             peak_fp16 = sm_count * ops_per_clock_per_sm * clock_ghz * 2 / 1e3
-            peak_bw = props.clock_rate / 1e6 * 256 / 8 * 2
-            peak_bw = max(peak_bw, 500.0)
+            mem_clock_khz = getattr(props, 'memory_clock_rate', 0)
+            bus_width_bits = getattr(props, 'memory_bus_width', 0)
+            if mem_clock_khz > 0 and bus_width_bits > 0:
+                # Same formula as the CUDA deviceQuery sample (DDR: x2)
+                peak_bw = 2.0 * mem_clock_khz * (bus_width_bits / 8) / 1e6
+            else:
+                peak_bw = props.clock_rate / 1e6 * 256 / 8 * 2
+                peak_bw = max(peak_bw, 500.0)
         else:
             # ROCm fallback: no clock_rate available
             peak_fp16 = 500.0  # conservative estimate
@@ -230,6 +272,22 @@ def gen_flash_attention_inputs(size: dict, dtype: torch.dtype, device: str, seed
     Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    return {"Q": Q, "K": K, "V": V}
+
+
+def gen_gqa_prefill_attention_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    """One prefill chunk of q_len queries against kv_len keys (the cached prefix plus the chunk).
+
+    Queries are scaled so attention scores have a standard deviation of 4. Random unscaled inputs spread
+    attention over thousands of keys at long kv_len, which shrinks the output far below the tolerance;
+    peaked attention keeps it O(1), so a kernel that drops distant keys or attends past the causal edge fails.
+    """
+    torch.manual_seed(seed)
+    batch, heads_q, heads_kv = size["batch"], size["heads_q"], size["heads_kv"]
+    q_len, kv_len, head_dim = size["q_len"], size["kv_len"], size["head_dim"]
+    Q = (torch.randn(batch, heads_q, q_len, head_dim, device=device, dtype=torch.float32) * 4.0).to(dtype)
+    K = torch.randn(batch, heads_kv, kv_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads_kv, kv_len, head_dim, device=device, dtype=dtype)
     return {"Q": Q, "K": K, "V": V}
 
 
@@ -296,6 +354,27 @@ def _ref_layernorm(inputs: dict) -> torch.Tensor:
 def _ref_flash_attention(inputs: dict) -> torch.Tensor:
     import reference
     return reference.flash_attention_ref(inputs["Q"], inputs["K"], inputs["V"])
+
+def _ref_gqa_prefill_attention(inputs: dict) -> torch.Tensor:
+    import reference
+    return reference.gqa_prefill_attention_ref(inputs["Q"], inputs["K"], inputs["V"])
+
+def _sdpa_gqa_prefill_attention(inputs: dict) -> torch.Tensor:
+    """Timing baseline: PyTorch SDPA with a bottom-right causal mask (the float32 oracle is far too slow to time)."""
+    from torch.nn.attention.bias import causal_lower_right
+    Q, K, V = inputs["Q"], inputs["K"], inputs["V"]
+    mask = causal_lower_right(Q.shape[-2], K.shape[-2])
+    try:
+        return F.scaled_dot_product_attention(Q, K, V, attn_mask=mask, enable_gqa=True)
+    except RuntimeError:
+        # Some backends take grouped KV heads only when expanded to one KV head per query head.
+        group = Q.shape[1] // K.shape[1]
+        return F.scaled_dot_product_attention(Q, K.repeat_interleave(group, dim=1),
+                                              V.repeat_interleave(group, dim=1), attn_mask=mask)
+
+def _gqa_prefill_visible_pairs(s: dict) -> int:
+    """(query, key) pairs the bottom-right causal mask keeps: query i sees kv_len - q_len + i + 1 keys."""
+    return s["q_len"] * s["kv_len"] - s["q_len"] * (s["q_len"] - 1) // 2
 
 def _ref_fused_mlp(inputs: dict) -> torch.Tensor:
     import reference
@@ -451,6 +530,44 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "edge_sizes": [
             ("edge_127",  {"batch": 1, "heads": 8, "seq_len": 127,  "head_dim": 64}),
             ("edge_1023", {"batch": 1, "heads": 8, "seq_len": 1023, "head_dim": 64}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # GQA PREFILL ATTENTION (one prefill chunk against a long KV cache)
+    # -----------------------------------------------------------------
+    # Q: [batch, heads_q, q_len, head_dim] at positions kv_len - q_len .. kv_len - 1; K, V: [batch, heads_kv,
+    # kv_len, head_dim]. Bottom-right causal mask. The oracle is an exact float32 online softmax; the timing
+    # baseline is PyTorch SDPA (baseline_fn), not the engine's own prefill kernel: measure against that in the
+    # engine (engine/prefill_ttft.py) before claiming a serving win.
+    "gqa_prefill_attention": {
+        "test_sizes": [
+            ("tiny",          {"batch": 1, "heads_q": 8,  "heads_kv": 1, "q_len": 64,    "kv_len": 64,      "head_dim": 128}),
+            ("small",         {"batch": 2, "heads_q": 8,  "heads_kv": 2, "q_len": 256,   "kv_len": 2048,    "head_dim": 128}),
+            ("medium",        {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 2048,  "kv_len": 16384,   "head_dim": 256}),
+            ("large",         {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 8192,  "kv_len": 131072,  "head_dim": 256}),
+            ("chunk16k_256k", {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 16384, "kv_len": 262144,  "head_dim": 256}),
+            ("chunk8k_1m",    {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 8192,  "kv_len": 1048576, "head_dim": 256}),
+            ("chunk32k_1m",   {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 32768, "kv_len": 1048576, "head_dim": 256}),
+            ("d128_8k_1m",    {"batch": 1, "heads_q": 32, "heads_kv": 4, "q_len": 8192,  "kv_len": 1048576, "head_dim": 128}),
+        ],
+        "test_dtypes": [torch.bfloat16, torch.float16],
+        "tolerances": {
+            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
+            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
+        },
+        # 2 FLOPs per multiply-add in Q@K^T and in P@V, over the visible (query, key) pairs only
+        "flops_fn": lambda s: 4 * s["batch"] * s["heads_q"] * s["head_dim"] * _gqa_prefill_visible_pairs(s),
+        "bytes_fn": lambda s, dt: (2 * s["batch"] * s["heads_q"] * s["q_len"]
+                                   + 2 * s["batch"] * s["heads_kv"] * s["kv_len"]) * s["head_dim"] * _dtype_bytes(dt),
+        "input_generator": gen_gqa_prefill_attention_inputs,
+        "reference_fn": _ref_gqa_prefill_attention,
+        "baseline_fn": _sdpa_gqa_prefill_attention,
+        "edge_sizes": [
+            ("edge_q1",   {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1,    "kv_len": 4097, "head_dim": 256}),
+            ("edge_odd",  {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1000, "kv_len": 5003, "head_dim": 256}),
+            ("edge_full", {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1500, "kv_len": 1500, "head_dim": 256}),
         ],
     },
 
@@ -1007,6 +1124,8 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
     gen_fn = config["input_generator"]
     ref_fn = config["reference_fn"]
     flops_fn = config["flops_fn"]
+    # An op may time a faster baseline than its correctness oracle (an exact float32 oracle can take seconds).
+    base_fn = config.get("baseline_fn") or ref_fn
     bytes_fn = config["bytes_fn"]
     dtypes = config["test_dtypes"]
 
@@ -1059,7 +1178,7 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
             # Benchmark PyTorch reference
             with _Timeout(30):
-                ref_ms = _do_bench(lambda: ref_fn(inputs), warmup=25, rep=100)
+                ref_ms = _do_bench(lambda: base_fn(inputs), warmup=25, rep=100)
 
             # Compute metrics
             kernel_us = kernel_ms * 1000.0

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Long-context prefill
+
+- Added the `gqa_prefill_attention` op: one causal prefill chunk of q_len queries against kv_len keys (the cached prefix plus the chunk), grouped KV heads, bottom-right causal mask. Sizes run from 64 keys to 32K-query chunks over 1M keys at head_dim 128 and 256, with causal FLOP counting. Its oracle (`reference.gqa_prefill_attention_ref`) is an exact float32 online softmax over KV tiles, and inputs make attention peaked so the tolerance still means something at 1M keys. A Triton starter is in `kernels/gqa_prefill_attention.py`.
+- `bench.py` times an op's optional `baseline_fn` instead of its oracle when one is given; gqa_prefill_attention times PyTorch SDPA with a bottom-right causal mask.
+- Fixed: running a script from the repository put AutoKernel's `profile.py` ahead of the standard-library module that `cProfile` imports, so anything that imported `torch._dynamo` (torch.compile, `torch.nn.attention.bias`) failed with "module 'profile' has no attribute 'run'". `bench.py` now registers the standard-library module first.
+- `calibrate.py` measures an attention peak per SDPA backend at long-prefill shapes (`--attention`), after checking each backend against the float32 oracle.
+- Added `engine/prefill_ttft.py`: time to first token at long ISL, cold or after a primed prefix (warm), with the same identity and comparison gates as `decode_step.py`.
+- CPU tests: `tests/test_gqa_prefill_attention.py`, `tests/test_gqa_prefill_attention_kernel.py` (Triton interpreter), `tests/test_calibrate_attention.py`, `engine/test_prefill_ttft.py`.
+
+### Datacenter Blackwell support
+
+- Added B200, B300, GB200, GB300 and H200 to the GPU database in `bench.py` and `profile.py`. Blackwell entries read L2 size from the device. Before this, Blackwell GPUs fell back to a clock-based estimate of ~500 GB/s HBM bandwidth (real: ~8 TB/s), so every `pct_peak_bandwidth` and roofline verdict was wrong.
+- The unknown-GPU fallback now computes bandwidth from `memory_clock_rate` x `memory_bus_width` when PyTorch exposes them, and warns that the peaks are estimates.
+- Added `calibrate.py`: measures achieved HBM bandwidth (device copy) and FP16/BF16 GEMM throughput, and compares them to the database entry.
+- `kernels/cuda/_compile.py` targets `sm_90a` / `sm_100a` / `sm_103a` on Hopper and datacenter Blackwell, so kernels can use wgmma / tcgen05 / TMEM.
+- Added Blackwell sections to the Triton and CUDA playbooks in `program.md`.
+
+### Engine mode
+
+- Refuse incomplete decode streams: require `[DONE]`, a successful finish reason, exact requested completion usage and matching prompt usage. Invalid points retain explicit reasons.
+- Sum running-request metrics across engines and retain all poll attempts. Sampled occupancy now requires fresh, sufficiently frequent coverage, bounded sample/boundary gaps, stable series and no overlapping failed polls; insufficient evidence stays UNVERIFIED.
+- Label latency as SSE event gaps, retaining `step_ms_*` and `tokens_per_step` compatibility keys with `step_basis: "sse-event-gap"`. Detect multi-token merged events without speculation and refuse their unverified event-gap ratios unless explicitly overridden. Profiler graph-replay timing remains necessary for engine-step claims.
+- Correct window token accounting using cumulative usage at each boundary independently of the latency-gap filter. Keep `window` as the default; record `window_token_basis` and refuse comparisons against older gap-filtered window rates. Added regression counterexamples for truncation, sparse metrics, merged events and staggered boundary tokens.
+- Decode-step schema v2 records a validated declared identity (hardware, image, engine, model/revision, parallelism, speculation, KV dtype and arm). `compare` and `table` refuse undeclared identity differences (exit 4); exact dotted `--arm-delta` keys declare planned changes. Missing identity requires an explicitly `UNQUALIFIED` override.
+- Enforced exact-B evidence in comparisons and progress tables (exit 5), including unverified metrics and raw repetitions. `--allow-inexact` marks affected rows and ratios instead of silently qualifying them.
+- Persisted first/last output arrival timestamps and both usage-based full-stream `N/dt` and `(N-1)/dt` rates per stream. The primary rate defaults to `window` (usage-token delta inside the exact-B window, prefill excluded); `--rate-formula-primary` selects a full-stream formula instead, and headers name it. Removed the chunk-count fallback.
+- Old result JSON remains readable with a labelled legacy rate basis; corrected and legacy window accounting cannot be mixed. Added an offline dry-run plan, progress logs, and synthetic regression tests covering successful and refused comparisons without a server.
+- Added `engine/decode_step.py`: decode-window benchmark for a running vLLM server. It reports median event-gap latency, decode tok/s, tok/s/user and tokens per event, checks sampled occupancy through `/metrics`, and has a `compare` command that refuses mismatched profiles.
+- Added the optional `engine` dependency group (`httpx`).
+
 ## v1.3.0 -- 2026-03-13
 
 ### AMD ROCm GPU Support (PR #3 by @andyluo7)

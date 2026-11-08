@@ -79,10 +79,11 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | `orchestrate.py` | Multi-kernel scheduler: decides which kernel to optimize next using Amdahl's law, tracks aggregate progress |
 | `bench.py` | Fixed benchmark: 5-stage correctness (smoke, shape sweep, numerical stability, determinism, edge cases) + performance + roofline |
 | `verify.py` | Plugs optimized kernels back into the model, checks end-to-end correctness, reports total speedup |
+| `calibrate.py` | Measures achieved HBM bandwidth and FP16/BF16 GEMM throughput on a new GPU and compares them to the roofline peaks in the GPU database |
 
 ## Supported Kernels
 
-9 kernel types covering the core operations of modern deep learning:
+10 kernel types covering the core operations of modern deep learning:
 
 | Kernel | Description | Key Metric |
 |--------|-------------|------------|
@@ -91,12 +92,13 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | **layernorm** | Layer normalization with affine transform | GB/s |
 | **rmsnorm** | RMS normalization (LLaMA-style) | GB/s |
 | **flash_attention** | Scaled dot-product attention with causal masking | TFLOPS |
+| **gqa_prefill_attention** | One causal prefill chunk against a long KV cache (up to 1M keys), grouped KV heads, bottom-right mask | TFLOPS |
 | **fused_mlp** | SwiGLU-style fused MLP (gate + up + down) | TFLOPS |
 | **cross_entropy** | Fused cross entropy loss | GB/s |
 | **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
 | **reduce** | Parallel reduction (sum) | GB/s |
 
-Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
+Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/` (gqa_prefill_attention has a Triton starter only). gqa_prefill_attention's reference is an exact float32 online softmax over KV tiles, and its timing baseline is PyTorch SDPA, because the oracle is far too slow to time at 1M keys.
 
 ## Example Models
 
@@ -152,6 +154,147 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 | `kernelbench/bench_kb.py` | Evaluates `ModelNew` vs `Model`: 5-trial correctness + CUDA event timing + stability + determinism |
 | `kernelbench/scorer.py` | Batch evaluation across a level, computes `fast_p` at thresholds (1.0x, 1.5x, 2.0x, 3.0x, 5.0x) |
 | `kernelbench/program_kb.md` | Agent instructions for KernelBench mode |
+
+## Engine Mode: Long-Prompt TTFT
+
+`engine/prefill_ttft.py` times prefill on a running server: one single-token streaming request per run,
+prompts of exactly ISL random token IDs (for example 128K to 1M), one request at a time.
+
+- `--mode cold`: every run sends a fresh prompt, so the prefix cache cannot help.
+- `--mode warm`: an untimed priming request reads a fresh prefix, then the timed request sends the same
+  prefix plus a fresh `--suffix-tokens` tail (a follow-up question over an already-read document). The
+  server's `cached_tokens` is recorded when it reports one (vLLM `--enable-prompt-tokens-details`); a warm
+  run with no cache hit is flagged.
+
+It uses the same identity file and comparison gates as `decode_step.py`.
+
+```bash
+uv run engine/prefill_ttft.py run --base-url http://127.0.0.1:8000 --model <served-name> \
+  --isl 131072,262144,524288,1048576 --runs 3 --label stock --identity stock-identity.json --out results/ttft-stock.json
+uv run engine/prefill_ttft.py compare results/ttft-stock.json results/ttft-ours.json --arm-delta image.digest,arm.label
+```
+
+`calibrate.py` also measures an attention peak: dense attention of an 8K-query chunk over 128K keys at
+head_dim 128 and 256, per SDPA backend (flash, cuDNN, memory-efficient), each checked against the float32
+oracle before it is timed. Pass `--attention QxKV:HQ/HKV:D` for other shapes.
+
+## Engine Mode: Decode-Step Benchmark
+
+Kernel speedups only matter if the serving engine's decode step gets faster. `engine/decode_step.py`
+records **SSE event-gap latency** and usage-based throughput in a common decode window at requested
+batch B. vLLM's output collector can merge outputs when a consumer falls behind: an SSE event
+is not necessarily one engine step. `/metrics` supplies **sampled occupancy**, not scheduler-level
+proof that exactly B requests ran at every instant.
+
+Supply a local identity JSON for each arm. All fields below are required; values are
+illustrative placeholders to replace with the actual measurement configuration.
+`sm_count` is per GPU; `gpu_count` is the allocated GPU count. Use `method: "none"`,
+`k: 0`, and `draft_revision: null` when speculation is disabled. Additional fields
+are preserved and compared. The harness records declarations; it does not attest them.
+
+```json
+{
+  "hardware": {"gpu_name": "NVIDIA H100", "gpu_count": 2, "sm_count": 132, "driver": "<driver version>"},
+  "image": {"digest": "sha256:<actual image digest>"},
+  "engine": {"version": "<engine version or commit>"},
+  "model": {"id": "Qwen/Qwen3-8B", "revision": "<immutable revision>"},
+  "parallelism": {"tp": 2, "dcp": 1, "ep": 1},
+  "speculation": {"method": "none", "k": 0, "draft_revision": null},
+  "kv_dtype": "auto",
+  "arm": {"label": "stock"}
+}
+```
+
+```bash
+uv sync --extra engine
+
+# Baseline twice (the A/A ratio is your noise floor), then the candidate
+uv run engine/decode_step.py run --base-url http://127.0.0.1:8000 --model Qwen/Qwen3-8B \
+ --batch 1,2,4,8,16,32,64 --isl 1 --osl 1024 --label stock \
+ --identity stock-identity.json --out results/stock.json
+# Repeat the same workload for stock-repeat.json, then ours.json with its own identity.
+
+uv run engine/decode_step.py compare results/stock.json results/stock-repeat.json
+uv run engine/decode_step.py compare results/stock.json results/ours.json --arm-delta image.digest,arm.label
+uv run engine/decode_step.py table results/stock.json results/ours.json --arm-delta image.digest,arm.label
+```
+
+- Prompts are random token IDs, so ISL is exact and the prefix cache cannot help.
+- Tokens come from continuous `usage.completion_tokens`, including multi-token speculative chunks.
+  Missing, non-increasing, or inconsistent usage invalidates the stream; chunk counts never substitute.
+  A successful stream also requires `[DONE]`, a `stop` or `length` finish reason, the exact
+  requested completion count, and observed prompt usage equal to the requested ISL. Truncated
+  streams, missing terminal evidence and token-count mismatches invalidate the point with reasons.
+- `/metrics` sums **all** matching `vllm:num_requests_running` series across engines, with a
+  250 ms pause between polls. Every attempt is retained in `metric_polls`, including failures
+  and request/response timestamps. The `occupancy` record states the coverage bounds and reasons:
+  at least `max(2, ceil(window_s / 1.5) + 1)` distinct fresh samples; no sample-to-sample or
+  window-boundary gap above **1.5 s**; a fresh sample's scrape completes within **1.0 s**; and the
+  engine-series set remains present and stable. Failed or slow polls never count as fresh and are
+  reported, but a lone one voids nothing while the gap bound holds, since `/metrics` competes with
+  B streams on a busy API server. Missing,
+  duplicate, negative or non-finite metric values are failed polls. Insufficient coverage makes
+  `exact_b: null` / `UNVERIFIED`; adequate coverage with an observed count different from B gives
+  `false`. Even `true` means only that this **sampled occupancy** check passed.
+- `compare` and `table` require `exact_b_all: true`, coverage evidence, and usable event statistics,
+  checking raw repetitions when present. Failures refuse with **exit 5**. `--allow-inexact`
+  permits diagnostic output with affected rows and ratios explicitly marked.
+- Compatibility keys `step_ms_p50`, `step_ms_p90` and `tokens_per_step` remain, with
+  `step_basis: "sse-event-gap"`; tables say **event gap** and **tokens/event**. When identity
+  declares `speculation.k == 0`, any event carrying more than one usage token (including the
+  first event) is counted in `merged_events`. A positive count marks that point's `step_status`
+  `UNVERIFIED` and blocks event-gap ratios unless `--allow-inexact` is passed. `EVENT_GAP` means
+  only an event statistic, never a verified engine step. With speculation or unknown identity,
+  merging cannot be inferred from token counts: `merged_events` is null and the limitation is
+  recorded in `step_reason`. Cross-check latency with **graph-replay time from a profiler**.
+- Both commands refuse different workload profiles, primary rate formulas, or undeclared identity
+  differences with **exit 4**, naming the differing keys. `--arm-delta` lists exact dotted leaf
+  keys, such as `image.digest,arm.label` or `speculation.method,speculation.k,speculation.draft_revision`.
+  It grants no workload exceptions. Parent keys and unknown keys refuse; no differences are implicit.
+- Without `--identity`, `run` warns and writes `identity: null`. Comparisons refuse missing identity
+  with **exit 4** unless `--allow-missing-identity` is supplied; output then says `UNQUALIFIED`.
+  An incomplete or malformed identity cannot use that override. `table` applies the same identity gate.
+- `run --dry-run` prints the resolved measurement plan without HTTP calls or output writes.
+  Each real warmup/timed run logs progress to `<out>.log` (or `decode-step.log` without `--out`);
+  `--log` selects another log path. Keep credentials out of identity files, labels, URLs and notes.
+
+New output uses schema `autokernel-decode-step.v2`. Each repetition includes `streams`, even
+without `--keep-timelines`: `t_first_output_token`, `t_last_output_token` (client monotonic
+seconds), usage token counts, and both `tok_s_n_over_dt` and `tok_s_n_minus_1_over_dt`.
+Here **N is the full-stream usage count** and **dt is last output arrival minus first output
+arrival**; usage-only trailers do not extend dt. Single-token or nonpositive intervals have null rates.
+Each repetition's full-stream rates are the mean across its streams; summaries take the median
+across valid repetitions. `rate_formula_primary` defaults to **`window`**: usage-token deltas inside
+the common decode window divided by its duration (`window_decode_tok_s`), per user as
+`tok_s_window_per_user`. The window starts at the latest first-token arrival and ends at the
+earliest last-token arrival. For **each stream**, subtract the last cumulative usage **at or before
+the start** from the last cumulative usage **at or before the end**; interpolate nothing. This
+accounting is independent of the fully-contained-gap filter used for event latency and tokens/event.
+`window_tokens` and `window_boundary_usage` retain the numerator and per-stream boundary counts;
+`window_token_basis: "cumulative-at-boundaries"` identifies this corrected accounting.
+Select `--rate-formula-primary '(N-1)/dt'` (production decode telemetry's
+formula) or `'N/dt'` explicitly for the full-stream rates; these can include other requests'
+prefill overlap. Tables name the selected formula; `tok_s_per_user` uses it and `decode_tok_s` is
+B times it.
+
+Old JSON still loads. Its missing identity needs the explicit override, and missing occupancy or
+event-statistic evidence also requires `--allow-inexact`. Old rates retain the label
+`legacy window delta/dt`; summaries cannot reconstruct first/last stream timestamps or missing
+boundary tokens. Older files counted only tokens in fully-contained event gaps, so their window
+rates **cannot compare with corrected boundary-based rates** (exit 4, `window_token_basis`).
+Different primary formulas also refuse with exit 4: rerun both arms on the same accounting basis
+before using their ratios. Exit 2 denotes bad run arguments or no valid runs;
+exit 3 denotes an unreadable result or log. Overrides are diagnostic, not qualified evidence.
+
+Offline regression gates (no server or GPU; includes refusal cases):
+
+```bash
+python -m pytest engine/test_decode_step.py
+# If pytest is unavailable:
+python -m unittest engine.test_decode_step -v
+```
+
+Run the client on the server's host, and cross-check event-gap measurements against nsys graph-replay time.
 
 ## HuggingFace Kernels Export
 
