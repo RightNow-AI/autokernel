@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Long-context prefill
+
+- Added the `gqa_prefill_attention` op: one causal prefill chunk of q_len queries against kv_len keys (the cached prefix plus the chunk), grouped KV heads, bottom-right causal mask. Sizes run from 64 keys to 32K-query chunks over 1M keys at head_dim 128 and 256, with causal FLOP counting. Its oracle (`reference.gqa_prefill_attention_ref`) is an exact float32 online softmax over KV tiles, and inputs make attention peaked so the tolerance still means something at 1M keys. A Triton starter is in `kernels/gqa_prefill_attention.py`.
+- `bench.py` times an op's optional `baseline_fn` instead of its oracle when one is given; gqa_prefill_attention times PyTorch SDPA with a bottom-right causal mask.
+- Fixed: running a script from the repository put AutoKernel's `profile.py` ahead of the standard-library module that `cProfile` imports, so anything that imported `torch._dynamo` (torch.compile, `torch.nn.attention.bias`) failed with "module 'profile' has no attribute 'run'". `bench.py` now registers the standard-library module first.
+- `calibrate.py` measures an attention peak per SDPA backend at long-prefill shapes (`--attention`), after checking each backend against the float32 oracle.
+- Added `engine/prefill_ttft.py`: time to first token at long ISL, cold or after a primed prefix (warm), with the same identity and comparison gates as `decode_step.py`.
+- CPU tests: `tests/test_gqa_prefill_attention.py`, `tests/test_gqa_prefill_attention_kernel.py` (Triton interpreter), `tests/test_calibrate_attention.py`, `engine/test_prefill_ttft.py`.
+
 ### Datacenter Blackwell support
 
 - Added B200, B300, GB200, GB300 and H200 to the GPU database in `bench.py` and `profile.py`. Blackwell entries read L2 size from the device. Before this, Blackwell GPUs fell back to a clock-based estimate of ~500 GB/s HBM bandwidth (real: ~8 TB/s), so every `pct_peak_bandwidth` and roofline verdict was wrong.

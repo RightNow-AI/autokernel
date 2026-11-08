@@ -809,6 +809,7 @@ kernels/                    Triton starters (Python + @triton.jit)
   layernorm.py                -- layer normalization
   rmsnorm.py                  -- RMS normalization
   flash_attention.py          -- flash attention (block-wise online softmax)
+  gqa_prefill_attention.py    -- one prefill chunk against a long KV cache (grouped KV heads, bottom-right causal)
   fused_mlp.py                -- fused SwiGLU MLP
   cross_entropy.py            -- fused cross entropy loss
   rotary_embedding.py         -- rotary position embeddings

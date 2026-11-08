@@ -83,7 +83,7 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 
 ## Supported Kernels
 
-9 kernel types covering the core operations of modern deep learning:
+10 kernel types covering the core operations of modern deep learning:
 
 | Kernel | Description | Key Metric |
 |--------|-------------|------------|
@@ -92,12 +92,13 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | **layernorm** | Layer normalization with affine transform | GB/s |
 | **rmsnorm** | RMS normalization (LLaMA-style) | GB/s |
 | **flash_attention** | Scaled dot-product attention with causal masking | TFLOPS |
+| **gqa_prefill_attention** | One causal prefill chunk against a long KV cache (up to 1M keys), grouped KV heads, bottom-right mask | TFLOPS |
 | **fused_mlp** | SwiGLU-style fused MLP (gate + up + down) | TFLOPS |
 | **cross_entropy** | Fused cross entropy loss | GB/s |
 | **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
 | **reduce** | Parallel reduction (sum) | GB/s |
 
-Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/`.
+Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/` (gqa_prefill_attention has a Triton starter only). gqa_prefill_attention's reference is an exact float32 online softmax over KV tiles, and its timing baseline is PyTorch SDPA, because the oracle is far too slow to time at 1M keys.
 
 ## Example Models
 
@@ -153,6 +154,29 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 | `kernelbench/bench_kb.py` | Evaluates `ModelNew` vs `Model`: 5-trial correctness + CUDA event timing + stability + determinism |
 | `kernelbench/scorer.py` | Batch evaluation across a level, computes `fast_p` at thresholds (1.0x, 1.5x, 2.0x, 3.0x, 5.0x) |
 | `kernelbench/program_kb.md` | Agent instructions for KernelBench mode |
+
+## Engine Mode: Long-Prompt TTFT
+
+`engine/prefill_ttft.py` times prefill on a running server: one single-token streaming request per run,
+prompts of exactly ISL random token IDs (for example 128K to 1M), one request at a time.
+
+- `--mode cold`: every run sends a fresh prompt, so the prefix cache cannot help.
+- `--mode warm`: an untimed priming request reads a fresh prefix, then the timed request sends the same
+  prefix plus a fresh `--suffix-tokens` tail (a follow-up question over an already-read document). The
+  server's `cached_tokens` is recorded when it reports one (vLLM `--enable-prompt-tokens-details`); a warm
+  run with no cache hit is flagged.
+
+It uses the same identity file and comparison gates as `decode_step.py`.
+
+```bash
+uv run engine/prefill_ttft.py run --base-url http://127.0.0.1:8000 --model <served-name> \
+  --isl 131072,262144,524288,1048576 --runs 3 --label stock --identity stock-identity.json --out results/ttft-stock.json
+uv run engine/prefill_ttft.py compare results/ttft-stock.json results/ttft-ours.json --arm-delta image.digest,arm.label
+```
+
+`calibrate.py` also measures an attention peak: dense attention of an 8K-query chunk over 128K keys at
+head_dim 128 and 256, per SDPA backend (flash, cuDNN, memory-efficient), each checked against the float32
+oracle before it is timed. Pass `--attention QxKV:HQ/HKV:D` for other shapes.
 
 ## Engine Mode: Decode-Step Benchmark
 
