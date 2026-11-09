@@ -79,7 +79,7 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | `orchestrate.py` | Multi-kernel scheduler: decides which kernel to optimize next using Amdahl's law, tracks aggregate progress |
 | `bench.py` | Fixed benchmark: 5-stage correctness (smoke, shape sweep, numerical stability, determinism, edge cases) + performance + roofline |
 | `verify.py` | Plugs optimized kernels back into the model, checks end-to-end correctness, reports total speedup |
-| `calibrate.py` | Measures achieved HBM bandwidth and FP16/BF16 GEMM throughput on a new GPU and compares them to the roofline peaks in the GPU database |
+| `calibrate.py` | Measures achieved HBM bandwidth, FP16/BF16 GEMM throughput and a dense-attention peak on a new GPU, and compares them to the roofline peaks in the GPU database |
 
 ## Supported Kernels
 
@@ -92,13 +92,21 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 | **layernorm** | Layer normalization with affine transform | GB/s |
 | **rmsnorm** | RMS normalization (LLaMA-style) | GB/s |
 | **flash_attention** | Scaled dot-product attention with causal masking | TFLOPS |
-| **gqa_prefill_attention** | One causal prefill chunk against a long KV cache (up to 1M keys), grouped KV heads, bottom-right mask | TFLOPS |
+| **gqa_prefill_attention** | One causal prefill chunk against a long KV cache (up to 1M keys), grouped KV heads, bottom-right mask, contiguous or paged KV | TFLOPS |
 | **fused_mlp** | SwiGLU-style fused MLP (gate + up + down) | TFLOPS |
 | **cross_entropy** | Fused cross entropy loss | GB/s |
 | **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
 | **reduce** | Parallel reduction (sum) | GB/s |
 
 Each has a PyTorch reference in `reference.py`, a starter Triton kernel in `kernels/`, and a starter CUDA C++ kernel in `kernels/cuda/` (gqa_prefill_attention has a Triton starter only). gqa_prefill_attention's reference is an exact float32 online softmax over KV tiles, and its timing baseline is PyTorch SDPA, because the oracle is far too slow to time at 1M keys.
+
+gqa_prefill_attention counts FLOPs over the (query, key) pairs the causal mask keeps. A size with a `page_size` reads K and V the way a serving engine stores them: page pools `[num_pages, page_size, heads_kv, head_dim]`, an int32 `block_table` and `kv_len`. The pages are shuffled, and the reserved page 0 and each last page's unused slots hold large values, so a kernel that ignores the table or gets the length wrong fails. `--page-size N` runs every size at the engine's page size (`0` = contiguous). `--calibration` adds `pct_calibrated_peak`: throughput as a percentage of the dense-attention peak `calibrate.py` measured on this GPU at the same head_dim, instead of only the datasheet's tensor-core peak.
+
+```bash
+uv run calibrate.py --attention 8192x131072:16/2:256 --attention 8192x1048576:16/2:256 --out results/calibrate.json
+cp kernels/gqa_prefill_attention.py kernel.py
+uv run bench.py --page-size 16 --calibration results/calibrate.json
+```
 
 ## Example Models
 
@@ -157,26 +165,33 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 
 ## Engine Mode: Long-Prompt TTFT
 
-`engine/prefill_ttft.py` times prefill on a running server: one single-token streaming request per run,
-prompts of exactly ISL random token IDs (for example 128K to 1M), one request at a time.
+`engine/prefill_ttft.py` times prefill on a running server: single-token streaming requests whose prompts
+are exactly ISL random token IDs (for example 128K to 1M), one request at a time.
 
-- `--mode cold`: every run sends a fresh prompt, so the prefix cache cannot help.
-- `--mode warm`: an untimed priming request reads a fresh prefix, then the timed request sends the same
-  prefix plus a fresh `--suffix-tokens` tail (a follow-up question over an already-read document). The
-  server's `cached_tokens` is recorded when it reports one (vLLM `--enable-prompt-tokens-details`); a warm
-  run with no cache hit is flagged.
+- `--mode cold`: every run sends one fresh prompt, so the prefix cache cannot help.
+- `--mode warm`: every run sends the same prefix twice and times both requests, each exactly ISL tokens:
+  cold (a fresh prefix plus a fresh `--suffix-tokens` tail), then warm (the same prefix plus another fresh
+  tail: a follow-up question over an already-read document; `--suffix-tokens 0` resends the same prompt).
+  One run reports cold and warm TTFT and their ratio per ISL. When the server reports `cached_tokens`
+  (vLLM `--enable-prompt-tokens-details`), a cold request with cached tokens or a warm one without them is
+  invalid; when it does not, warm cells are marked as unverified.
 
-It uses the same identity file and comparison gates as `decode_step.py`.
+Token counts come from `usage` (prompt tokens must equal ISL, one completion token). It writes the raw JSON
+and a per-request log, and uses the same identity file and comparison gates as `decode_step.py`: `compare`
+and `table` refuse a profile mismatch (exit 4). The server's `max_model_len` must be at least ISL + 1.
 
 ```bash
-uv run engine/prefill_ttft.py run --base-url http://127.0.0.1:8000 --model <served-name> \
-  --isl 131072,262144,524288,1048576 --runs 3 --label stock --identity stock-identity.json --out results/ttft-stock.json
+uv run engine/prefill_ttft.py run --base-url http://127.0.0.1:8000 --model <served-name> --mode warm \
+  --isl 131072,262144,524288,1048575 --runs 3 --label stock --identity stock-identity.json --out results/ttft-stock.json
+uv run engine/prefill_ttft.py table results/ttft-stock.json        # cold vs warm for one run
 uv run engine/prefill_ttft.py compare results/ttft-stock.json results/ttft-ours.json --arm-delta image.digest,arm.label
 ```
 
 `calibrate.py` also measures an attention peak: dense attention of an 8K-query chunk over 128K keys at
-head_dim 128 and 256, per SDPA backend (flash, cuDNN, memory-efficient), each checked against the float32
-oracle before it is timed. Pass `--attention QxKV:HQ/HKV:D` for other shapes.
+head_dim 128 and 256, per SDPA backend (flash, cuDNN, memory-efficient) and FlashInfer when installed, each
+checked against the float32 oracle before it is timed. The best one is `attention_tflops`, next to the
+bandwidth and GEMM peaks. Pass `--attention QxKV:HQ/HKV:D` for other shapes and `--out` to write the JSON
+that `bench.py --calibration` reads.
 
 ## Engine Mode: Decode-Step Benchmark
 

@@ -1,31 +1,34 @@
 """
 AutoKernel engine mode -- time to first token (TTFT) for long prompts on a running vLLM server.
 
-Prefill as the client sees it. Each run is one streaming /v1/completions request with a prompt of exactly
-ISL random token IDs, max_tokens = min_tokens = 1 (no decode tail), temperature 0, so the TTFT is one prefill
-alone on the engine. Runs go one at a time: nothing else shares the engine while a run is timed.
+Prefill as the client sees it. Each request is one streaming /v1/completions request with a prompt of exactly
+ISL random token IDs, max_tokens = min_tokens = 1 (no decode tail), temperature 0, so its TTFT is one prefill
+alone on the engine. Requests go one at a time: nothing else shares the engine while one is timed.
 
 Modes:
-  cold  every run sends a fresh random prompt, so the prefix cache cannot help (the default).
-  warm  every run first sends an untimed priming request whose prompt is a fresh prefix of ISL - SUFFIX
-        tokens, then times a request with that same prefix and a fresh SUFFIX-token tail: the follow-up
-        question over an already-read document. It needs prefix caching on the server. The server's
-        usage.prompt_tokens_details.cached_tokens is recorded when reported (vLLM:
-        --enable-prompt-tokens-details); a warm run that reports no cached tokens is marked no_cache_hit.
+  cold  every run sends one fresh random prompt, so the prefix cache cannot help (the default).
+  warm  every run sends the same prefix twice, one request right after the other, and times both. The cold
+        request is a fresh prefix of ISL - SUFFIX tokens plus a fresh SUFFIX-token tail; the warm request is
+        the same prefix plus another fresh tail (--suffix-tokens 0: the same prompt again). Both are exactly
+        ISL tokens, so one run reports cold and warm TTFT at the same length: the first question over a
+        document, then a follow-up over the already-read document. It needs prefix caching on the server.
+        When the server reports usage.prompt_tokens_details.cached_tokens (vLLM: --enable-prompt-tokens-details)
+        it is checked: a cold request that reports cached tokens, or a warm one that reports none, is invalid.
+        A warm request whose cold request failed is invalid too.
 
-TTFT = arrival of the first output event - request start (client clock, perf_counter). Every run must end
-with [DONE], one completion token and prompt_tokens equal to ISL, or it is invalid. Prompts are token IDs,
-so tokenization is not measured. Run the client on the server's host, and cross-check against the server's
-histogram (vllm:time_to_first_token_seconds).
+TTFT = arrival of the first output event - request start (client clock, perf_counter). Every request must end
+with [DONE], one completion token and prompt_tokens equal to ISL (both from usage), or it is invalid. Prompts
+are token IDs, so tokenization is not measured. Run the client on the server's host, and cross-check against
+the server's histogram (vllm:time_to_first_token_seconds). The server's max_model_len must be at least ISL + 1.
 
 Usage:
     uv run --extra engine engine/prefill_ttft.py run --base-url http://127.0.0.1:8000 --model <served-name> \\
-        --isl 131072,262144,524288,1048576 --runs 3 --label stock --out results/ttft-stock.json
+        --isl 131072,262144,524288,1048575 --runs 3 --label stock --out results/ttft-stock.json
     uv run --extra engine engine/prefill_ttft.py run ... --mode warm --suffix-tokens 512 --label stock-warm
     uv run --extra engine engine/prefill_ttft.py compare results/ttft-stock.json results/ttft-exp01.json
-    uv run --extra engine engine/prefill_ttft.py table results/ttft-stock.json results/ttft-exp*.json
+    uv run --extra engine engine/prefill_ttft.py table results/ttft-stock-warm.json [results/ttft-exp*.json]
 
-Exit codes: 0 ok, 2 usage error or no valid run at any ISL, 3 missing/unreadable file, 4 incompatible
+Exit codes: 0 ok, 2 usage error or no valid request at any ISL, 3 missing/unreadable file, 4 incompatible
 profile or identity.
 """
 
@@ -52,9 +55,11 @@ try:
 except ImportError:
     httpx = None
 
-SCHEMA = "autokernel-prefill-ttft.v1"
+SCHEMA = "autokernel-prefill-ttft.v2"
 # Fields that must match between two runs for a comparison to mean anything
 PROFILE_FIELDS = ("model", "isls", "mode", "suffix_tokens", "runs", "seed", "token_id_range")
+# The timed requests of one run, in the order they are sent
+LEGS = {"cold": ("cold",), "warm": ("cold", "warm")}
 REQUEST_TIMEOUT_S = 3600.0
 
 
@@ -127,6 +132,22 @@ async def stream_first_token(client, url: str, headers: dict, model: str, prompt
     return rec
 
 
+def judge_leg(leg: str, rec: dict, run: dict) -> dict:
+    """Cache evidence on top of the stream checks. A cold request must not hit the prefix cache; a warm one
+    needs its cold request to have succeeded and, when the server reports cached tokens, a hit."""
+    errors = [rec["error"]] if rec["error"] else []
+    cached = rec["cached_tokens"]
+    if leg == "cold" and cached:
+        errors.append(f"cold request reported {cached} cached tokens")
+    if leg == "warm":
+        if run["cold"]["error"]:
+            errors.append("its cold request failed")
+        if cached == 0:
+            errors.append("warm request reported no cached tokens")
+    rec["error"] = "; ".join(errors) or None
+    return rec
+
+
 # ---------------------------------------------------------------------------
 # A whole run
 # ---------------------------------------------------------------------------
@@ -140,6 +161,7 @@ async def measure(args, log, client=None) -> dict:
     headers = {"Authorization": f"Bearer {os.environ[args.api_key_env]}"} if args.api_key_env else {}
     token_range = tuple(int(v) for v in args.token_id_range.split(","))
     rng = random.Random(args.seed)
+    legs = LEGS[args.mode]
     own = client is None
     if own:
         client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_S))
@@ -149,43 +171,54 @@ async def measure(args, log, client=None) -> dict:
             runs = []
             for i in range(args.warmup + args.runs):
                 timed = i >= args.warmup
-                if args.mode == "warm":
-                    prefix = make_prompt(rng, isl - args.suffix_tokens, token_range)
-                    prime = await stream_first_token(client, url, headers, args.model, prefix)
+                # Cold mode: suffix_tokens is 0, so the prefix is the whole fresh prompt.
+                prefix = make_prompt(rng, isl - args.suffix_tokens, token_range)
+                run = {"run": i, "timed": timed}
+                for leg in legs:
                     prompt = prefix + make_prompt(rng, args.suffix_tokens, token_range)
-                else:
-                    prime, prompt = None, make_prompt(rng, isl, token_range)
-                rec = await stream_first_token(client, url, headers, args.model, prompt)
-                if prime is not None:
-                    rec["prime_error"] = prime["error"]
-                    rec["no_cache_hit"] = None if rec["cached_tokens"] is None else rec["cached_tokens"] == 0
-                    if prime["error"] and not rec["error"]:
-                        rec["error"] = "priming request failed"
-                rec["timed"] = timed
-                print(json.dumps({"isl": isl, "run": i, **rec}), file=log, flush=True)
+                    rec = await stream_first_token(client, url, headers, args.model, prompt)
+                    run[leg] = judge_leg(leg, rec, run)
+                    print(json.dumps({"isl": isl, "run": i, "leg": leg, "timed": timed, **rec}), file=log, flush=True)
                 if timed:
-                    runs.append(rec)
-            results[str(isl)] = {"runs": runs, "summary": summarize(isl, runs)}
-            s = results[str(isl)]["summary"]
-            state = (f"p50 {s['ttft_s_p50']:.3f} s, {s['prefill_tok_s_p50']:.0f} tok/s" if s["valid_runs"]
-                     else "no valid run")
-            print(f"  ISL {isl}: {s['valid_runs']}/{len(runs)} valid, {state}", flush=True)
+                    runs.append(run)
+            results[str(isl)] = {"runs": runs, "summary": summarize(isl, runs, legs)}
+            print(f"  ISL {isl}: {progress(results[str(isl)]['summary'], legs, len(runs))}", flush=True)
     finally:
         if own:
             await client.aclose()
     return results
 
 
-def summarize(isl: int, runs: List[dict]) -> dict:
-    valid = [r for r in runs if not r["error"]]
-    summary = {"valid_runs": len(valid), "invalid_runs": len(runs) - len(valid)}
+def summarize_leg(isl: int, recs: List[dict]) -> dict:
+    valid = [r for r in recs if not r["error"]]
+    summary = {"valid_runs": len(valid), "invalid_runs": len(recs) - len(valid)}
     if valid:
         ttft = [r["ttft_s"] for r in valid]
         p50 = percentile(ttft, 50)
         summary.update({"ttft_s_p50": p50, "ttft_s_p90": percentile(ttft, 90), "ttft_s_spread": [min(ttft), max(ttft)],
                         "prefill_tok_s_p50": isl / p50, "cached_tokens": [r["cached_tokens"] for r in valid],
-                        "no_cache_hit_runs": sum(1 for r in valid if r.get("no_cache_hit"))})
+                        # Valid runs whose server reported no cached_tokens: their cache state is unverified
+                        "unreported_cache_runs": sum(r["cached_tokens"] is None for r in valid)})
     return summary
+
+
+def summarize(isl: int, runs: List[dict], legs: tuple) -> dict:
+    summary = {leg: summarize_leg(isl, [run[leg] for run in runs]) for leg in legs}
+    if "warm" in summary and summary["cold"]["valid_runs"] and summary["warm"]["valid_runs"]:
+        summary["warm_speedup_p50"] = summary["cold"]["ttft_s_p50"] / summary["warm"]["ttft_s_p50"]
+    return summary
+
+
+def progress(summary: dict, legs: tuple, runs: int) -> str:
+    parts = []
+    for leg in legs:
+        s = summary[leg]
+        state = (f"p50 {s['ttft_s_p50']:.3f} s, {s['prefill_tok_s_p50']:.0f} tok/s" if s["valid_runs"]
+                 else "no valid run")
+        parts.append(f"{leg} {s['valid_runs']}/{runs} valid, {state}")
+    if "warm_speedup_p50" in summary:
+        parts.append(f"cold/warm {summary['warm_speedup_p50']:.2f}x")
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +238,8 @@ def cmd_run(args) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 2
-    if args.mode == "warm" and not all(0 < args.suffix_tokens < isl for isl in args.isls):
-        print("ERROR: warm mode needs 0 < --suffix-tokens < every ISL")
+    if args.mode == "warm" and not all(0 <= args.suffix_tokens < isl for isl in args.isls):
+        print("ERROR: warm mode needs 0 <= --suffix-tokens < every ISL")
         return 2
     if args.mode == "cold":
         args.suffix_tokens = 0
@@ -225,9 +258,10 @@ def cmd_run(args) -> int:
         print("WARNING: no --identity supplied; recording identity: null. Comparisons will refuse it by default.",
               file=sys.stderr)
     log_path = args.log or (args.out + ".log" if args.out else "prefill-ttft.log")
+    legs = LEGS[args.mode]
     plan = {"base_url": args.base_url, **{k: getattr(args, k) for k in PROFILE_FIELDS}, "warmup": args.warmup,
             "label": args.label, "out": args.out, "log": log_path, "identity": identity,
-            "requests_per_run": 2 if args.mode == "warm" else 1,
+            "legs": list(legs), "requests_per_run": len(legs),
             "request_url": args.base_url.rstrip("/") + "/v1/completions", "max_tokens": 1}
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
@@ -245,7 +279,8 @@ def cmd_run(args) -> int:
         return 3
     doc = {"schema": SCHEMA, "identity": identity, "label": args.label, "notes": args.notes,
            "started_utc": started, "finished_utc": datetime.now(timezone.utc).isoformat(),
-           **{k: getattr(args, k) for k in PROFILE_FIELDS}, "warmup": args.warmup, "results": results}
+           **{k: getattr(args, k) for k in PROFILE_FIELDS}, "warmup": args.warmup, "legs": list(legs),
+           "results": results}
     if args.out:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -255,27 +290,36 @@ def cmd_run(args) -> int:
             print("ERROR: could not write result JSON")
             return 3
         print(f"wrote {args.out}")
-    return 0 if any(r["summary"]["valid_runs"] for r in results.values()) else 2
+    return 0 if any(r["summary"][leg]["valid_runs"] for r in results.values() for leg in legs) else 2
+
+
+def _positive(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
 def load(path: str) -> Optional[dict]:
     try:
         with open(path, encoding="utf-8-sig") as f:
             doc = json.load(f)
-        if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
+        if not isinstance(doc, dict) or doc.get("schema") != SCHEMA or doc.get("mode") not in LEGS:
             return None
         for key in ("label", *PROFILE_FIELDS):
             doc[key]
+        if not isinstance(doc["isls"], list) or not doc["isls"]:
+            return None
         for isl in doc["isls"]:
             summary = doc["results"][str(isl)]["summary"]
-            if type(summary.get("valid_runs")) is not int or summary["valid_runs"] < 0:
-                return None
-            if summary["valid_runs"]:
-                value = summary["ttft_s_p50"]
-                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            for leg in LEGS[doc["mode"]]:
+                s = summary[leg]
+                if type(s.get("valid_runs")) is not int or s["valid_runs"] < 0:
                     return None
+                if s["valid_runs"]:
+                    spread = s["ttft_s_spread"]
+                    if (not _positive(s["ttft_s_p50"]) or not isinstance(spread, list) or len(spread) != 2
+                            or not all(_positive(v) for v in spread)):
+                        return None
         return doc
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
@@ -314,6 +358,17 @@ def check_pair(a: dict, b: dict, args) -> int:
     return 0
 
 
+def leg_summary(doc: dict, isl: int, leg: str) -> dict:
+    return doc["results"][str(isl)]["summary"][leg]
+
+
+def cache_mark(leg: str, *summaries: dict) -> str:
+    """Warm cells whose cache hit the server never reported are marked, not hidden."""
+    if leg == "warm" and any(s.get("valid_runs") and s.get("unreported_cache_runs") for s in summaries):
+        return " [cache hit unreported]"
+    return ""
+
+
 def cell(summary: dict) -> str:
     if not summary["valid_runs"]:
         return "absent"
@@ -331,14 +386,23 @@ def cmd_compare(args) -> int:
         return code
     if args.allow_missing_identity:
         print("UNQUALIFIED: --allow-missing-identity enabled")
+    legs = LEGS[a["mode"]]
     print(f"\n{a['model']}  mode {a['mode']}   A = {a['label']}   B = {b['label']}")
-    print(f"{'ISL':>9}{'A TTFT p50 [min-max]':>28}{'B TTFT p50 [min-max]':>28}{'speedup':>9}{'B tok/s':>12}")
+    print(f"{'ISL':>9}{'leg':>6}{'A TTFT p50 [min-max]':>28}{'B TTFT p50 [min-max]':>28}{'speedup':>9}{'B tok/s':>12}")
     for isl in a["isls"]:
-        sa, sb = a["results"][str(isl)]["summary"], b["results"][str(isl)]["summary"]
-        ratio = (f"{sa['ttft_s_p50'] / sb['ttft_s_p50']:.3f}x" if sa["valid_runs"] and sb["valid_runs"] else "absent")
-        rate = f"{sb['prefill_tok_s_p50']:.0f}" if sb["valid_runs"] else "absent"
-        print(f"{isl:>9}{cell(sa):>28}{cell(sb):>28}{ratio:>9}{rate:>12}")
-    print("\nspeedup = A TTFT p50 / B TTFT p50. Run the baseline twice first: its A/A ratio is the noise floor.")
+        for leg in legs:
+            sa, sb = leg_summary(a, isl, leg), leg_summary(b, isl, leg)
+            ratio = (f"{sa['ttft_s_p50'] / sb['ttft_s_p50']:.3f}x" if sa["valid_runs"] and sb["valid_runs"] else "absent")
+            rate = f"{sb['prefill_tok_s_p50']:.0f}" if sb["valid_runs"] else "absent"
+            print(f"{isl:>9}{leg:>6}{cell(sa):>28}{cell(sb):>28}{ratio:>9}{rate:>12}{cache_mark(leg, sa, sb)}")
+    if "warm" in legs:
+        print("\ncold/warm TTFT p50 (prefix-cache speedup):")
+        for isl in a["isls"]:
+            sides = [f"{side} " + (f"{doc['results'][str(isl)]['summary']['warm_speedup_p50']:.2f}x"
+                                   if "warm_speedup_p50" in doc["results"][str(isl)]["summary"] else "absent")
+                     for side, doc in (("A", a), ("B", b))]
+            print(f"  ISL {isl}: " + ", ".join(sides))
+    print("\nspeedup = A TTFT p50 / B TTFT p50, per leg. Run the baseline twice first: its A/A ratio is the noise floor.")
     return 0
 
 
@@ -359,19 +423,25 @@ def cmd_table(args) -> int:
         rows.append(doc)
     if args.allow_missing_identity:
         print("UNQUALIFIED: --allow-missing-identity enabled")
-    isls = base["isls"]
+    isls, legs = base["isls"], LEGS[base["mode"]]
     print(f"**{base['model']}**, TTFT ({base['mode']}), baseline = `{base['label']}`. "
-          "Cells: TTFT p50 s (speedup vs baseline).\n")
-    print("| # | arm | " + " | ".join(f"ISL={i}" for i in isls) + " | notes |")
-    print("|---|---|" + "---|" * len(isls) + "---|")
+          "Cells: TTFT p50 s (speedup vs baseline" + ("; warm rows: and vs that arm's cold TTFT" if "warm" in legs else "")
+          + ").\n")
+    print("| # | arm | leg | " + " | ".join(f"ISL={i}" for i in isls) + " | notes |")
+    print("|---|---|---|" + "---|" * len(isls) + "---|")
     for i, doc in enumerate([base] + rows):
-        cells = []
-        for isl in isls:
-            s, sb = doc["results"][str(isl)]["summary"], base["results"][str(isl)]["summary"]
-            cells.append(f"{s['ttft_s_p50']:.3f} ({sb['ttft_s_p50'] / s['ttft_s_p50']:.2f}x)"
-                         if s["valid_runs"] and sb["valid_runs"] else "absent")
-        note = "UNQUALIFIED identity; " if args.allow_missing_identity else ""
-        print(f"| {i} | {doc['label']} | " + " | ".join(cells) + f" | {note}{doc.get('notes', '')} |")
+        for leg in legs:
+            cells = []
+            for isl in isls:
+                s, sb = leg_summary(doc, isl, leg), leg_summary(base, isl, leg)
+                if not (s["valid_runs"] and sb["valid_runs"]):
+                    cells.append("absent")
+                    continue
+                vs_cold = doc["results"][str(isl)]["summary"].get("warm_speedup_p50") if leg == "warm" else None
+                cells.append(f"{s['ttft_s_p50']:.3f} ({sb['ttft_s_p50'] / s['ttft_s_p50']:.2f}x"
+                             + (f"; {vs_cold:.2f}x vs cold" if vs_cold else "") + ")" + cache_mark(leg, s))
+            note = "UNQUALIFIED identity; " if args.allow_missing_identity else ""
+            print(f"| {i} | {doc['label']} | {leg} | " + " | ".join(cells) + f" | {note}{doc.get('notes', '')} |")
     return 0
 
 
@@ -382,8 +452,9 @@ def main(argv=None) -> int:
     r.add_argument("--base-url", required=True, help="Server root, e.g. http://127.0.0.1:8000")
     r.add_argument("--model", required=True, help="Served model name")
     r.add_argument("--isl", default="131072", help="Comma-separated prompt lengths in tokens")
-    r.add_argument("--mode", choices=("cold", "warm"), default="cold")
-    r.add_argument("--suffix-tokens", type=int, default=512, help="warm mode: fresh tokens after the cached prefix")
+    r.add_argument("--mode", choices=tuple(LEGS), default="cold")
+    r.add_argument("--suffix-tokens", type=int, default=512,
+                   help="warm mode: fresh tokens after the shared prefix in each request (0: the same prompt twice)")
     r.add_argument("--runs", type=int, default=3, help="Timed runs per ISL")
     r.add_argument("--warmup", type=int, default=1, help="Discarded runs per ISL")
     r.add_argument("--seed", type=int, default=0)
@@ -398,9 +469,9 @@ def main(argv=None) -> int:
     c = sub.add_parser("compare", help="Compare two run files (A = baseline, B = candidate)")
     c.add_argument("baseline")
     c.add_argument("candidate")
-    t = sub.add_parser("table", help="Markdown progress table of candidate runs vs one baseline")
+    t = sub.add_parser("table", help="Markdown table: one run file's legs, or candidate runs vs one baseline")
     t.add_argument("baseline")
-    t.add_argument("candidates", nargs="+", help="Run files in experiment order")
+    t.add_argument("candidates", nargs="*", help="Run files in experiment order")
     for command in (c, t):
         command.add_argument("--arm-delta", default="", help="Comma-separated identity leaf keys allowed to differ")
         command.add_argument("--allow-missing-identity", action="store_true", help="Allow missing identity; mark output UNQUALIFIED")

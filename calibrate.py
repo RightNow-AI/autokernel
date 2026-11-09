@@ -21,10 +21,12 @@ Usage:
     uv run calibrate.py --gemm-size 16384 --copy-gb 8
     uv run calibrate.py --attention 8192x1048576:16/2:256   # q_len x kv_len : heads_q/heads_kv : head_dim
     uv run calibrate.py --attention none
+    uv run calibrate.py --out results/calibrate.json        # raw JSON for bench.py --calibration
 """
 
 import argparse
 import json
+import os
 import sys
 
 import torch
@@ -143,31 +145,19 @@ def measure_attention(size: dict, dtype: torch.dtype = torch.bfloat16, device: s
             "best_backend": best, "best_tflops": timed[best]["tflops"] if best else None}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Measure achieved GPU peaks vs the AutoKernel GPU database")
-    parser.add_argument("--gemm-size", type=int, default=8192, help="M=N=K of the calibration GEMM")
-    parser.add_argument("--copy-gb", type=float, default=4.0, help="GiB copied in the bandwidth test")
-    parser.add_argument("--attention", action="append", default=None, metavar="QxKV:HQ/HKV:D",
-                        help="Long-prefill attention shape to measure (repeatable; 'none' skips the attention peak). "
-                             "Default: " + " and ".join(ATTENTION_DEFAULT))
-    parser.add_argument("--json", action="store_true", help="Print one JSON object instead of a table")
-    args = parser.parse_args()
-    specs = ATTENTION_DEFAULT if args.attention is None else [s for s in args.attention if s.lower() != "none"]
-    try:
-        attention_sizes = [parse_attention_shape(spec) for spec in specs]
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    if not torch.cuda.is_available():
-        print("ERROR: no CUDA GPU available")
-        sys.exit(1)
-
+def collect(args, attention_sizes) -> dict:
+    """Every measurement as one result object: what --json prints and --out writes."""
     gpu = detect_gpu()
     bw = measure_bandwidth_gb_s(args.copy_gb)
     fp16 = measure_gemm_tflops(args.gemm_size, torch.float16)
     bf16 = measure_gemm_tflops(args.gemm_size, torch.bfloat16)
-
-    result = {
+    attention = [measure_attention(size) for size in attention_sizes]
+    for entry in attention:
+        best = entry["best_tflops"]
+        entry["best_pct_of_bf16_gemm_measured"] = round(100 * best / bf16, 1) if best and bf16 > 0 else None
+    timed = [entry for entry in attention if entry["best_tflops"]]
+    top = max(timed, key=lambda entry: entry["best_tflops"]) if timed else None
+    return {
         "gpu": gpu.name,
         "compute_capability": f"{gpu.compute_capability[0]}.{gpu.compute_capability[1]}",
         "sm_count": gpu.sm_count,
@@ -178,30 +168,66 @@ def main():
         "bandwidth_gb_s": {"measured": round(bw, 1), "database": gpu.peak_bandwidth_gb_s},
         "fp16_tflops": {"measured": round(fp16, 1), "database": gpu.peak_tflops_fp16},
         "bf16_tflops": {"measured": round(bf16, 1), "database": gpu.peak_tflops_bf16},
-        "attention": [measure_attention(size) for size in attention_sizes],
+        # The best dense-attention backend over every measured shape. The GPU database has no attention peak:
+        # this measurement is the only one. Per-shape results (bench.py --calibration matches head_dim) follow.
+        "attention_tflops": {"measured": round(top["best_tflops"], 1) if top else None, "database": None,
+                             "backend": top["best_backend"] if top else None, "shape": top["shape"] if top else None},
+        "attention": attention,
     }
-    for entry in result["attention"]:
-        best = entry["best_tflops"]
-        entry["best_pct_of_bf16_gemm_measured"] = round(100 * best / bf16, 1) if best and bf16 > 0 else None
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Measure achieved GPU peaks vs the AutoKernel GPU database")
+    parser.add_argument("--gemm-size", type=int, default=8192, help="M=N=K of the calibration GEMM")
+    parser.add_argument("--copy-gb", type=float, default=4.0, help="GiB copied in the bandwidth test")
+    parser.add_argument("--attention", action="append", default=None, metavar="QxKV:HQ/HKV:D",
+                        help="Long-prefill attention shape to measure (repeatable; 'none' skips the attention peak). "
+                             "Default: " + " and ".join(ATTENTION_DEFAULT))
+    parser.add_argument("--json", action="store_true", help="Print one JSON object instead of a table")
+    parser.add_argument("--out", default="", help="Also write the JSON result here (bench.py --calibration reads it)")
+    args = parser.parse_args(argv)
+    specs = ATTENTION_DEFAULT if args.attention is None else [s for s in args.attention if s.lower() != "none"]
+    try:
+        attention_sizes = [parse_attention_shape(spec) for spec in specs]
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if not torch.cuda.is_available():
+        print("ERROR: no CUDA GPU available")
+        return 1
+
+    result = collect(args, attention_sizes)
+    if args.out:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except OSError:
+            print(f"ERROR: could not write {args.out}")
+            return 3
 
     if args.json:
         print(json.dumps(result, indent=2))
-        return
+        return 0
 
-    print(f"gpu: {result['gpu']} (sm_{gpu.compute_capability[0]}{gpu.compute_capability[1]}, "
-          f"{gpu.sm_count} SMs, {gpu.memory_gb} GB, L2 {result['l2_cache_mb']} MB)")
+    cc = result["compute_capability"].replace(".", "")
+    print(f"gpu: {result['gpu']} (sm_{cc}, {result['sm_count']} SMs, {result['memory_gb']} GB, "
+          f"L2 {result['l2_cache_mb']} MB)")
     print(f"torch {result['torch']}, CUDA {result['cuda']}")
-    print(f"{'metric':<16}{'measured':>12}{'database':>12}{'measured/db':>14}")
-    for key, unit in (("bandwidth_gb_s", "GB/s"), ("fp16_tflops", "TFLOPS"), ("bf16_tflops", "TFLOPS")):
+    print(f"{'metric':<18}{'measured':>12}{'database':>12}{'measured/db':>14}")
+    for key in ("bandwidth_gb_s", "fp16_tflops", "bf16_tflops"):
         m, d = result[key]["measured"], result[key]["database"]
         pct = f"{100 * m / d:.1f}%" if d > 0 else "n/a"
-        print(f"{key:<16}{m:>12.1f}{d:>12.1f}{pct:>14}")
+        print(f"{key:<18}{m:>12.1f}{d:>12.1f}{pct:>14}")
+    top = result["attention_tflops"]
+    print(f"{'attention_tflops':<18}" + (f"{top['measured']:>12.1f}" if top["measured"] else f"{'none':>12}")
+          + f"{'n/a':>12}{'n/a':>14}" + (f"  ({top['backend']})" if top["measured"] else ""))
     for entry in result["attention"]:
         s = entry["shape"]
         cells = []
         for name, b in entry["backends"].items():
             state = (f"{b['tflops']:.1f}" + ("*" if b["kv_expanded"] else "") if "tflops" in b
-                     else "wrong" if b.get("wrong") else "unsupported")
+                     else "wrong" if b.get("wrong") else "unavailable" if b.get("unavailable") else "unsupported")
             cells.append(f"{name} {state}")
         best = (f"best {entry['best_backend']} {entry['best_tflops']:.1f} TFLOPS = "
                 f"{entry['best_pct_of_bf16_gemm_measured']}% of measured BF16 GEMM" if entry["best_backend"]
@@ -210,7 +236,8 @@ def main():
               f"{entry['dtype']} dense: " + ", ".join(cells) + f"; {best}")
     if any(b.get("kv_expanded") for e in result["attention"] for b in e["backends"].values()):
         print("* timed with KV heads expanded to one per query head (the backend refused grouped heads)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
