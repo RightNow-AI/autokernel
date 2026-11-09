@@ -1,15 +1,21 @@
-"""CPU checks for calibrate.py's attention peak: shape parsing, the oracle gate before timing, the FLOP count."""
+"""CPU checks for calibrate.py's attention peak: shape parsing, the oracle gate before timing, the FLOP count,
+and the attention entry in the result next to the bandwidth and GEMM peaks."""
 
+import io
+import json
 import math
 import os
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import bench  # noqa: E402
 import calibrate  # noqa: E402
 import reference  # noqa: E402
 
@@ -93,6 +99,64 @@ class MeasureTests(unittest.TestCase):
             result = calibrate.measure_attention(SMALL, torch.float32, "cpu", bench_fn=lambda fn: fn() is not None and 4.0)
         self.assertIn("tflops", result["backends"]["flashinfer"])
         self.assertEqual(result["best_backend"], "flashinfer")
+
+
+class ResultTests(unittest.TestCase):
+    """main() on CPU: the GPU-only measurements are stubbed, the attention measurement runs (math backend)."""
+
+    MS = 1e-7  # every timed backend "takes" this long, so these tiny shapes come out at a few TFLOP/s
+
+    def run_main(self, *argv):
+        real = calibrate.measure_attention
+        gpu = bench.GPUSpec(name="Test GPU", sm_count=4, memory_gb=8.0, peak_tflops_fp16=100.0,
+                            peak_tflops_bf16=100.0, peak_bandwidth_gb_s=1000.0, l2_cache_mb=4.0,
+                            compute_capability=(10, 0))
+        out = io.StringIO()
+        with patch.object(calibrate.torch.cuda, "is_available", lambda: True), \
+                patch.object(calibrate, "detect_gpu", lambda: gpu), \
+                patch.object(calibrate, "measure_bandwidth_gb_s", lambda copy_gb: 900.0), \
+                patch.object(calibrate, "measure_gemm_tflops", lambda size, dtype: 80.0), \
+                patch.object(calibrate, "ATTENTION_BACKENDS", ("MATH",)), \
+                patch.dict(sys.modules, {"flashinfer": None}), \
+                patch.object(calibrate, "measure_attention",
+                             lambda size: real(size, torch.bfloat16, "cpu", bench_fn=lambda fn: self.MS)), \
+                redirect_stdout(out):
+            code = calibrate.main(list(argv))
+        return code, out.getvalue()
+
+    def test_attention_peak_sits_next_to_the_bandwidth_and_gemm_peaks(self):
+        path = os.path.join(tempfile.mkdtemp(), "calibrate.json")
+        code, out = self.run_main("--attention", "16x48:8/2:32", "--attention", "8x40:8/2:64", "--json", "--out", path)
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), result)  # --out writes the same object
+        keys = list(result)
+        self.assertEqual(keys[keys.index("bandwidth_gb_s"):],
+                         ["bandwidth_gb_s", "fp16_tflops", "bf16_tflops", "attention_tflops", "attention"])
+        self.assertEqual(result["bf16_tflops"], {"measured": 80.0, "database": 100.0})
+        flops = 4 * 8 * 16 * 48 * 32  # the larger of the two shapes: the same time, so the higher TFLOP/s
+        self.assertEqual(result["attention_tflops"],
+                         {"measured": round(flops / (self.MS / 1e3) / 1e12, 1), "database": None, "backend": "math",
+                          "shape": calibrate.parse_attention_shape("16x48:8/2:32")})
+        self.assertGreater(result["attention_tflops"]["measured"], 1.0)
+        self.assertEqual([e["shape"]["head_dim"] for e in result["attention"]], [32, 64])
+        for entry in result["attention"]:
+            self.assertEqual(entry["best_backend"], "math")
+            self.assertEqual(entry["best_pct_of_bf16_gemm_measured"], round(100 * entry["best_tflops"] / 80.0, 1))
+        # bench.py --calibration reads this file: the head_dim 64 entry is the peak for a head_dim 64 size
+        peak = bench.calibrated_attention_peak(result, {"head_dim": 64}, torch.bfloat16)
+        self.assertEqual(peak["tflops"], result["attention"][1]["best_tflops"])
+
+    def test_table_output_and_no_attention(self):
+        code, out = self.run_main("--attention", "16x48:8/2:32")
+        self.assertEqual(code, 0)
+        self.assertIn("attention_tflops", out)
+        self.assertIn("attention 16x48 8/2 d32 bfloat16 dense: math", out)
+        self.assertIn("flashinfer unavailable", out)
+        code, out = self.run_main("--attention", "none", "--json")
+        result = json.loads(out)
+        self.assertEqual((result["attention"], result["attention_tflops"]["measured"]), ([], None))
 
 
 if __name__ == "__main__":

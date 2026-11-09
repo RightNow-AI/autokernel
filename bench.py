@@ -14,12 +14,15 @@ Usage:
   uv run bench.py --quick                # skip stages 3-5, bench only large size
   uv run bench.py --profile              # emit torch profiler trace
   uv run bench.py --sizes large          # benchmark only 'large' size
+  uv run bench.py --page-size 16         # paged-KV ops: every size reads 16-token pages through a block table
+  uv run bench.py --calibration calibrate.json   # also report % of the peak calibrate.py measured on this GPU
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import math
 import os
 import signal
@@ -281,6 +284,9 @@ def gen_gqa_prefill_attention_inputs(size: dict, dtype: torch.dtype, device: str
     Queries are scaled so attention scores have a standard deviation of 4. Random unscaled inputs spread
     attention over thousands of keys at long kv_len, which shrinks the output far below the tolerance;
     peaked attention keeps it O(1), so a kernel that drops distant keys or attends past the causal edge fails.
+
+    A size with page_size > 0 gets the keys and values in the engine's paged layout instead (paged_kv_cache):
+    the same values, so a paged size and a contiguous size of one shape have the same expected output.
     """
     torch.manual_seed(seed)
     batch, heads_q, heads_kv = size["batch"], size["heads_q"], size["heads_kv"]
@@ -288,7 +294,48 @@ def gen_gqa_prefill_attention_inputs(size: dict, dtype: torch.dtype, device: str
     Q = (torch.randn(batch, heads_q, q_len, head_dim, device=device, dtype=torch.float32) * 4.0).to(dtype)
     K = torch.randn(batch, heads_kv, kv_len, head_dim, device=device, dtype=dtype)
     V = torch.randn(batch, heads_kv, kv_len, head_dim, device=device, dtype=dtype)
-    return {"Q": Q, "K": K, "V": V}
+    if not size.get("page_size"):
+        return {"Q": Q, "K": K, "V": V}
+    return {"Q": Q, **paged_kv_cache(K, V, size["page_size"])}
+
+
+PAGE_POISON = 100.0  # scale of the finite values in the reserved page and in unused slots
+
+
+def paged_kv_cache(K: torch.Tensor, V: torch.Tensor, page_size: int) -> dict:
+    """Contiguous keys and values [batch, heads_kv, kv_len, head_dim] scattered into an engine-style page pool.
+
+    Returns K and V as pools [num_pages, page_size, heads_kv, head_dim] (vLLM's per-layer KV layout), an int32
+    block_table [batch, pages + 1] and kv_len. Page 0 is reserved like vLLM's null block: only the table's
+    spare last column points to it. The other pages are a random permutation, so a kernel that ignores the
+    table reads the wrong keys. Page 0 and the unused tail slots of each sequence's last page hold large finite
+    values: a kernel that attends to them (one that takes pages x page_size for kv_len, say) misses the
+    tolerance by orders of magnitude, while one that loads them and gives them zero weight stays exact.
+    """
+    batch, heads_kv, kv_len, head_dim = K.shape
+    if page_size < 1:
+        raise ValueError("page_size must be at least 1")
+    pages = -(-kv_len // page_size)
+    shape = (1 + batch * pages, page_size, heads_kv, head_dim)
+    k_pool = torch.randn(shape, device=K.device, dtype=K.dtype) * PAGE_POISON
+    v_pool = torch.randn(shape, device=V.device, dtype=V.dtype) * PAGE_POISON
+    table = torch.zeros(batch, pages + 1, dtype=torch.int32)
+    table[:, :pages] = (torch.randperm(batch * pages) + 1).view(batch, pages)
+    table = table.to(K.device)
+    keys = torch.arange(kv_len, device=K.device)
+    for b in range(batch):
+        page, slot = table[b, keys // page_size].long(), keys % page_size
+        k_pool[page, slot] = K[b].transpose(0, 1)
+        v_pool[page, slot] = V[b].transpose(0, 1)
+    return {"K": k_pool, "V": v_pool, "block_table": table, "kv_len": kv_len}
+
+
+def gather_paged_kv(pool: torch.Tensor, block_table: torch.Tensor, kv_len: int) -> torch.Tensor:
+    """A page pool [num_pages, page_size, heads_kv, head_dim] back to contiguous [batch, heads_kv, kv_len, head_dim]."""
+    page_size = pool.shape[1]
+    keys = torch.arange(kv_len, device=pool.device)
+    pages = block_table[:, keys // page_size].long()  # [batch, kv_len]
+    return pool[pages, keys % page_size].permute(0, 2, 1, 3).contiguous()
 
 
 def gen_fused_mlp_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
@@ -357,11 +404,25 @@ def _ref_flash_attention(inputs: dict) -> torch.Tensor:
 
 def _ref_gqa_prefill_attention(inputs: dict) -> torch.Tensor:
     import reference
-    return reference.gqa_prefill_attention_ref(inputs["Q"], inputs["K"], inputs["V"])
+    return reference.gqa_prefill_attention_ref(inputs["Q"], inputs["K"], inputs["V"],
+                                               block_table=inputs.get("block_table"), kv_len=inputs.get("kv_len"))
+
+def _contiguous_gqa_inputs(inputs: dict) -> dict:
+    """Paged inputs as contiguous Q, K, V holding the same values (contiguous inputs are returned as they are).
+
+    bench.py calls this once per size before timing the baseline, so the gather is never inside a timed call:
+    a paged kernel is timed against SDPA on the same keys laid out contiguously.
+    """
+    if inputs.get("block_table") is None:
+        return inputs
+    table, kv_len = inputs["block_table"], inputs["kv_len"]
+    return {"Q": inputs["Q"], "K": gather_paged_kv(inputs["K"], table, kv_len),
+            "V": gather_paged_kv(inputs["V"], table, kv_len)}
 
 def _sdpa_gqa_prefill_attention(inputs: dict) -> torch.Tensor:
     """Timing baseline: PyTorch SDPA with a bottom-right causal mask (the float32 oracle is far too slow to time)."""
     from torch.nn.attention.bias import causal_lower_right
+    inputs = _contiguous_gqa_inputs(inputs)
     Q, K, V = inputs["Q"], inputs["K"], inputs["V"]
     mask = causal_lower_right(Q.shape[-2], K.shape[-2])
     try:
@@ -375,6 +436,24 @@ def _sdpa_gqa_prefill_attention(inputs: dict) -> torch.Tensor:
 def _gqa_prefill_visible_pairs(s: dict) -> int:
     """(query, key) pairs the bottom-right causal mask keeps: query i sees kv_len - q_len + i + 1 keys."""
     return s["q_len"] * s["kv_len"] - s["q_len"] * (s["q_len"] - 1) // 2
+
+def calibrated_attention_peak(calibration: dict, size: dict, dtype: torch.dtype) -> Optional[dict]:
+    """The highest dense-attention TFLOP/s calibrate.py measured at this size's head_dim and dtype, or None.
+
+    The highest one is used so a weak calibration shape never inflates the percentage. Dense attention is the
+    ceiling for causal prefill counted over visible pairs only: a causal kernel skips masked tiles but cannot
+    do the visible ones faster than dense attention does.
+    """
+    name, best = str(dtype).replace("torch.", ""), None
+    for entry in calibration.get("attention") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("shape"), dict):
+            continue
+        tflops = entry.get("best_tflops")
+        if (entry.get("dtype") == name and entry["shape"].get("head_dim") == size["head_dim"]
+                and type(tflops) in (int, float) and math.isfinite(tflops) and tflops > 0
+                and (best is None or tflops > best["tflops"])):
+            best = {"tflops": tflops, "backend": entry.get("best_backend"), "shape": entry["shape"]}
+    return best
 
 def _ref_fused_mlp(inputs: dict) -> torch.Tensor:
     import reference
@@ -540,6 +619,8 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     # kv_len, head_dim]. Bottom-right causal mask. The oracle is an exact float32 online softmax; the timing
     # baseline is PyTorch SDPA (baseline_fn), not the engine's own prefill kernel: measure against that in the
     # engine (engine/prefill_ttft.py) before claiming a serving win.
+    # A size with page_size reads K and V from an engine-style page pool through a block table instead
+    # (kernel_fn gets block_table and kv_len too); --page-size N gives every size the engine's page size.
     "gqa_prefill_attention": {
         "test_sizes": [
             ("tiny",          {"batch": 1, "heads_q": 8,  "heads_kv": 1, "q_len": 64,    "kv_len": 64,      "head_dim": 128}),
@@ -550,6 +631,9 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
             ("chunk8k_1m",    {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 8192,  "kv_len": 1048576, "head_dim": 256}),
             ("chunk32k_1m",   {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 32768, "kv_len": 1048576, "head_dim": 256}),
             ("d128_8k_1m",    {"batch": 1, "heads_q": 32, "heads_kv": 4, "q_len": 8192,  "kv_len": 1048576, "head_dim": 128}),
+            # Two page sizes, so a kernel cannot hard-code one
+            ("paged_8k_128k", {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 8192,  "kv_len": 131072,  "head_dim": 256, "page_size": 16}),
+            ("paged_32k_1m",  {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 32768, "kv_len": 1048576, "head_dim": 256, "page_size": 64}),
         ],
         "test_dtypes": [torch.bfloat16, torch.float16],
         "tolerances": {
@@ -564,10 +648,17 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "input_generator": gen_gqa_prefill_attention_inputs,
         "reference_fn": _ref_gqa_prefill_attention,
         "baseline_fn": _sdpa_gqa_prefill_attention,
+        "baseline_inputs": _contiguous_gqa_inputs,
+        "paged_kv": True,
+        "calibrated_peak_fn": calibrated_attention_peak,
         "edge_sizes": [
-            ("edge_q1",   {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1,    "kv_len": 4097, "head_dim": 256}),
-            ("edge_odd",  {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1000, "kv_len": 5003, "head_dim": 256}),
-            ("edge_full", {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1500, "kv_len": 1500, "head_dim": 256}),
+            ("edge_q1",         {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1,    "kv_len": 4097, "head_dim": 256}),
+            ("edge_odd",        {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1000, "kv_len": 5003, "head_dim": 256}),
+            ("edge_full",       {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1500, "kv_len": 1500, "head_dim": 256}),
+            # A page size that is not a power of two, two block-table rows and a last page holding 11 of 48 keys
+            ("edge_paged_tail", {"batch": 2, "heads_q": 16, "heads_kv": 2, "q_len": 1000, "kv_len": 5003, "head_dim": 256, "page_size": 48}),
+            # One query; the last page holds a single key
+            ("edge_paged_q1",   {"batch": 1, "heads_q": 16, "heads_kv": 2, "q_len": 1,    "kv_len": 4097, "head_dim": 256, "page_size": 16}),
         ],
     },
 
@@ -712,6 +803,31 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         ],
     },
 }
+
+
+def with_page_size(config: dict, page_size: int) -> dict:
+    """The op's sizes with one paged-KV page size for all of them (0 = contiguous K/V).
+
+    For matching a kernel to the engine's attention page size. Sizes that become identical run once, under
+    their first label.
+    """
+    if not config.get("paged_kv"):
+        raise ValueError("--page-size applies only to ops that read a paged KV cache (gqa_prefill_attention)")
+    if page_size < 0:
+        raise ValueError("--page-size must be 0 (contiguous K/V) or a positive number of tokens")
+
+    def apply(sizes):
+        seen, out = set(), []
+        for label, size in sizes:
+            size = {k: v for k, v in size.items() if k != "page_size"}
+            if page_size:
+                size["page_size"] = page_size
+            key = tuple(sorted(size.items()))
+            if key not in seen:
+                seen.add(key)
+                out.append((label, size))
+        return out
+    return {**config, "test_sizes": apply(config["test_sizes"]), "edge_sizes": apply(config.get("edge_sizes", []))}
 
 
 # =========================================================================
@@ -1118,14 +1234,22 @@ def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
 
 
 def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
-                    sizes_filter: str = "all") -> dict:
-    """Run performance benchmarks. Returns dict with metrics."""
+                    sizes_filter: str = "all", calibration: Optional[dict] = None) -> dict:
+    """Run performance benchmarks. Returns dict with metrics.
+
+    calibration: calibrate.py's JSON from this GPU. An op with a calibrated_peak_fn then also reports
+    pct_calibrated_peak, its throughput as a percentage of the measured peak for that op (attention for
+    gqa_prefill_attention) instead of only the database's tensor-core peak.
+    """
     device = "cuda"
     gen_fn = config["input_generator"]
     ref_fn = config["reference_fn"]
     flops_fn = config["flops_fn"]
     # An op may time a faster baseline than its correctness oracle (an exact float32 oracle can take seconds).
     base_fn = config.get("baseline_fn") or ref_fn
+    # ...and give it its inputs in another layout, built once per size outside the timed calls.
+    base_inputs_fn = config.get("baseline_inputs") or (lambda inputs: inputs)
+    peak_fn = config.get("calibrated_peak_fn") if calibration else None
     bytes_fn = config["bytes_fn"]
     dtypes = config["test_dtypes"]
 
@@ -1177,8 +1301,9 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 kernel_ms = _do_bench(lambda: kernel_fn(**inputs), warmup=25, rep=100)
 
             # Benchmark PyTorch reference
+            base_inputs = base_inputs_fn(inputs)
             with _Timeout(30):
-                ref_ms = _do_bench(lambda: base_fn(inputs), warmup=25, rep=100)
+                ref_ms = _do_bench(lambda: base_fn(base_inputs), warmup=25, rep=100)
 
             # Compute metrics
             kernel_us = kernel_ms * 1000.0
@@ -1201,6 +1326,7 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
 
             speedup = ref_ms / kernel_ms if kernel_ms > 0 else 0.0
+            peak = peak_fn(calibration, sz, dtype) if peak_fn else None
 
             entry = {
                 "label": label,
@@ -1219,15 +1345,19 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 "ridge_point": ridge_point,
                 "bottleneck": bottleneck,
                 "speedup_vs_pytorch": speedup,
+                "calibrated_peak": peak,
+                "pct_calibrated_peak": 100.0 * throughput_tflops / peak["tflops"] if peak else None,
             }
             all_results.append(entry)
 
             if label == primary_label:
                 primary_result = entry
 
+            calibrated = (f" | {entry['pct_calibrated_peak']:.1f}% of calibrated peak" if peak
+                          else " | calibrated peak: absent" if peak_fn else "")
             print(f"    kernel: {kernel_us:.2f} us | pytorch: {ref_us:.2f} us | "
                   f"speedup: {speedup:.3f}x | {throughput_tflops:.3f} TFLOPS | "
-                  f"{pct_peak_compute:.1f}% peak")
+                  f"{pct_peak_compute:.1f}% peak{calibrated}")
 
         except torch.cuda.OutOfMemoryError:
             print(f"    SKIP: {label} -> OOM")
@@ -1322,6 +1452,14 @@ def main():
                         help="Quick mode: skip correctness stages 3-5, bench only large size")
     parser.add_argument("--profile", action="store_true",
                         help="Enable torch profiler trace")
+    parser.add_argument("--page-size", type=int, default=None,
+                        help="Paged-KV page size in tokens for every size of an op that reads a paged KV cache "
+                             "(gqa_prefill_attention): use the engine's attention page size. 0 = contiguous K/V. "
+                             "Default: each size's own")
+    parser.add_argument("--calibration", default=None, metavar="JSON",
+                        help="calibrate.py --out file from this GPU: also report pct_calibrated_peak, the "
+                             "throughput as a percentage of the measured peak for the op (gqa_prefill_attention: "
+                             "the best dense-attention TFLOP/s at its head_dim)")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -1380,11 +1518,39 @@ def main():
         sys.exit(1)
 
     config = KERNEL_CONFIGS[kernel_type]
+    if args.page_size is not None:
+        try:
+            config = with_page_size(config, args.page_size)
+        except ValueError as e:
+            print(f"\nERROR: {e}")
+            print(f"\ncorrectness: FAIL")
+            print(f"throughput_tflops: 0.000")
+            sys.exit(1)
+        print(f"page_size: {args.page_size or 'contiguous'} (every size)")
 
     # ------------------------------------------------------------------
     # GPU Detection
     # ------------------------------------------------------------------
     gpu = detect_gpu()
+    calibration = None
+    if args.calibration:
+        try:
+            with open(args.calibration, encoding="utf-8-sig") as f:
+                calibration = json.load(f)
+            if not isinstance(calibration, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as e:
+            print(f"\nERROR: could not read the calibration file {args.calibration}: {type(e).__name__}")
+            print(f"\ncorrectness: FAIL")
+            print(f"throughput_tflops: 0.000")
+            sys.exit(1)
+        if calibration.get("gpu") != gpu.name:
+            print(f"WARNING: {args.calibration} was measured on {calibration.get('gpu')!r}, this GPU is "
+                  f"{gpu.name!r}: its peaks are not used")
+            calibration = None
+        elif not config.get("calibrated_peak_fn"):
+            print(f"WARNING: {kernel_type} has no calibrated peak; --calibration is ignored")
+            calibration = None
 
     print(f"\n=== GPU INFO ===")
     print(f"gpu_name: {gpu.name}")
@@ -1442,7 +1608,7 @@ def main():
         if args.quick:
             sizes_filter = "large"
         torch.cuda.reset_peak_memory_stats()
-        perf_results = run_performance(kernel_fn, config, gpu, sizes_filter=sizes_filter)
+        perf_results = run_performance(kernel_fn, config, gpu, sizes_filter=sizes_filter, calibration=calibration)
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")
@@ -1457,6 +1623,15 @@ def main():
         print(f"bandwidth_gb_s: {primary['bandwidth_gb_s']:.1f}")
         print(f"pct_peak_compute: {primary['pct_peak_compute']:.1f}%")
         print(f"pct_peak_bandwidth: {primary['pct_peak_bandwidth']:.1f}%")
+        if calibration is not None:
+            peak = primary["calibrated_peak"]
+            if peak:
+                s = peak["shape"]
+                print(f"pct_calibrated_peak: {primary['pct_calibrated_peak']:.1f}%")
+                print(f"calibrated_peak_tflops: {peak['tflops']:.1f} ({peak['backend']}, dense "
+                      f"{s.get('q_len')}x{s.get('kv_len')} {s.get('heads_q')}/{s.get('heads_kv')} d{s.get('head_dim')})")
+            else:
+                print("pct_calibrated_peak: absent (no calibrated peak at this head_dim and dtype)")
         print(f"arithmetic_intensity: {primary['arithmetic_intensity']:.2f}")
         print(f"ridge_point: {primary['ridge_point']:.2f}")
         print(f"bottleneck: {primary['bottleneck']}")
@@ -1493,12 +1668,16 @@ def main():
     all_perf = perf_results.get("all", [])
     if len(all_perf) > 1:
         print(f"\n=== SIZE SWEEP ===")
-        print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8}")
-        print("-" * 66)
+        cal_col = calibration is not None
+        print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8}"
+              + (f" {'%cal':>8}" if cal_col else ""))
+        print("-" * (75 if cal_col else 66))
         for entry in all_perf:
+            pct_cal = entry.get("pct_calibrated_peak")
+            cal = (f" {pct_cal:>7.1f}%" if pct_cal is not None else f" {'absent':>8}") if cal_col else ""
             print(f"{entry['label']:<12} {entry['kernel_latency_us']:>12.2f} "
                   f"{entry['pytorch_latency_us']:>12.2f} {entry['speedup_vs_pytorch']:>9.3f}x "
-                  f"{entry['throughput_tflops']:>10.3f} {entry['pct_peak_compute']:>7.1f}%")
+                  f"{entry['throughput_tflops']:>10.3f} {entry['pct_peak_compute']:>7.1f}%{cal}")
 
     # ------------------------------------------------------------------
     # Profiling (optional)
@@ -1522,6 +1701,8 @@ def main():
     if primary:
         print(f"speedup_vs_pytorch: {primary['speedup_vs_pytorch']:.3f}x")
         print(f"pct_peak_compute: {primary['pct_peak_compute']:.1f}%")
+        if primary.get("pct_calibrated_peak") is not None:
+            print(f"pct_calibrated_peak: {primary['pct_calibrated_peak']:.1f}%")
     else:
         print(f"speedup_vs_pytorch: 0.000x")
         print(f"pct_peak_compute: 0.0%")
