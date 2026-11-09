@@ -747,7 +747,7 @@ def cmd_plan(state: dict) -> None:
     for kp in kernels_plan:
         rank = kp.get("rank", "?")
         op_type = kp.get("op_type", "unknown")
-        shape = kp.get("shape", "")
+        shape = kp.get("model_shape", kp.get("shape", ""))
         if isinstance(shape, dict):
             shape = ", ".join(f"{k}={v}" for k, v in shape.items())
         elif isinstance(shape, list):
@@ -774,7 +774,7 @@ def cmd_plan(state: dict) -> None:
     print("  " + "-" * 50)
 
     for s in [1.5, 2.0, 3.0, 5.0]:
-        for n in [1, 3, 5, min(len(kernels_state), 10)]:
+        for n in sorted({1, 3, 5, min(len(kernels_state), 10)}):
             if n > len(kernels_state):
                 continue
             projected = _hypothetical_speedup(kernels_state, s, n)
