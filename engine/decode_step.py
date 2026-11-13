@@ -1,5 +1,5 @@
 """
-AutoKernel engine mode -- decode-step benchmark for a running vLLM server.
+AutoKernel engine mode -- decode-step benchmark for a running vLLM or SGLang server.
 
 Records SSE event-gap latency and usage-based decode throughput in a common
 decode window at requested batch B, fixed ISL, OSL 1024, greedy. SSE events
@@ -17,8 +17,17 @@ How one measurement works:
      The window opens at the LAST first-token arrival and closes at the FIRST
      last-token arrival. Latency uses only event gaps fully inside the window;
      token counts use cumulative usage at or before each boundary separately.
-  4. While it runs, /metrics is polled for vllm:num_requests_running, so the
-     result records sampled occupancy across all engines with coverage bounds.
+  4. While it runs, /metrics is polled for the server's own running-request
+     gauge (vllm:num_requests_running, or sglang:num_running_reqs with
+     --engine sglang), summed over its series, so the result records sampled
+     occupancy across all engines with coverage bounds.
+
+SGLang (--engine sglang): start the server with --enable-metrics, or /metrics
+has no gauge and every B stays unverified (exact_b_all false). Its gauge is
+summed over all series it publishes; the result keeps the series names, so
+check on the first real run that they are one per data-parallel group. Token
+counts still come only from continuous usage in the stream: a server that does
+not send it is refused, never counted from chunks.
 
 Reported per B: event gap ms (legacy step_ms keys), p90, tokens per event
 (legacy tokens_per_step key), and sampled occupancy in the window.
@@ -76,6 +85,11 @@ FULL_STREAM_FIELDS = {"N/dt": "tok_s_n_over_dt", "(N-1)/dt": "tok_s_n_minus_1_ov
 RATE_FIELDS = {"window": "tok_s_window_per_user", **FULL_STREAM_FIELDS}
 DEFAULT_RATE_FORMULA = "window"
 LEGACY_RATE_FORMULA = "legacy window delta/dt"
+
+# The running-request gauge each engine publishes on /metrics. Exact B is proven
+# only from this gauge; a run where it cannot be read stays unverified.
+RUNNING_METRICS = {"vllm": "vllm:num_requests_running", "sglang": "sglang:num_running_reqs"}
+DEFAULT_ENGINE = "vllm"
 
 METRICS_POLL_S = 0.25
 # /metrics competes with B streams on a busy API server, so one slow or failed poll
@@ -205,13 +219,14 @@ async def stream_one(client, url: str, headers: dict, model: str,
     return rec
 
 
-def parse_running_metrics(body: str) -> tuple[int, list[str]]:
+def parse_running_metrics(body: str, metric: str = RUNNING_METRICS[DEFAULT_ENGINE]) -> tuple[int, list[str]]:
     """Sum every engine's gauge; reject missing, duplicate or invalid samples."""
     series, total = set(), 0
+    name_re = re.escape(metric)
     for line in body.splitlines():
-        if not re.match(r"^vllm:num_requests_running(?:\{|\s|$)", line):
+        if not re.match(rf"^{name_re}(?:\{{|\s|$)", line):
             continue
-        match = re.fullmatch(r"(vllm:num_requests_running(?:\{.*\})?)\s+(\S+)(?:\s+\S+)?", line)
+        match = re.fullmatch(rf"({name_re}(?:\{{.*\}})?)\s+(\S+)(?:\s+\S+)?", line)
         if not match:
             raise ValueError("malformed running-request metric")
         name, raw = match.groups()
@@ -225,7 +240,8 @@ def parse_running_metrics(body: str) -> tuple[int, list[str]]:
     return total, sorted(series)
 
 
-async def poll_running(client, metrics_url: str, stop: asyncio.Event, samples: list):
+async def poll_running(client, metrics_url: str, stop: asyncio.Event, samples: list,
+                       metric: str = RUNNING_METRICS[DEFAULT_ENGINE]):
     """Retain every poll attempt, including failures and request/response times."""
     while not stop.is_set():
         poll = {"t_start": time.perf_counter(), "running": None, "series": [], "error": None}
@@ -233,7 +249,7 @@ async def poll_running(client, metrics_url: str, stop: asyncio.Event, samples: l
             resp = await client.get(metrics_url, timeout=5.0)
             if resp.status_code != 200:
                 raise ValueError("metrics HTTP failure")
-            poll["running"], poll["series"] = parse_running_metrics(resp.text)
+            poll["running"], poll["series"] = parse_running_metrics(resp.text, metric)
         except Exception as exc:  # noqa: BLE001 -- absence must remain evidence
             poll["error"] = f"metrics poll failed: {type(exc).__name__}"
         poll["t_end"] = time.perf_counter()
@@ -372,7 +388,8 @@ async def measure(client, args, headers, batch: int, run_idx: int, rng: random.R
     lo, hi = args.token_id_range
     prompts = [[rng.randrange(lo, hi) for _ in range(args.isl)] for _ in range(batch)]
     stop, running = asyncio.Event(), []
-    poller = asyncio.create_task(poll_running(client, args.base_url.rstrip("/") + "/metrics", stop, running))
+    metric = RUNNING_METRICS[getattr(args, "engine", DEFAULT_ENGINE)]
+    poller = asyncio.create_task(poll_running(client, args.base_url.rstrip("/") + "/metrics", stop, running, metric))
     url = args.base_url.rstrip("/") + "/v1/completions"
     records = await asyncio.gather(*[
         stream_one(client, url, headers, args.model, p, args.osl) for p in prompts
@@ -519,6 +536,9 @@ def check_step_statistics(docs: list[dict], allow_inexact: bool) -> int:
 
 def check_comparison(a: dict, b: dict, args) -> int:
     diff = [k for k in PROFILE_FIELDS if a.get(k) != b.get(k)]
+    # Files written before --engine existed measured vLLM.
+    if a.get("engine", DEFAULT_ENGINE) != b.get("engine", DEFAULT_ENGINE):
+        diff.append("engine")
     if comparable_formula(a) != comparable_formula(b):
         diff.append("rate_formula_primary")
     elif comparable_formula(a) == "window" and (a.get("window_token_basis", "contained-event-gaps")
@@ -610,7 +630,7 @@ def cmd_run(args) -> int:
         return 2
     if args.dry_run:
         invocation = [sys.executable, "engine/decode_step.py", "run"]
-        for option in ("base_url", "model", "batch", "isl", "osl", "runs", "warmup", "seed",
+        for option in ("engine", "base_url", "model", "batch", "isl", "osl", "runs", "warmup", "seed",
                        "token_id_range", "api_key_env", "label", "notes", "out", "log", "identity",
                        "rate_formula_primary"):
             value = getattr(args, option)
@@ -626,6 +646,7 @@ def cmd_run(args) -> int:
                           "requests_per_batch": "B concurrent POST /v1/completions per warmup and timed run",
                           "request_url": args.base_url.rstrip("/") + "/v1/completions",
                           "metrics_url": args.base_url.rstrip("/") + "/metrics",
+                          "engine": args.engine, "running_metric": RUNNING_METRICS[args.engine],
                           "prompt_generation": "seeded random token IDs; warmups advance the same RNG",
                           "stream_options": {"include_usage": True, "continuous_usage_stats": True},
                           "temperature": 0.0, "ignore_eos": True, "max_tokens": args.osl,
@@ -650,6 +671,7 @@ def cmd_run(args) -> int:
         "identity": identity,
         "step_basis": STEP_BASIS, "window_token_basis": WINDOW_TOKEN_BASIS,
         "rate_formula_primary": args.rate_formula_primary,
+        "engine": args.engine, "running_metric": RUNNING_METRICS[args.engine],
         "label": args.label,
         "started_utc": started,
         "finished_utc": datetime.now(timezone.utc).isoformat(),
@@ -801,6 +823,8 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="Measure a running server")
+    r.add_argument("--engine", choices=tuple(RUNNING_METRICS), default=DEFAULT_ENGINE,
+                   help="Serving engine; picks the running-request gauge read from /metrics")
     r.add_argument("--base-url", required=True, help="Server root, e.g. http://127.0.0.1:8000")
     r.add_argument("--model", required=True, help="Served model name")
     r.add_argument("--batch", default="1,2,4,8", help="Comma-separated B values")

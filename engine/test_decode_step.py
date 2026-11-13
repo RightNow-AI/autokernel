@@ -730,7 +730,7 @@ class ReviewRegressionTests(OfflineCase):
                                rate_formula_primary="window", run_identity=identity(), keep_timelines=False)
         async def gather_inline(*coroutines):
             return [await coroutine for coroutine in coroutines]
-        async def poll_inline(client, url, stop, samples):
+        async def poll_inline(client, url, stop, samples, metric=None):
             samples.extend(covered_polls(0, 24, 1))
         with patch.object(ds, "stream_one", new_callable=AsyncMock, return_value=complete_record(tokens_per_event=2)), \
                 patch.object(ds, "poll_running", side_effect=poll_inline), \
@@ -771,6 +771,89 @@ class ReviewRegressionTests(OfflineCase):
         self.assertEqual(measured["tok_s_window_per_user"], 0.5)
         self.assertEqual(measured["window_tokens"], 23)
         self.assertEqual(measured["step_samples"], 22)
+
+
+# A made-up /metrics answer in SGLang's public format: one gauge series per
+# data-parallel group, plus neighbouring gauges that must not be counted.
+SGLANG_METRICS = """# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{engine_type="unified",model_name="example-model",pp_rank="0",tp_rank="0"} 3.0
+sglang:num_running_reqs{engine_type="unified",model_name="example-model",pp_rank="0",tp_rank="4"} 5.0
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{engine_type="unified",model_name="example-model",pp_rank="0",tp_rank="0"} 7.0
+sglang:num_running_reqs_offline_batch{model_name="example-model"} 9.0
+"""
+
+
+class EngineMetricsTests(OfflineCase):
+    argv = ["run", "--base-url", "http://localhost:8000", "--model", "example-model", "--batch", "1", "--label", "stock"]
+
+    def test_sglang_gauge_is_summed_over_its_series_only(self):
+        total, series = ds.parse_running_metrics(SGLANG_METRICS, ds.RUNNING_METRICS["sglang"])
+        self.assertEqual(total, 8)
+        self.assertEqual(len(series), 2)
+        self.assertTrue(all(name.startswith("sglang:num_running_reqs{") for name in series))
+
+    def test_vllm_gauge_is_not_read_from_an_sglang_answer(self):
+        with self.assertRaisesRegex(ValueError, "missing"):
+            ds.parse_running_metrics(SGLANG_METRICS)
+
+    def test_sglang_gauge_absent_without_enable_metrics_stays_unverified(self):
+        with self.assertRaisesRegex(ValueError, "missing"):
+            ds.parse_running_metrics("# no metrics\n", ds.RUNNING_METRICS["sglang"])
+
+    def test_sglang_duplicate_or_fractional_series_refuses(self):
+        line = 'sglang:num_running_reqs{tp_rank="0"} 2.0\n'
+        with self.assertRaisesRegex(ValueError, "duplicate or invalid"):
+            ds.parse_running_metrics(line + line, ds.RUNNING_METRICS["sglang"])
+        with self.assertRaisesRegex(ValueError, "duplicate or invalid"):
+            ds.parse_running_metrics('sglang:num_running_reqs{tp_rank="0"} 2.5\n', ds.RUNNING_METRICS["sglang"])
+
+    def test_poller_reads_the_selected_engine_gauge(self):
+        client = Mock()
+        client.get = AsyncMock(return_value=SimpleNamespace(status_code=200, text=SGLANG_METRICS))
+        stop = Mock()
+        stop.is_set.side_effect = [False, True]
+        stop.wait = AsyncMock()
+        async def immediate_wait(awaitable, timeout):
+            return await awaitable
+        samples = []
+        with patch.object(ds.asyncio, "wait_for", side_effect=immediate_wait), \
+                patch.object(ds.time, "perf_counter", side_effect=[0, 0.01]):
+            finish_without_io(ds.poll_running(client, "http://localhost:8000/metrics", stop, samples,
+                                              ds.RUNNING_METRICS["sglang"]))
+        self.assertEqual(samples[0]["running"], 8)
+        self.assertIsNone(samples[0]["error"])
+
+    def test_dry_run_records_engine_and_its_gauge(self):
+        with patch.object(ds, "run_all", new_callable=AsyncMock) as run:
+            code, output = self.invoke([*self.argv, "--engine", "sglang", "--dry-run"], {})
+            self.assertEqual(code, 0, output)
+            self.assertIn('"engine": "sglang"', output)
+            self.assertIn('"running_metric": "sglang:num_running_reqs"', output)
+            self.assertIn('"--engine"', output)
+            run.assert_not_called()
+            code, output = self.invoke([*self.argv, "--dry-run"], {})
+            self.assertIn('"running_metric": "vllm:num_requests_running"', output)
+
+    def test_unknown_engine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit):
+            self.invoke([*self.argv, "--engine", "other", "--dry-run"], {})
+
+    def test_comparison_refuses_runs_from_two_engines(self):
+        a, b = result(), result()
+        b["engine"] = "sglang"
+        code, output = self.compare(a, b)
+        self.assertEqual(code, 4, output)
+        self.assertIn("PROFILE_MISMATCH: engine", output)
+
+    def test_files_without_engine_compare_as_vllm(self):
+        a, b = result(), result()
+        b["engine"] = "vllm"
+        code, output = self.compare(a, b)
+        self.assertNotIn("engine", output.split("PROFILE_MISMATCH")[-1] if "PROFILE_MISMATCH" in output else "")
+        self.assertNotEqual(code, 4, output)
 
 
 if __name__ == "__main__":

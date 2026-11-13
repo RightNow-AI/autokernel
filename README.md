@@ -219,6 +219,11 @@ uv run engine/decode_step.py compare results/stock.json results/ours.json --arm-
 uv run engine/decode_step.py table results/stock.json results/ours.json --arm-delta image.digest,arm.label
 ```
 
+- SGLang servers: add `--engine sglang`. Start the server with `--enable-metrics`, or `/metrics` has no
+  running-request gauge and every B stays unverified. The tool reads `sglang:num_running_reqs` summed over
+  its series and keeps the series names in the result: on the first run, check there is one per data-parallel
+  group. Tokens are still counted only from continuous usage in the stream; a server that does not send it is
+  refused. Runs from two engines never compare.
 - Prompts are random token IDs, so ISL is exact and the prefix cache cannot help.
 - Tokens come from continuous `usage.completion_tokens`, including multi-token speculative chunks.
   Missing, non-increasing, or inconsistent usage invalidates the stream; chunk counts never substitute.
