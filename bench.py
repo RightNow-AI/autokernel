@@ -381,6 +381,52 @@ def gen_reduce_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 4
     return {"x": x}
 
 
+def gen_modulated_norm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    batch = size.get("batch", 4)
+    tokens = size.get("tokens", size.get("seq_len", 1024))
+    dim = size["dim"]
+    broadcast_scale = size.get("broadcast_scale", True)
+
+    x = torch.randn(batch, tokens, dim, device=device, dtype=dtype)
+    weight = torch.randn(dim, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype) if size.get("norm_type") != "rmsnorm" else None
+
+    if broadcast_scale:
+        scale = torch.randn(batch, 1, dim, device=device, dtype=dtype)
+        shift = torch.randn(batch, 1, dim, device=device, dtype=dtype)
+    else:
+        scale = torch.randn(batch, tokens, dim, device=device, dtype=dtype)
+        shift = torch.randn(batch, tokens, dim, device=device, dtype=dtype)
+
+    return {
+        "x": x,
+        "weight": weight,
+        "bias": bias,
+        "scale": scale,
+        "shift": shift,
+        "eps": size.get("eps", 1e-5),
+        "norm_type": size.get("norm_type", "layernorm"),
+    }
+
+
+def gen_gated_residual_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    batch = size.get("batch", 4)
+    tokens = size.get("tokens", size.get("seq_len", 1024))
+    dim = size["dim"]
+    broadcast_gate = size.get("broadcast_gate", True)
+
+    residual = torch.randn(batch, tokens, dim, device=device, dtype=dtype)
+    update = torch.randn(batch, tokens, dim, device=device, dtype=dtype)
+    if broadcast_gate:
+        gate = torch.randn(batch, 1, dim, device=device, dtype=dtype)
+    else:
+        gate = torch.randn(batch, tokens, dim, device=device, dtype=dtype)
+
+    return {"residual": residual, "gate": gate, "update": update}
+
+
 # =========================================================================
 # 3. REFERENCE WRAPPERS
 # =========================================================================
@@ -474,6 +520,22 @@ def _ref_rmsnorm(inputs: dict) -> torch.Tensor:
 def _ref_reduce(inputs: dict) -> torch.Tensor:
     import reference
     return reference.reduce_sum_ref(inputs["x"], dim=-1)
+
+def _ref_modulated_norm(inputs: dict) -> torch.Tensor:
+    import reference
+    return reference.modulated_norm_ref(
+        inputs["x"],
+        weight=inputs.get("weight"),
+        bias=inputs.get("bias"),
+        scale=inputs.get("scale"),
+        shift=inputs.get("shift"),
+        eps=inputs.get("eps", 1e-5),
+        norm_type=inputs.get("norm_type", "layernorm"),
+    )
+
+def _ref_gated_residual(inputs: dict) -> torch.Tensor:
+    import reference
+    return reference.gated_residual_ref(inputs["residual"], inputs["gate"], inputs["update"])
 
 
 # =========================================================================
@@ -802,7 +864,78 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
             ("edge_4097", {"M": 4096, "N": 4097}),
         ],
     },
+
+    # -----------------------------------------------------------------
+    # MODULATED NORM (Diffusion & Video Transformers)
+    # -----------------------------------------------------------------
+    "modulated_norm": {
+        "test_sizes": [
+            ("dit_xl",       {"batch": 4, "seq_len": 1024, "dim": 1152, "broadcast_scale": True, "norm_type": "layernorm"}),
+            ("pixart_alpha", {"batch": 2, "seq_len": 2048, "dim": 1152, "broadcast_scale": True, "norm_type": "layernorm"}),
+            ("wan2_1",       {"batch": 1, "seq_len": 4096, "dim": 3072, "broadcast_scale": True, "norm_type": "rmsnorm"}),
+            ("flux_dit",     {"batch": 1, "seq_len": 4096, "dim": 3072, "broadcast_scale": False, "norm_type": "rmsnorm"}),
+            ("sd3_medium",   {"batch": 4, "seq_len": 1024, "dim": 1536, "broadcast_scale": True, "norm_type": "layernorm"}),
+        ],
+        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        "tolerances": {
+            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
+            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
+        },
+        "flops_fn": lambda s: 8 * s["batch"] * s.get("tokens", s.get("seq_len", 1024)) * s["dim"],
+        "bytes_fn": lambda s, dt: (s["batch"] * s.get("tokens", s.get("seq_len", 1024)) * s["dim"] * 3 + s["dim"] * 4) * _dtype_bytes(dt),
+        "input_generator": gen_modulated_norm_inputs,
+        "reference_fn": _ref_modulated_norm,
+        "edge_sizes": [
+            ("edge_odd_dim",      {"batch": 2, "seq_len": 513, "dim": 1023, "broadcast_scale": True, "norm_type": "layernorm"}),
+            ("edge_single_token", {"batch": 1, "seq_len": 1,   "dim": 2048, "broadcast_scale": True, "norm_type": "rmsnorm"}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # GATED RESIDUAL FUSION
+    # -----------------------------------------------------------------
+    "gated_residual": {
+        "test_sizes": [
+            ("small",       {"batch": 4, "seq_len": 512,  "dim": 1024, "broadcast_gate": True}),
+            ("medium",      {"batch": 4, "seq_len": 1024, "dim": 2048, "broadcast_gate": True}),
+            ("large",       {"batch": 2, "seq_len": 4096, "dim": 3072, "broadcast_gate": True}),
+            ("elementwise", {"batch": 2, "seq_len": 2048, "dim": 2048, "broadcast_gate": False}),
+        ],
+        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        "tolerances": {
+            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 5e-2, "rtol": 5e-2},
+            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
+        },
+        "flops_fn": lambda s: 2 * s["batch"] * s.get("tokens", s.get("seq_len", 1024)) * s["dim"],
+        "bytes_fn": lambda s, dt: (3 * s["batch"] * s.get("tokens", s.get("seq_len", 1024)) * s["dim"]) * _dtype_bytes(dt),
+        "input_generator": gen_gated_residual_inputs,
+        "reference_fn": _ref_gated_residual,
+        "edge_sizes": [
+            ("edge_odd", {"batch": 1, "seq_len": 511, "dim": 1023, "broadcast_gate": True}),
+        ],
+    },
 }
+
+
+def register_kernel(name: str, config: Dict[str, Any]) -> None:
+    """Register a custom or external kernel configuration into AutoKernel."""
+    required_keys = {"test_sizes", "test_dtypes", "tolerances", "flops_fn", "bytes_fn", "input_generator", "reference_fn"}
+    missing = required_keys - set(config.keys())
+    if missing:
+        raise ValueError(f"Kernel config for '{name}' is missing required keys: {missing}")
+    KERNEL_CONFIGS[name] = config
+
+
+def unregister_kernel(name: str) -> None:
+    """Unregister a kernel configuration by name."""
+    KERNEL_CONFIGS.pop(name, None)
+
+
+def list_registered_kernels() -> List[str]:
+    """Return a list of all registered kernel types."""
+    return list(KERNEL_CONFIGS.keys())
 
 
 def with_page_size(config: dict, page_size: int) -> dict:
@@ -1446,6 +1579,10 @@ def main():
     parser = argparse.ArgumentParser(description="AutoKernel benchmark harness")
     parser.add_argument("--kernel", type=str, default=None,
                         help="Kernel type to benchmark (default: read from kernel.py)")
+    parser.add_argument("--kernel-file", type=str, default=None,
+                        help="Path to kernel file to benchmark (default: kernel.py)")
+    parser.add_argument("--custom-kernel", type=str, default=None,
+                        help="Path to python file defining/registering custom kernel configs")
     parser.add_argument("--sizes", type=str, default="all",
                         help="Which sizes to benchmark: small|medium|large|all (default: all)")
     parser.add_argument("--quick", action="store_true",
@@ -1482,8 +1619,28 @@ def main():
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
 
-        kernel_module = importlib.import_module("kernel")
-        kernel_fn = kernel_module.kernel_fn
+        if args.custom_kernel:
+            ck_path = os.path.abspath(args.custom_kernel)
+            spec = importlib.util.spec_from_file_location("custom_kernel_spec", ck_path)
+            if spec and spec.loader:
+                ck_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ck_mod)
+                if hasattr(ck_mod, "register"):
+                    ck_mod.register()
+                elif hasattr(ck_mod, "CUSTOM_KERNEL_CONFIG") and hasattr(ck_mod, "CUSTOM_KERNEL_NAME"):
+                    register_kernel(ck_mod.CUSTOM_KERNEL_NAME, ck_mod.CUSTOM_KERNEL_CONFIG)
+
+        if args.kernel_file:
+            kf_path = os.path.abspath(args.kernel_file)
+            spec = importlib.util.spec_from_file_location("benchmark_kernel", kf_path)
+            if not spec or not spec.loader:
+                raise ImportError(f"Cannot load kernel file: {args.kernel_file}")
+            kernel_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(kernel_module)
+            kernel_fn = kernel_module.kernel_fn
+        else:
+            kernel_module = importlib.import_module("kernel")
+            kernel_fn = kernel_module.kernel_fn
 
         if kernel_type is None:
             kernel_type = getattr(kernel_module, "KERNEL_TYPE", None)

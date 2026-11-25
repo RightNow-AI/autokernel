@@ -46,6 +46,8 @@ _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
     (["attention"],                            "flash_attention"),
     (["gemm", "matmul", "cublas"],             "matmul"),
     (["softmax"],                              "softmax"),
+    (["modulated_norm", "modulate", "ada_ln", "adaln", "modulated_layernorm", "modulated_rmsnorm", "dit_norm"], "modulated_norm"),
+    (["gated_residual", "gate_residual", "gated_res"], "gated_residual"),
     (["layer_norm", "layernorm"],              "layernorm"),
     (["rms_norm", "rmsnorm"],                  "rmsnorm"),
     (["gelu", "silu", "mlp"],                  "fused_mlp"),
@@ -67,6 +69,15 @@ def _discover_supported_op_types() -> set[str]:
             if fname.endswith(".py") and fname != "__init__.py":
                 supported.add(fname[:-3])  # e.g. "matmul", "softmax"
     return supported
+
+
+def register_kernel_classifier(fragments: List[str], op_type: str, prepend: bool = True) -> None:
+    """Register custom kernel classification rule for profile.py."""
+    rule = (fragments, op_type)
+    if prepend:
+        _KERNEL_CLASSIFICATION.insert(0, rule)
+    else:
+        _KERNEL_CLASSIFICATION.append(rule)
 
 
 # ---------------------------------------------------------------------------
