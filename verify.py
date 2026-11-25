@@ -158,9 +158,54 @@ def load_model_from_module(module_name: str, class_name: str,
     return model
 
 
+def _build_quantization_config(
+    quantization: Optional[str] = None,
+    compute_dtype: Optional[str] = None,
+) -> Any:
+    """Build BitsAndBytesConfig for quantized model loading."""
+    if not quantization or quantization.lower() in ("none", "no"):
+        return None
+
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError as e:
+        raise ImportError(
+            f"Quantization '{quantization}' requested, but transformers is not installed "
+            "or does not support BitsAndBytesConfig. Install with: pip install 'autokernel[quant]'"
+        ) from e
+
+    mode = quantization.lower()
+    if mode == "bnb4":
+        torch_compute_dtype = torch.bfloat16
+        if compute_dtype:
+            dt = compute_dtype.lower()
+            if dt in ("float16", "fp16"):
+                torch_compute_dtype = torch.float16
+            elif dt in ("bfloat16", "bf16"):
+                torch_compute_dtype = torch.bfloat16
+            elif dt in ("float32", "fp32"):
+                torch_compute_dtype = torch.float32
+
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch_compute_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    elif mode == "bnb8":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    else:
+        raise ValueError(
+            f"Unsupported quantization: '{quantization}'. Supported: 'bnb4', 'bnb8', 'none'."
+        )
+
+
 def load_model(args) -> nn.Module:
     """Unified model loader from CLI args."""
     dtype = _parse_dtype(args.dtype)
+    quant = getattr(args, "quantization", None)
+    comp_dtype = getattr(args, "compute_dtype", None)
+    dev_map = getattr(args, "device_map", None)
 
     if args.model:
         print(f"Loading model from file: {args.model} (class: {args.class_name})")
@@ -168,28 +213,44 @@ def load_model(args) -> nn.Module:
     elif args.module:
         print(f"Loading model from module: {args.module} (class: {args.class_name})")
         extra_kwargs = {}
-        if dtype == torch.float16:
-            extra_kwargs["torch_dtype"] = torch.float16
-        elif dtype == torch.bfloat16:
-            extra_kwargs["torch_dtype"] = torch.bfloat16
+        quant_config = _build_quantization_config(quant, comp_dtype)
+        if quant_config is not None:
+            extra_kwargs["quantization_config"] = quant_config
+            extra_kwargs["device_map"] = dev_map if dev_map is not None else "auto"
+        else:
+            if dev_map is not None:
+                extra_kwargs["device_map"] = dev_map
+            if dtype == torch.float16:
+                extra_kwargs["torch_dtype"] = torch.float16
+            elif dtype == torch.bfloat16:
+                extra_kwargs["torch_dtype"] = torch.bfloat16
+
         model = load_model_from_module(
             args.module, args.class_name, pretrained=args.pretrained, **extra_kwargs
         )
     else:
         raise ValueError("Must specify either --model (file path) or --module (Python module)")
 
-    model = model.to(dtype=dtype)
+    is_quantized = (
+        getattr(model, "is_quantized", False)
+        or getattr(model, "is_loaded_in_4bit", False)
+        or getattr(model, "is_loaded_in_8bit", False)
+        or hasattr(model, "hf_device_map")
+    )
 
-    if torch.cuda.is_available():
-        try:
-            model = model.cuda()
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"WARNING: OOM moving model to GPU. Trying with smaller footprint...")
-                torch.cuda.empty_cache()
-                model = model.half().cuda()
-            else:
-                raise
+    if not is_quantized:
+        model = model.to(dtype=dtype)
+
+        if torch.cuda.is_available():
+            try:
+                model = model.cuda()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"WARNING: OOM moving model to GPU. Trying with smaller footprint...")
+                    torch.cuda.empty_cache()
+                    model = model.half().cuda()
+                else:
+                    raise
 
     model.eval()
     return model
@@ -577,6 +638,18 @@ class OptimizedModelContext:
         count = 0
         for name, module in list(self.model.named_modules()):
             if isinstance(module, nn.Linear):
+                # Guard against replacing quantized linear modules (e.g. bitsandbytes Linear8bitLt)
+                if (
+                    getattr(module, "is_quantized", False)
+                    or "Linear4bit" in type(module).__name__
+                    or "Linear8bit" in type(module).__name__
+                ):
+                    print(
+                        f"  NOTE: Skipping quantized module '{name}' ({type(module).__name__}) - "
+                        "quantized kernel replacement is not yet supported."
+                    )
+                    continue
+
                 # Save original
                 self._original_modules[name] = module
                 # Create wrapper
@@ -1009,6 +1082,26 @@ def main() -> None:
     parser.add_argument(
         "--dtype", type=str, default="float16",
         help="Data type: float16, bfloat16, float32 (default: float16)"
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "bnb4", "bnb8"],
+        help="Quantization method: bnb4 (4-bit bitsandbytes), bnb8 (8-bit), none (default: none)",
+    )
+    parser.add_argument(
+        "--compute-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="Compute dtype for 4-bit quantization: auto, bf16, fp16, fp32 (default: auto)",
+    )
+    parser.add_argument(
+        "--device-map",
+        type=str,
+        default=None,
+        help="Device map for HuggingFace models, e.g. 'auto' (default: None, or 'auto' when quantized)",
     )
 
     # Benchmark tuning

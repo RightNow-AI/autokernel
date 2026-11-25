@@ -44,7 +44,7 @@ WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worksp
 _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
     (["flash", "fmha"],                       "flash_attention"),
     (["attention"],                            "flash_attention"),
-    (["gemm", "matmul", "cublas"],             "matmul"),
+    (["gemm", "matmul", "cublas", "bnb", "gemv_4bit", "igemm", "dequant", "awq", "marlin", "cutlass"], "matmul"),
     (["softmax"],                              "softmax"),
     (["layer_norm", "layernorm"],              "layernorm"),
     (["rms_norm", "rmsnorm"],                  "rmsnorm"),
@@ -259,8 +259,61 @@ def _load_model_from_file(model_path: str, class_name: str) -> nn.Module:
     return model
 
 
+def _build_quantization_config(
+    quantization: Optional[str] = None,
+    compute_dtype: Optional[str] = None,
+) -> Any:
+    """Build BitsAndBytesConfig for quantized model loading.
+
+    Supported modes:
+      - 'bnb4': 4-bit NormalFloat (NF4) with double quantization.
+      - 'bnb8': 8-bit quantization.
+      - 'none' or None: No quantization.
+    """
+    if not quantization or quantization.lower() in ("none", "no"):
+        return None
+
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError as e:
+        raise ImportError(
+            f"Quantization '{quantization}' requested, but transformers is not installed "
+            "or does not support BitsAndBytesConfig. Install with: pip install 'autokernel[quant]'"
+        ) from e
+
+    mode = quantization.lower()
+    if mode == "bnb4":
+        torch_compute_dtype = torch.bfloat16
+        if compute_dtype:
+            dt = compute_dtype.lower()
+            if dt in ("float16", "fp16"):
+                torch_compute_dtype = torch.float16
+            elif dt in ("bfloat16", "bf16"):
+                torch_compute_dtype = torch.bfloat16
+            elif dt in ("float32", "fp32"):
+                torch_compute_dtype = torch.float32
+
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch_compute_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    elif mode == "bnb8":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    else:
+        raise ValueError(
+            f"Unsupported quantization: '{quantization}'. Supported: 'bnb4', 'bnb8', 'none'."
+        )
+
+
 def _load_model_from_module(
-    module_name: str, class_name: str, pretrained: Optional[str] = None
+    module_name: str,
+    class_name: str,
+    pretrained: Optional[str] = None,
+    quantization: Optional[str] = None,
+    compute_dtype: Optional[str] = None,
+    device_map: Optional[str] = None,
 ) -> nn.Module:
     """Load a model from an installed Python module (e.g. transformers)."""
     try:
@@ -280,8 +333,16 @@ def _load_model_from_module(
     if pretrained:
         # HuggingFace-style: cls.from_pretrained(...)
         if hasattr(cls, "from_pretrained"):
+            kwargs: Dict[str, Any] = {"torch_dtype": "auto"}
+            quant_config = _build_quantization_config(quantization, compute_dtype)
+            if quant_config is not None:
+                kwargs["quantization_config"] = quant_config
+                kwargs["device_map"] = device_map if device_map is not None else "auto"
+            elif device_map is not None:
+                kwargs["device_map"] = device_map
+
             try:
-                model = cls.from_pretrained(pretrained, torch_dtype="auto")
+                model = cls.from_pretrained(pretrained, **kwargs)
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to load pretrained model '{pretrained}' via "
@@ -309,10 +370,22 @@ def load_model(args: argparse.Namespace) -> Tuple[nn.Module, str]:
         model = _load_model_from_file(args.model, args.class_name)
         desc = f"{args.class_name} from {args.model}"
     elif args.module:
-        model = _load_model_from_module(args.module, args.class_name, args.pretrained)
+        quant = getattr(args, "quantization", None)
+        comp_dtype = getattr(args, "compute_dtype", None)
+        dev_map = getattr(args, "device_map", None)
+        model = _load_model_from_module(
+            args.module,
+            args.class_name,
+            args.pretrained,
+            quantization=quant,
+            compute_dtype=comp_dtype,
+            device_map=dev_map,
+        )
         desc = f"{args.class_name} from {args.module}"
         if args.pretrained:
             desc += f" (pretrained: {args.pretrained})"
+        if quant and quant.lower() != "none":
+            desc += f" [quant: {quant}]"
     else:
         raise ValueError("Must specify either --model <file> or --module <package>")
 
@@ -397,10 +470,17 @@ def _prepare_model_and_input(
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Move model to device, generate input, validate forward pass.
     Handles OOM by trying smaller batch sizes."""
-    model = model.to(device=device)
-    # Cast model dtype if not float32
-    if dtype in (torch.float16, torch.bfloat16):
-        model = model.to(dtype=dtype)
+    is_quantized = (
+        getattr(model, "is_quantized", False)
+        or getattr(model, "is_loaded_in_4bit", False)
+        or getattr(model, "is_loaded_in_8bit", False)
+        or hasattr(model, "hf_device_map")
+    )
+    if not is_quantized:
+        model = model.to(device=device)
+        # Cast model dtype if not float32
+        if dtype in (torch.float16, torch.bfloat16):
+            model = model.to(dtype=dtype)
     model.eval()
 
     original_batch = input_shape[0] if len(input_shape) >= 1 else 1
@@ -893,6 +973,28 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="float16",
         help="Data type: float16, bfloat16, float32 (default: float16).",
+    )
+
+    # Quantization
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "bnb4", "bnb8"],
+        help="Quantization method: bnb4 (4-bit bitsandbytes), bnb8 (8-bit), none (default: none).",
+    )
+    parser.add_argument(
+        "--compute-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="Compute dtype for 4-bit quantization: auto, bf16, fp16, fp32 (default: auto).",
+    )
+    parser.add_argument(
+        "--device-map",
+        type=str,
+        default=None,
+        help="Device map for HuggingFace models, e.g. 'auto' (default: None, or 'auto' when quantized).",
     )
 
     # Profiling configuration

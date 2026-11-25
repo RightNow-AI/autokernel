@@ -18,6 +18,11 @@ models = [
     "transformers>=4.50.0",
     "accelerate>=1.5.0",
     "safetensors>=0.5.0",
+    "bitsandbytes>=0.43.0",
+]
+# Quantization: profile and benchmark 4-bit / 8-bit quantized models
+quant = [
+    "bitsandbytes>=0.43.0",
 ]
 # CUDA C++ backend: native CUDA kernel compilation (speeds up build from ~30s to ~5s)
 cuda = [
