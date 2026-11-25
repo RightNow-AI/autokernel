@@ -21,6 +21,19 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from triton.language.extra.libdevice import tanh
+except ImportError:
+    try:
+        from triton.language.extra.cuda.libdevice import tanh
+    except ImportError:
+        try:
+            from triton.language.math import tanh
+        except ImportError:
+            @triton.jit
+            def tanh(x):
+                return 2.0 * tl.sigmoid(2.0 * x) - 1.0
+
 
 @triton.jit
 def fused_gate_up_kernel(
@@ -89,7 +102,7 @@ def fused_gate_up_kernel(
         gate_activated = acc_gate * tl.sigmoid(acc_gate)
     else:
         # GELU approximation
-        gate_activated = 0.5 * acc_gate * (1.0 + tl.math.tanh(0.7978845608 * (acc_gate + 0.044715 * acc_gate * acc_gate * acc_gate)))
+        gate_activated = 0.5 * acc_gate * (1.0 + tanh(0.7978845608 * (acc_gate + 0.044715 * acc_gate * acc_gate * acc_gate)))
 
     result = gate_activated * acc_up
 
