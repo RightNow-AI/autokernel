@@ -31,6 +31,7 @@ def matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
 ):
     """Basic tiled matmul. The agent improves this."""
     pid_m = tl.program_id(0)
@@ -48,7 +49,7 @@ def matmul_kernel(
     for k in range(0, K, BLOCK_SIZE_K):
         a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
         b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         offs_k += BLOCK_SIZE_K
@@ -71,6 +72,7 @@ def kernel_fn(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     BLOCK_SIZE_M = 64
     BLOCK_SIZE_N = 64
     BLOCK_SIZE_K = 32
+    ALLOW_TF32 = (A.dtype != torch.float32)
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
@@ -83,5 +85,6 @@ def kernel_fn(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        ALLOW_TF32=ALLOW_TF32,
     )
     return C
