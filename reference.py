@@ -5,6 +5,7 @@ DO NOT MODIFY. These are the oracles that the benchmark harness checks against.
 
 import torch
 import torch.nn.functional as F
+from typing import Optional, Tuple
 
 # Matrix Multiplication
 def matmul_ref(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -144,3 +145,72 @@ def gqa_prefill_attention_ref(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
                     m = m_new
                 out[b, heads, q0:q1] = (acc / l[..., None]).to(Q.dtype)
     return out
+
+
+# Modulated Normalization (Diffusion / Video Transformers)
+def modulated_norm_ref(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    shift: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    norm_type: str = "layernorm",
+) -> torch.Tensor:
+    """Modulated LayerNorm / RMSNorm oracle: norm(x) * (1 + scale) + shift."""
+    x_f = x.float()
+    w_f = weight.float() if weight is not None else None
+    b_f = bias.float() if bias is not None else None
+
+    if norm_type == "rmsnorm":
+        rms = torch.sqrt(torch.mean(x_f ** 2, dim=-1, keepdim=True) + eps)
+        normed = (x_f / rms)
+        if w_f is not None:
+            normed = normed * w_f
+    else:
+        # LayerNorm
+        normed = F.layer_norm(x_f, (x.shape[-1],), w_f, b_f, eps)
+
+    out = normed
+    if scale is not None:
+        out = out * (1.0 + scale.float())
+    if shift is not None:
+        out = out + shift.float()
+    return out.to(x.dtype)
+
+
+# Gated Residual Fusion
+def gated_residual_ref(
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    update: torch.Tensor,
+) -> torch.Tensor:
+    """Gated residual oracle: residual + gate * update."""
+    return (residual.float() + gate.float() * update.float()).to(residual.dtype)
+
+
+# Combined Fused Gated Residual + Modulated Norm
+def fused_gated_residual_modulated_norm_ref(
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    update: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    shift: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    norm_type: str = "layernorm",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused gated residual and modulated norm oracle."""
+    updated = residual + gate * update
+    normed = modulated_norm_ref(
+        updated,
+        weight=weight,
+        bias=bias,
+        scale=scale,
+        shift=shift,
+        eps=eps,
+        norm_type=norm_type,
+    )
+    return normed, updated
+

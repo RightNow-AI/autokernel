@@ -507,6 +507,73 @@ class _RMSNormWrapper(nn.Module):
         return out
 
 
+class _ModulatedNormWrapper(nn.Module):
+    """Wraps AdaLayerNorm / ModulatedNorm modules to use optimized kernel_fn."""
+
+    def __init__(self, original: nn.Module, kernel_fn: Callable):
+        super().__init__()
+        self.original = original
+        self.kernel_fn = kernel_fn
+        self.weight = getattr(original, "weight", None)
+        self.bias = getattr(original, "bias", None)
+        self.eps = getattr(original, "eps", 1e-5)
+        self.norm_type = getattr(original, "norm_type", "layernorm")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        try:
+            return self.kernel_fn(
+                x,
+                weight=self.weight,
+                bias=self.bias,
+                scale=scale,
+                shift=shift,
+                eps=self.eps,
+                norm_type=self.norm_type,
+            )
+        except Exception:
+            if scale is not None or shift is not None:
+                return self.original(x, scale=scale, shift=shift, **kwargs)
+            return self.original(x, **kwargs)
+
+
+class _GatedResidualWrapper(nn.Module):
+    """Wraps gated residual fusion modules."""
+
+    def __init__(self, original: nn.Module, kernel_fn: Callable):
+        super().__init__()
+        self.original = original
+        self.kernel_fn = kernel_fn
+
+    def forward(
+        self,
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+        update: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        try:
+            return self.kernel_fn(residual, gate, update)
+        except Exception:
+            return self.original(residual, gate, update, **kwargs)
+
+
+_CUSTOM_REPLACEMENT_STRATEGIES: Dict[str, Callable[[Any, KernelReplacement], int]] = {}
+
+
+def register_replacement_strategy(
+    kernel_type: str,
+    strategy_fn: Callable[[Any, KernelReplacement], int],
+) -> None:
+    """Register a custom module replacement strategy for OptimizedModelContext."""
+    _CUSTOM_REPLACEMENT_STRATEGIES[kernel_type] = strategy_fn
+
+
 class OptimizedModelContext:
     """
     Context manager that patches a model's submodules to use optimized Triton kernels.
@@ -558,6 +625,9 @@ class OptimizedModelContext:
         """
         Replace matching modules in the model. Returns number of modules replaced.
         """
+        if repl.kernel_type in _CUSTOM_REPLACEMENT_STRATEGIES:
+            return _CUSTOM_REPLACEMENT_STRATEGIES[repl.kernel_type](self, repl)
+
         count = 0
 
         if repl.kernel_type == "matmul":
@@ -566,9 +636,13 @@ class OptimizedModelContext:
             count = self._replace_layernorm_modules(repl)
         elif repl.kernel_type == "rmsnorm":
             count = self._replace_rmsnorm_modules(repl)
+        elif repl.kernel_type == "modulated_norm":
+            count = self._replace_modulated_norm_modules(repl)
+        elif repl.kernel_type == "gated_residual":
+            count = self._replace_gated_residual_modules(repl)
         else:
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, layernorm, rmsnorm)")
+                  f"Skipping. (Supported: matmul, layernorm, rmsnorm, modulated_norm, gated_residual)")
 
         return count
 
@@ -628,6 +702,52 @@ class OptimizedModelContext:
             if is_rmsnorm:
                 self._original_modules[name] = module
                 wrapper = _RMSNormWrapper(module, repl.module_fn)
+                parts = name.split(".")
+                parent = self.model
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, parts[-1], wrapper)
+                count += 1
+        return count
+
+    def _replace_modulated_norm_modules(self, repl: KernelReplacement) -> int:
+        """Replace AdaLayerNorm / ModulatedNorm diffusion modules."""
+        count = 0
+        target_names = {
+            "AdaLayerNorm", "AdaLayerNormZero", "AdaLayerNormContinuous",
+            "AdaRMSNorm", "ModulatedNorm", "CombinedTimestepLabelEmbeddings",
+            "DiTLayerNorm", "FluxNorm", "HunyuanNorm"
+        }
+        for name, module in list(self.model.named_modules()):
+            cls_name = type(module).__name__
+            cls_lower = cls_name.lower()
+            if (
+                cls_name in target_names
+                or "adalayernorm" in cls_lower
+                or "modulatednorm" in cls_lower
+                or "adaln" in cls_lower
+                or hasattr(module, "adaLN_modulation")
+            ):
+                self._original_modules[name] = module
+                wrapper = _ModulatedNormWrapper(module, repl.module_fn)
+                parts = name.split(".")
+                parent = self.model
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, parts[-1], wrapper)
+                count += 1
+        return count
+
+    def _replace_gated_residual_modules(self, repl: KernelReplacement) -> int:
+        """Replace gated residual fusion modules."""
+        count = 0
+        target_names = {"GatedResidual", "GateResidual", "GatedResidualBlock"}
+        for name, module in list(self.model.named_modules()):
+            cls_name = type(module).__name__
+            cls_lower = cls_name.lower()
+            if cls_name in target_names or "gatedresidual" in cls_lower or "gated_res" in cls_lower:
+                self._original_modules[name] = module
+                wrapper = _GatedResidualWrapper(module, repl.module_fn)
                 parts = name.split(".")
                 parent = self.model
                 for p in parts[:-1]:
